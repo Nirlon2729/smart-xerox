@@ -1,5 +1,5 @@
 services:
-  # 1. Node.js + Express Backend Web Service (connects to MongoDB Atlas + GridFS)
+  # 1. Node.js + Express Multi-Vendor Cloud Backend (MongoDB Atlas + GridFS)
   - type: web
     name: smart-xerox-api
     runtime: node
@@ -14,20 +14,20 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
-      - key: PRINT_AGENT_TOKEN
-        sync: false
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
       - key: CUSTOMER_ORIGIN
         sync: false
+      - key: PUBLIC_SHOP_BASE_URL
+        sync: false
       - key: MAX_UPLOAD_MB
         value: "20"
       - key: FILE_RETENTION_MINUTES
         value: "60"
 
-  # 2. React + Vite Mobile-First Frontend Static Site
+  # 2. React + Vite Customer Mobile Website (QR-based shop routes /shop/:shopSlug)
   - type: web
     name: smart-xerox-web
     runtime: static

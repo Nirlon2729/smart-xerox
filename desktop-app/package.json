@@ -1,0 +1,87 @@
+{
+  "name": "smart-xerox-desktop",
+  "productName": "Smart Xerox",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Smart Xerox — Multi-Vendor Windows Desktop Print Console & Background Agent",
+  "main": "electron/main.cjs",
+  "author": "Smart Xerox Platform",
+  "scripts": {
+    "dev:vite": "vite --port 5174",
+    "dev:electron": "electron .",
+    "build:renderer": "vite build",
+    "prepare:agent": "node scripts/prepare-agent-runtime.cjs",
+    "dist:win": "npm run build:renderer && npm run prepare:agent && electron-builder --win --x64"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "lucide-react": "^0.475.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-hot-toast": "^2.5.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.9",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "tailwindcss": "^4.0.9",
+    "vite": "^6.2.0"
+  },
+  "build": {
+    "appId": "com.smartxerox.vendor.desktop",
+    "productName": "Smart Xerox",
+    "copyright": "Copyright © 2026 Smart Xerox",
+    "asar": true,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/icon.png",
+      "build/icon.ico",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "agent-runtime",
+        "to": "print-agent",
+        "filter": [
+          "**/*",
+          "!**/*.env*",
+          "!**/completed_jobs.json",
+          "!**/*.log",
+          "!**/__pycache__/**"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "SmartXerox-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Smart Xerox",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "include": "build/installer.nsh"
+    }
+  }
+}

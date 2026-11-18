@@ -18,6 +18,9 @@ dist/
 release/
 out/
 build/
+desktop-app/agent-runtime/
+desktop-app/release/
+desktop-app/dist/
 *.exe
 *.msi
 *.blockmap
