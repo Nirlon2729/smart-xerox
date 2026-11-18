@@ -1,8 +1,10 @@
+
 services:
-  # 1. Node.js + Express Multi-Vendor Cloud Backend (MongoDB Atlas + GridFS)
+  # 1. Node.js + Express Multi-Vendor Cloud Backend
   - type: web
     name: smart-xerox-api
     runtime: node
+    plan: free
     rootDir: backend
     buildCommand: npm install
     startCommand: npm start
@@ -33,7 +35,7 @@ services:
       - key: FILE_RETENTION_MINUTES
         value: "60"
 
-  # 2. React + Vite Customer Mobile Website (QR-based shop routes /shop/:shopSlug)
+  # 2. React + Vite Customer Mobile Website
   - type: web
     name: smart-xerox-web
     runtime: static
