@@ -1,12 +1,11 @@
-import React, { useState } from "react";
-import { useParams, Link, useNavigate } from "react-router-dom";
+import React, { useState, useEffect } from "react";
+import { useParams, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import {
   RefreshCw,
   AlertCircle,
   Plus,
   XCircle,
-  RotateCcw,
   Printer
 } from "lucide-react";
 import OrderStatus from "../components/OrderStatus";
@@ -14,26 +13,37 @@ import Loader from "../components/Loader";
 import { useOrderPolling } from "../hooks/useOrderPolling";
 import {
   cancelPendingOrder,
-  reprintOrderRequest,
   getApiErrorMessage
 } from "../services/api";
 import { formatFileSize, summarizeSelectedPages } from "../utils/formatters";
 import { usePrintSession } from "../context/PrintSessionContext";
 
 export default function OrderSuccess() {
-  const { token } = useParams();
+  const { shopSlug: routeShopSlug, token } = useParams();
   const navigate = useNavigate();
-  const { clearDocument, printerState } = usePrintSession();
-  const { order, loading, refreshing, error, refresh } = useOrderPolling(token, 2500);
+  const { shopSlug, setShopSlug, shopInfo, clearDocument, printerState } =
+    usePrintSession();
+
+  const activeSlug = routeShopSlug || shopSlug;
+
+  useEffect(() => {
+    if (routeShopSlug) {
+      setShopSlug(routeShopSlug);
+    }
+  }, [routeShopSlug, setShopSlug]);
+
+  const { order, loading, refreshing, error, refresh } = useOrderPolling(
+    activeSlug,
+    token,
+    2500
+  );
   const [cancelling, setCancelling] = useState(false);
-  const [confirmReprint, setConfirmReprint] = useState(false);
-  const [reprinting, setReprinting] = useState(false);
 
   const handleCancelOrder = async () => {
-    if (!order?.token || cancelling) return;
+    if (!order?.token || !activeSlug || cancelling) return;
     try {
       setCancelling(true);
-      await cancelPendingOrder(order.token);
+      await cancelPendingOrder(activeSlug, order.token);
       toast.success("Print job cancelled.");
       refresh();
     } catch (err) {
@@ -43,31 +53,13 @@ export default function OrderSuccess() {
     }
   };
 
-  const handleConfirmReprint = async () => {
-    if (!order?.token || reprinting) return;
-    setConfirmReprint(false);
-    try {
-      setReprinting(true);
-      const res = await reprintOrderRequest(order.token);
-      if (res?.success && res.order) {
-        toast.success("Sending reprint to printer...");
-        navigate(`/job/${res.order.token}`, { replace: true });
-        refresh();
-      }
-    } catch (err) {
-      toast.error(getApiErrorMessage(err, "Could not reprint job."));
-    } finally {
-      setReprinting(false);
-    }
-  };
-
   const handleStartNewOrder = () => {
     clearDocument();
-    navigate("/");
+    navigate(activeSlug ? `/shop/${activeSlug}` : "/");
   };
 
   if (loading && !order) {
-    return <Loader fullScreen label="Connecting to print queue..." />;
+    return <Loader fullScreen label="Connecting to shop print queue..." />;
   }
 
   if (error && !order) {
@@ -84,7 +76,7 @@ export default function OrderSuccess() {
             onClick={handleStartNewOrder}
             className="px-5 py-2.5 rounded-xl bg-[#8D0100] text-white text-xs font-semibold"
           >
-            Back to Home
+            Back to Shop
           </button>
         </div>
       </div>
@@ -94,8 +86,6 @@ export default function OrderSuccess() {
   if (!order) return null;
 
   const canCancel = ["UPLOADING", "QUEUED"].includes(order.status);
-  const canReprint =
-    !order.fileDeleted && ["COMPLETED", "FAILED", "CANCELLED"].includes(order.status);
 
   return (
     <div className="space-y-4 pb-12">
@@ -103,7 +93,10 @@ export default function OrderSuccess() {
       <div className="flex items-center justify-between px-1">
         <span className="text-xs font-medium text-zinc-500 flex items-center gap-1.5">
           <Printer className="w-3.5 h-3.5 text-[#8D0100]" />
-          <span>{printerState?.printerName || "HP USB Printer"}</span>
+          <span>
+            {shopInfo?.shopName || activeSlug} •{" "}
+            {order.targetPrinterName || printerState?.printerName || "Shop Printer"}
+          </span>
         </span>
         <button
           type="button"
@@ -116,7 +109,7 @@ export default function OrderSuccess() {
         </button>
       </div>
 
-      {/* Live Status Card ("Sending to printer...", "Printer is printing...", "Completed" / "Failed") */}
+      {/* Live Status Card */}
       <OrderStatus status={order.status} failureReason={order.failureReason} />
 
       {/* Job Details Card */}
@@ -125,7 +118,7 @@ export default function OrderSuccess() {
           <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-500">
             Print Job Details
           </h3>
-          <span className="text-xs font-mono-code text-zinc-500">
+          <span className="text-xs font-mono-code font-semibold text-zinc-700">
             {order.token}
           </span>
         </div>
@@ -141,7 +134,7 @@ export default function OrderSuccess() {
           <div className="flex items-center justify-between gap-4">
             <dt className="text-zinc-500">Paper & Orientation</dt>
             <dd className="font-mono-code font-medium text-zinc-900 capitalize">
-              {order.paperSize || "A4"} • {order.orientation || "auto"}
+              {order.paperSize || "A4"} • {order.orientation || "portrait"}
             </dd>
           </div>
 
@@ -171,65 +164,20 @@ export default function OrderSuccess() {
           </div>
         </dl>
 
-        {(canCancel || canReprint) && (
-          <div className="pt-3 border-t border-zinc-100 flex items-center justify-end gap-2.5">
-            {canCancel && (
-              <button
-                type="button"
-                onClick={handleCancelOrder}
-                disabled={cancelling}
-                className="min-h-[38px] px-3.5 py-1.5 rounded-xl border border-red-200 bg-red-50/70 text-xs font-semibold text-red-700 inline-flex items-center gap-1.5 hover:bg-red-100 disabled:opacity-50"
-              >
-                <XCircle className="w-3.5 h-3.5" />
-                <span>{cancelling ? "Cancelling..." : "Cancel Job"}</span>
-              </button>
-            )}
-
-            {canReprint && (
-              <button
-                type="button"
-                onClick={() => setConfirmReprint(true)}
-                disabled={reprinting}
-                className="min-h-[38px] px-3.5 py-1.5 rounded-xl border border-zinc-200 bg-zinc-50 text-xs font-semibold text-zinc-800 inline-flex items-center gap-1.5 hover:bg-zinc-100 disabled:opacity-50"
-              >
-                <RotateCcw className="w-3.5 h-3.5 text-[#8D0100]" />
-                <span>{reprinting ? "Reprinting..." : "Reprint"}</span>
-              </button>
-            )}
+        {canCancel && (
+          <div className="pt-3 border-t border-zinc-100 flex items-center justify-end">
+            <button
+              type="button"
+              onClick={handleCancelOrder}
+              disabled={cancelling}
+              className="min-h-[38px] px-3.5 py-1.5 rounded-xl border border-red-200 bg-red-50/70 text-xs font-semibold text-red-700 inline-flex items-center gap-1.5 hover:bg-red-100 disabled:opacity-50"
+            >
+              <XCircle className="w-3.5 h-3.5" />
+              <span>{cancelling ? "Cancelling..." : "Cancel Job"}</span>
+            </button>
           </div>
         )}
       </div>
-
-      {/* Explicit Reprint Confirmation Modal */}
-      {confirmReprint && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl border border-zinc-200 p-5 max-w-sm w-full space-y-4 shadow-lg">
-            <h3 className="text-base font-bold text-zinc-900">
-              Confirm Reprint
-            </h3>
-            <p className="text-xs sm:text-sm text-zinc-600 leading-relaxed">
-              Send <strong className="text-zinc-900">{order.originalName}</strong>{" "}
-              ({order.copies} {order.copies === 1 ? "copy" : "copies"}) to the USB HP printer again?
-            </p>
-            <div className="flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setConfirmReprint(false)}
-                className="px-4 py-2 rounded-xl border border-zinc-200 text-xs font-semibold text-zinc-700"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmReprint}
-                className="px-4 py-2 rounded-xl bg-[#8D0100] text-white text-xs font-semibold"
-              >
-                Print Now
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       <div className="pt-1">
         <button

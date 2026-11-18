@@ -4,12 +4,12 @@ import { fetchOrderByToken, getApiErrorMessage } from "../services/api";
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "CANCELLED"];
 
 /**
- * Safe periodic polling hook for live order status updates.
+ * Safe periodic polling hook for live order status updates scoped to a specific shopSlug.
  * Automatically stops polling when order reaches a terminal state.
  */
-export function useOrderPolling(token, intervalMs = 5000) {
+export function useOrderPolling(shopSlug, token, intervalMs = 3000) {
   const [order, setOrder] = useState(null);
-  const [loading, setLoading] = useState(Boolean(token));
+  const [loading, setLoading] = useState(Boolean(shopSlug && token));
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -17,15 +17,16 @@ export function useOrderPolling(token, intervalMs = 5000) {
 
   const loadOrder = useCallback(
     async (isManual = false) => {
-      const clean = String(token || "").trim().toUpperCase();
-      if (!clean) {
+      const cleanSlug = String(shopSlug || "").trim().toLowerCase();
+      const cleanToken = String(token || "").trim().toUpperCase();
+      if (!cleanSlug || !cleanToken) {
         setLoading(false);
         return null;
       }
 
       if (isManual) setRefreshing(true);
       try {
-        const res = await fetchOrderByToken(clean);
+        const res = await fetchOrderByToken(cleanSlug, cleanToken);
         if (res?.success && res.order) {
           setOrder(res.order);
           setError(null);
@@ -33,19 +34,20 @@ export function useOrderPolling(token, intervalMs = 5000) {
           return res.order;
         }
       } catch (err) {
-        setError(getApiErrorMessage(err, "Unable to fetch order details."));
+        setError(getApiErrorMessage(err, "Unable to fetch print job status."));
       } finally {
         setLoading(false);
         if (isManual) setRefreshing(false);
       }
       return null;
     },
-    [token]
+    [shopSlug, token]
   );
 
   useEffect(() => {
-    const clean = String(token || "").trim();
-    if (!clean) {
+    const cleanSlug = String(shopSlug || "").trim();
+    const cleanToken = String(token || "").trim();
+    if (!cleanSlug || !cleanToken) {
       setOrder(null);
       setLoading(false);
       setError(null);
@@ -68,7 +70,7 @@ export function useOrderPolling(token, intervalMs = 5000) {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [token, intervalMs, loadOrder]);
+  }, [shopSlug, token, intervalMs, loadOrder]);
 
   return {
     order,

@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
-import { fetchPrinterStatus } from "../services/api";
+import { fetchShopInfo, getApiErrorMessage } from "../services/api";
 
 const PrintSessionContext = createContext(null);
 
@@ -7,7 +7,7 @@ const DEFAULT_SETTINGS = {
   paperSize: "A4",
   colorMode: "bw",
   sides: "single",
-  orientation: "auto",
+  orientation: "portrait",
   pageSelectionMode: "all",
   customPageRange: "",
   selectedPages: [1],
@@ -15,6 +15,11 @@ const DEFAULT_SETTINGS = {
 };
 
 export function PrintSessionProvider({ children }) {
+  const [shopSlug, setShopSlugState] = useState(null);
+  const [shopInfo, setShopInfo] = useState(null);
+  const [shopLoading, setShopLoading] = useState(false);
+  const [shopError, setShopError] = useState(null);
+
   const [selectedFile, setSelectedFile] = useState(null);
   const [previewObjectUrl, setPreviewObjectUrl] = useState(null);
   const [documentMeta, setDocumentMeta] = useState(null);
@@ -27,10 +32,10 @@ export function PrintSessionProvider({ children }) {
     statusLabel: "Connecting...",
     agentOnline: false,
     printerAvailable: false,
-    printerName: "HP LaserJet MFP M129-M134",
-    portName: "USB002",
+    printerName: "Shop Printer",
+    portName: null,
     status: "CONNECTING",
-    statusMessage: "Checking Windows print agent and USB printer status...",
+    statusMessage: "Checking shop printer availability...",
     spoolerJobCount: 0,
     capabilities: {
       supportedPaperSizes: ["A4", "Letter", "Legal", "A5"],
@@ -43,30 +48,67 @@ export function PrintSessionProvider({ children }) {
     }
   });
 
-  const refreshPrinterStatus = useCallback(async () => {
-    try {
-      const res = await fetchPrinterStatus();
-      if (res?.success && res.printer) {
-        setPrinterState(res.printer);
+  const refreshPrinterStatus = useCallback(
+    async (slugOverride = null, showInitialLoader = false) => {
+      const activeSlug = slugOverride || shopSlug;
+      if (!activeSlug) return;
+
+      if (showInitialLoader) setShopLoading(true);
+      try {
+        const res = await fetchShopInfo(activeSlug);
+        if (res?.success) {
+          if (res.shop) setShopInfo(res.shop);
+          if (res.printer) setPrinterState(res.printer);
+          setShopError(null);
+        }
+      } catch (err) {
+        const status = err?.response?.status;
+        if (status === 404 || status === 403 || status === 400) {
+          setShopError(
+            getApiErrorMessage(err, "Print shop not found or currently unavailable.")
+          );
+          setShopInfo(null);
+        } else {
+          setPrinterState((prev) => ({
+            ...prev,
+            online: false,
+            connectionState: "AGENT_OFFLINE",
+            statusLabel: "Offline",
+            agentOnline: false,
+            printerAvailable: false,
+            statusMessage: "Cannot reach cloud server to verify printer status."
+          }));
+        }
+      } finally {
+        if (showInitialLoader) setShopLoading(false);
       }
-    } catch (_err) {
-      setPrinterState((prev) => ({
-        ...prev,
-        online: false,
-        connectionState: "AGENT_OFFLINE",
-        statusLabel: "Agent Offline",
-        agentOnline: false,
-        printerAvailable: false,
-        statusMessage: "Cannot reach backend server to verify printer status."
-      }));
-    }
-  }, []);
+    },
+    [shopSlug]
+  );
+
+  const setShopSlug = useCallback(
+    (newSlug) => {
+      const normalized = newSlug ? String(newSlug).trim().toLowerCase() : null;
+      setShopSlugState((prev) => {
+        if (prev !== normalized) {
+          setSelectedFile(null);
+          setDocumentMeta(null);
+          setSettings(DEFAULT_SETTINGS);
+          setActiveOrder(null);
+          setShopError(null);
+        }
+        return normalized;
+      });
+    },
+    []
+  );
 
   useEffect(() => {
-    refreshPrinterStatus();
-    const interval = setInterval(refreshPrinterStatus, 4000);
+    if (!shopSlug) return;
+    refreshPrinterStatus(shopSlug, true);
+    const interval = setInterval(() => refreshPrinterStatus(shopSlug, false), 4000);
     return () => clearInterval(interval);
-  }, [refreshPrinterStatus]);
+  }, [shopSlug, refreshPrinterStatus]);
 
   useEffect(() => {
     if (!selectedFile) {
@@ -92,7 +134,8 @@ export function PrintSessionProvider({ children }) {
       setSettings({
         ...DEFAULT_SETTINGS,
         paperSize: defaultPaper,
-        orientation: serverMeta?.detectedOrientation || "auto",
+        orientation:
+          serverMeta?.detectedOrientation === "landscape" ? "landscape" : "portrait",
         selectedPages: allPages,
         customPageRange: total === 1 ? "1" : `1-${total}`
       });
@@ -115,6 +158,11 @@ export function PrintSessionProvider({ children }) {
   return (
     <PrintSessionContext.Provider
       value={{
+        shopSlug,
+        setShopSlug,
+        shopInfo,
+        shopLoading,
+        shopError,
         pdfFile: selectedFile,
         selectedFile,
         previewObjectUrl,
@@ -122,8 +170,8 @@ export function PrintSessionProvider({ children }) {
         settings,
         updateSettings,
         printerState,
-        refreshPrinterStatus,
-        shopConfig: printerState.config,
+        refreshPrinterStatus: () => refreshPrinterStatus(shopSlug, false),
+        shopConfig: shopInfo?.config || printerState.config,
         activeOrder,
         setActiveOrder,
         setUploadedDocument,

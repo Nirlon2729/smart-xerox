@@ -1,8 +1,7 @@
 import axios from "axios";
 
 /**
- * Resolves the backend API base URL for desktop, mobile Wi-Fi LAN, and Render HTTPS production.
- * Ensures mobile phones visiting http://<LAN-IP>:5173 never accidentally call localhost on the phone.
+ * Resolves the backend API base URL for mobile browsers, LAN testing, and Render HTTPS production.
  */
 export function resolveApiBaseUrl() {
   const rawEnvUrl = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
@@ -60,10 +59,10 @@ export function getApiErrorMessage(error, fallback = "Something went wrong. Plea
     return error.response.data.message;
   }
   if (error?.code === "ECONNABORTED") {
-    return "Upload timed out. Please check your Wi-Fi or mobile connection and try again.";
+    return "Upload timed out. Please check your internet connection and try again.";
   }
   if (!error?.response && error?.request) {
-    return `Cannot reach the Smart Xerox backend (${API_BASE_URL}). Verify the backend is running and your phone is on the same network.`;
+    return `Cannot reach the Smart Xerox cloud server (${API_BASE_URL}). Please check your internet connection.`;
   }
   return error?.message || fallback;
 }
@@ -73,53 +72,63 @@ export async function checkHealth() {
   return data;
 }
 
-export async function fetchPrinterStatus() {
-  const { data } = await apiClient.get("/orders/printer-status");
+/* ==========================================================================
+   CUSTOMER SHOP-SCOPED API (/api/shops/:shopSlug/*)
+   ========================================================================== */
+
+function encodeSlug(shopSlug) {
+  return encodeURIComponent(String(shopSlug || "").trim().toLowerCase());
+}
+
+export async function fetchShopInfo(shopSlug) {
+  const { data } = await apiClient.get(`/shops/${encodeSlug(shopSlug)}`);
   return data;
 }
 
-export async function fetchRecentJobs(limit = 20) {
-  const { data } = await apiClient.get("/orders", { params: { limit } });
+export async function fetchPrinterStatus(shopSlug) {
+  const { data } = await apiClient.get(`/shops/${encodeSlug(shopSlug)}/printer-status`);
   return data;
 }
 
-/**
- * Uploads and inspects a PDF, JPG, JPEG, or PNG file and stores it in MongoDB Atlas GridFS.
- * Does NOT manually set Content-Type so the browser attaches the multipart boundary automatically.
- */
-export async function inspectAndStagePdf(file, onProgress, signal) {
+export async function inspectAndStagePdf(shopSlug, file, onProgress, signal) {
   const formData = new FormData();
   formData.append("document", file, file.name || "document");
 
-  const { data } = await apiClient.post("/orders/inspect", formData, {
-    signal,
-    onUploadProgress: (progressEvent) => {
-      if (onProgress && progressEvent.total) {
-        const percent = Math.min(100, Math.round((progressEvent.loaded * 100) / progressEvent.total));
-        onProgress(percent);
+  const { data } = await apiClient.post(
+    `/shops/${encodeSlug(shopSlug)}/orders/inspect`,
+    formData,
+    {
+      signal,
+      onUploadProgress: (progressEvent) => {
+        if (onProgress && progressEvent.total) {
+          const percent = Math.min(
+            100,
+            Math.round((progressEvent.loaded * 100) / progressEvent.total)
+          );
+          onProgress(percent);
+        }
       }
     }
-  });
+  );
   return data;
 }
 
-/**
- * Direct PRINT NOW job submission.
- * Immediately sets job status to QUEUED in MongoDB so the Windows 11 print agent starts printing.
- */
-export async function createPrintOrder({
-  file,
-  uploadId,
-  idempotencyKey,
-  pageSelectionMode,
-  customPageRange,
-  selectedPages,
-  copies,
-  colorMode,
-  sides,
-  paperSize,
-  orientation
-}) {
+export async function createPrintOrder(
+  shopSlug,
+  {
+    file,
+    uploadId,
+    idempotencyKey,
+    pageSelectionMode,
+    customPageRange,
+    selectedPages,
+    copies,
+    colorMode,
+    sides,
+    paperSize,
+    orientation
+  }
+) {
   const formData = new FormData();
   if (uploadId) {
     formData.append("uploadId", uploadId);
@@ -129,8 +138,11 @@ export async function createPrintOrder({
   if (idempotencyKey) {
     formData.append("idempotencyKey", idempotencyKey);
   }
-  formData.append("pageSelectionMode", pageSelectionMode || "all");
-  if (customPageRange) {
+  formData.append(
+    "pageSelectionMode",
+    pageSelectionMode === "all" ? "all" : "custom"
+  );
+  if (customPageRange && pageSelectionMode === "custom") {
     formData.append("customPageRange", customPageRange);
   }
   formData.append("selectedPages", JSON.stringify(selectedPages || [1]));
@@ -138,85 +150,113 @@ export async function createPrintOrder({
   formData.append("colorMode", colorMode || "bw");
   formData.append("sides", sides || "single");
   formData.append("paperSize", paperSize || "A4");
-  formData.append("orientation", orientation || "auto");
+  formData.append("orientation", orientation || "portrait");
 
-  const { data } = await apiClient.post("/orders", formData);
+  const { data } = await apiClient.post(
+    `/shops/${encodeSlug(shopSlug)}/orders`,
+    formData
+  );
   return data;
 }
 
-export async function fetchOrderByToken(tokenOrId) {
+export async function fetchOrderByToken(shopSlug, tokenOrId) {
   const clean = encodeURIComponent(String(tokenOrId || "").trim());
-  const { data } = await apiClient.get(`/orders/${clean}`);
+  const { data } = await apiClient.get(
+    `/shops/${encodeSlug(shopSlug)}/orders/${clean}`
+  );
   return data;
 }
 
-export async function cancelPendingOrder(tokenOrId) {
+export async function cancelPendingOrder(shopSlug, tokenOrId) {
   const clean = encodeURIComponent(String(tokenOrId || "").trim());
-  const { data } = await apiClient.post(`/orders/${clean}/cancel`);
-  return data;
-}
-
-export async function reprintOrderRequest(tokenOrId) {
-  const clean = encodeURIComponent(String(tokenOrId || "").trim());
-  const { data } = await apiClient.post(`/orders/${clean}/reprint`);
-  return data;
-}
-
-export async function clearFailedOrdersRequest() {
-  const { data } = await apiClient.delete("/orders/failed");
+  const { data } = await apiClient.post(
+    `/shops/${encodeSlug(shopSlug)}/orders/${clean}/cancel`
+  );
   return data;
 }
 
 /* ==========================================================================
-   OWNER AUTHENTICATION & MANAGEMENT API
+   CUSTOMER LOCAL SESSION JOB HISTORY (SCOPED PER SHOP SLUG)
    ========================================================================== */
 
-function getOwnerHeaders(ownerToken) {
+function getCustomerJobStorageKey(shopSlug) {
+  return `smart_xerox_customer_tokens_${String(shopSlug || "default").toLowerCase()}`;
+}
+
+export function saveCustomerOrderToken(shopSlug, token) {
+  if (!shopSlug || !token || typeof window === "undefined") return;
+  try {
+    const key = getCustomerJobStorageKey(shopSlug);
+    const existing = JSON.parse(localStorage.getItem(key) || "[]");
+    const updated = [token, ...existing.filter((t) => t !== token)].slice(0, 10);
+    localStorage.setItem(key, JSON.stringify(updated));
+  } catch (_e) {
+    // Ignore storage errors
+  }
+}
+
+export function getSavedCustomerOrderTokens(shopSlug) {
+  if (!shopSlug || typeof window === "undefined") return [];
+  try {
+    const key = getCustomerJobStorageKey(shopSlug);
+    const list = JSON.parse(localStorage.getItem(key) || "[]");
+    return Array.isArray(list) ? list : [];
+  } catch (_e) {
+    return [];
+  }
+}
+
+/* ==========================================================================
+   PLATFORM SUPER ADMIN API (/api/super-admin/*)
+   ========================================================================== */
+
+function getSuperAdminHeaders(token) {
   return {
-    Authorization: `Bearer ${ownerToken}`
+    Authorization: `Bearer ${token}`
   };
 }
 
-export async function adminLoginRequest(email, password) {
-  const { data } = await apiClient.post("/admin/login", { email, password });
+export async function superAdminLoginRequest(email, password) {
+  const { data } = await apiClient.post("/super-admin/login", { email, password });
   return data;
 }
 
-export async function fetchAdminOrders(ownerToken, { status = "ALL", search = "" } = {}) {
-  const params = {};
-  if (status && status !== "ALL") params.status = status;
-  if (search && search.trim()) params.search = search.trim();
-
-  const { data } = await apiClient.get("/admin/orders", {
-    params,
-    headers: getOwnerHeaders(ownerToken)
+export async function fetchSuperAdminOverview(token) {
+  const { data } = await apiClient.get("/super-admin/overview", {
+    headers: getSuperAdminHeaders(token)
   });
   return data;
 }
 
-export async function adminCancelOrderRequest(ownerToken, tokenOrId) {
-  const clean = encodeURIComponent(String(tokenOrId || "").trim());
-  const { data } = await apiClient.post(
-    `/admin/orders/${clean}/cancel`,
-    {},
-    { headers: getOwnerHeaders(ownerToken) }
+export async function createVendorRequest(token, payload) {
+  const { data } = await apiClient.post("/super-admin/vendors", payload, {
+    headers: getSuperAdminHeaders(token)
+  });
+  return data;
+}
+
+export async function updateVendorStatusRequest(token, tenantId, status) {
+  const { data } = await apiClient.patch(
+    `/super-admin/vendors/${encodeURIComponent(tenantId)}/status`,
+    { status },
+    { headers: getSuperAdminHeaders(token) }
   );
   return data;
 }
 
-export async function adminReprintOrderRequest(ownerToken, tokenOrId) {
-  const clean = encodeURIComponent(String(tokenOrId || "").trim());
+export async function resetVendorPasswordRequest(token, tenantId, newPassword) {
   const { data } = await apiClient.post(
-    `/admin/orders/${clean}/reprint`,
-    {},
-    { headers: getOwnerHeaders(ownerToken) }
+    `/super-admin/vendors/${encodeURIComponent(tenantId)}/reset-password`,
+    { newPassword },
+    { headers: getSuperAdminHeaders(token) }
   );
   return data;
 }
 
-export async function adminClearFailedRequest(ownerToken) {
-  const { data } = await apiClient.delete("/admin/orders/failed", {
-    headers: getOwnerHeaders(ownerToken)
+export async function fetchSuperAdminAuditLogs(token, limit = 50) {
+  const { data } = await apiClient.get("/super-admin/audit-logs", {
+    params: { limit },
+    headers: getSuperAdminHeaders(token)
   });
   return data;
 }

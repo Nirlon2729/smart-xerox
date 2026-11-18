@@ -3,10 +3,11 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { Toaster } from "react-hot-toast";
 import { PrintSessionProvider } from "./context/PrintSessionContext";
 import Header from "./components/Header";
+import LandingScanQr from "./pages/LandingScanQr";
 import Home from "./pages/Home";
 import PrintSettings from "./pages/PrintSettings";
 import OrderSuccess from "./pages/OrderSuccess";
-import AdminDashboard from "./pages/AdminDashboard";
+import SuperAdminDashboard from "./pages/SuperAdminDashboard";
 
 export default function App() {
   return (
@@ -16,12 +17,16 @@ export default function App() {
           <Header />
           <main className="flex-1 w-full max-w-xl mx-auto px-4 pt-5">
             <Routes>
-              <Route path="/" element={<Home />} />
-              <Route path="/settings" element={<PrintSettings />} />
-              <Route path="/job/:token" element={<OrderSuccess />} />
-              <Route path="/order/:token" element={<OrderSuccess />} />
-              <Route path="/admin" element={<AdminDashboard />} />
-              <Route path="/owner" element={<AdminDashboard />} />
+              {/* Customer QR Landing & Shop-Specific Printing Workflow */}
+              <Route path="/" element={<LandingScanQr />} />
+              <Route path="/shop/:shopSlug" element={<Home />} />
+              <Route path="/shop/:shopSlug/settings" element={<PrintSettings />} />
+              <Route path="/shop/:shopSlug/job/:token" element={<OrderSuccess />} />
+              <Route path="/shop/:shopSlug/order/:token" element={<OrderSuccess />} />
+
+              {/* Platform-Level Super Admin Management */}
+              <Route path="/super-admin" element={<SuperAdminDashboard />} />
+
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </main>

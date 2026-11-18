@@ -1,22 +1,26 @@
 """
-Smart Xerox — Windows 11 Background USB Print Agent (v2.1.0)
-Target Printer: HP LaserJet MFP M129-M134 (Port USB002)
+Smart Xerox — Multi-Vendor Windows Background Print Agent (v3.0.0)
 
 Features:
-- Detects HP LaserJet MFP M129-M134 via pywin32 (checks existence, PrinterStatus, WorkOffline, queue, spooler).
-- Never marks printer offline merely because no print job is running (Status 0 == Normal/Ready).
-- Never uses window.print() or Microsoft Print to PDF.
-- Sends periodic authenticated heartbeats with Agent ID, Printer Name, Port, Driver, Availability, Capabilities, and Agent Version.
-- Polls and claims QUEUED print jobs, streams documents from MongoDB Atlas GridFS, verifies SHA-256,
-  renders pages with PyMuPDF / Pillow, prints directly via Windows GDI to HP LaserJet MFP M129-M134,
-  and tracks the Windows Spooler until physical completion.
-- Built-in CLI diagnostic runner: `python agent.py --diagnose`
+- Multi-printer Windows discovery via pywin32 (USB & Network printers, default printer, ports, drivers, status, capabilities).
+- Never marks a printer offline merely because no print job is running (Status 0 == Normal/Ready).
+- Never uses window.print() or virtual printers (Microsoft Print to PDF, XPS, OneNote, Fax).
+- Authenticates with unique, revocable per-agent credentials (x-agent-id + x-agent-secret).
+- Sends periodic heartbeats with full availablePrinters list and syncs vendor's selectedPrinterName.
+- Claims tenant-isolated QUEUED print jobs, streams documents from MongoDB Atlas GridFS, verifies SHA-256,
+  renders pages at 300 DPI with PyMuPDF / Pillow, prints via Windows GDI, and waits for Windows Spooler confirmation.
+- Supports CLI modes for Electron Desktop App integration:
+  - `python agent.py --list-printers-json`
+  - `python agent.py --diagnose`
+  - `python agent.py --config <config.json>`
 """
 
 import os
 import sys
 import time
 import json
+import socket
+import platform
 import argparse
 import hashlib
 import logging
@@ -24,6 +28,7 @@ import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 import requests
+
 try:
     import pymupdf as fitz
 except ImportError:
@@ -34,7 +39,7 @@ import win32print
 import win32ui
 import win32con
 
-AGENT_VERSION = "2.1.0"
+AGENT_VERSION = "3.0.0"
 DEFAULT_TARGET_PRINTER = "HP LaserJet MFP M129-M134"
 
 # Virtual/forbidden printers that must never be used for physical printing
@@ -44,35 +49,18 @@ FORBIDDEN_PRINTER_KEYWORDS = (
     "xps document writer",
     "onenote",
     "fax",
+    "send to onenote",
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-LOG_FILE = BASE_DIR / "agent.log"
-LEDGER_FILE = BASE_DIR / "completed_jobs.json"
+APPDATA_DIR = Path(os.getenv("APPDATA") or str(BASE_DIR)) / "SmartXerox"
+try:
+    APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    APPDATA_DIR = BASE_DIR
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-logger = logging.getLogger("SmartXeroxAgent")
-
-# Load environment from print-agent/.env first, then fallback to ../backend/.env
-load_dotenv(BASE_DIR / ".env")
-load_dotenv(BASE_DIR.parent / "backend" / ".env")
-
-BACKEND_API_URL = (
-    os.getenv("BACKEND_API_URL") or "http://localhost:5000/api"
-).rstrip("/")
-PRINT_AGENT_TOKEN = os.getenv("PRINT_AGENT_TOKEN", "").strip()
-AGENT_DEVICE_ID = os.getenv("AGENT_DEVICE_ID", "win11-hp-m129-m134-usb").strip()
-CONFIGURED_PRINTER_NAME = os.getenv("PRINTER_NAME", DEFAULT_TARGET_PRINTER).strip()
-if not CONFIGURED_PRINTER_NAME or CONFIGURED_PRINTER_NAME == "Exact Windows printer name":
-    CONFIGURED_PRINTER_NAME = DEFAULT_TARGET_PRINTER
-POLL_INTERVAL_SECONDS = max(2, int(os.getenv("POLL_INTERVAL_SECONDS", "3")))
+LOG_FILE = APPDATA_DIR / "agent.log"
+LEDGER_FILE = APPDATA_DIR / "completed_jobs.json"
 
 # Windows DMPAPER constants
 PAPER_SIZE_MAP = {
@@ -94,7 +82,10 @@ PRINTER_STATUS_PROCESSING = 0x00004000
 PRINTER_STATUS_WARMING_UP = 0x00010000
 PRINTER_STATUS_DOOR_OPEN = 0x00400000
 PRINTER_STATUS_USER_INTERVENTION = 0x00100000
+
 PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x00000400
+PRINTER_ATTRIBUTE_NETWORK = 0x00000010
+PRINTER_ATTRIBUTE_LOCAL = 0x00000040
 
 # Windows Job Status Bitmasks
 JOB_STATUS_ERROR = 0x00000002
@@ -105,85 +96,89 @@ JOB_STATUS_DELETED = 0x00000100
 JOB_STATUS_COMPLETE = 0x00001000
 
 
+def setup_logger(log_path: Path, quiet_stdout: bool = False) -> logging.Logger:
+    handlers = [logging.FileHandler(log_path, encoding="utf-8")]
+    if not quiet_stdout:
+        handlers.append(logging.StreamHandler(sys.stdout))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    return logging.getLogger("SmartXeroxAgent")
+
+
+logger = logging.getLogger("SmartXeroxAgent")
+
+
 def is_forbidden_printer(name: str) -> bool:
     lower = (name or "").lower()
     return any(keyword in lower for keyword in FORBIDDEN_PRINTER_KEYWORDS)
 
 
-def load_completed_ledger() -> set:
-    if not LEDGER_FILE.exists():
-        return set()
+def classify_connection_type(port_name: str, attributes: int = 0) -> str:
+    port_upper = (port_name or "").upper()
+    if "USB" in port_upper or "DOT4" in port_upper:
+        return "USB"
+    if (
+        (attributes & PRINTER_ATTRIBUTE_NETWORK)
+        or port_upper.startswith("IP_")
+        or port_upper.startswith("WSD")
+        or port_upper.startswith("TCP")
+        or port_upper.startswith("HTTP")
+        or port_upper.startswith("\\\\")
+    ):
+        return "NETWORK"
+    if port_upper:
+        return "LOCAL"
+    return "UNKNOWN"
+
+
+def get_default_windows_printer() -> str:
     try:
-        data = json.loads(LEDGER_FILE.read_text(encoding="utf-8"))
-        return set(data.get("completedOrderIds", []))
+        return str(win32print.GetDefaultPrinter() or "").strip()
     except Exception:
-        return set()
+        return ""
 
 
-def record_completed_job(order_id: str) -> None:
-    completed = load_completed_ledger()
-    completed.add(str(order_id))
-    recent = list(completed)[-500:]
-    try:
-        LEDGER_FILE.write_text(
-            json.dumps({"completedOrderIds": recent}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        logger.warning("Could not update completed job ledger: %s", exc)
-
-
-def list_windows_printers() -> list:
+def list_windows_printers(include_virtual: bool = False) -> list:
     """
-    Enumerates installed local and connected printers via Windows Spooler.
-    Raises RuntimeError if the Windows Print Spooler service is unavailable.
+    Enumerates installed local and network printers via Windows Print Spooler.
+    Filters out virtual printers (Print to PDF, XPS, OneNote, Fax) unless include_virtual=True.
     """
     try:
         flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
         printers = win32print.EnumPrinters(flags)
-        return [p[2] for p in printers if p and len(p) > 2]
+        names = [p[2] for p in printers if p and len(p) > 2 and p[2]]
+        if include_virtual:
+            return names
+        return [n for n in names if not is_forbidden_printer(n)]
     except Exception as exc:
         raise RuntimeError(f"Windows Print Spooler is unavailable: {exc}") from exc
 
 
-def resolve_target_printer() -> str:
+def inspect_printer_state_and_capabilities(printer_name: str, default_printer: str = None) -> dict:
     """
-    Resolves the exact target physical printer (HP LaserJet MFP M129-M134).
-    Never falls back to Microsoft Print to PDF or virtual printers.
+    Inspects a Windows printer via win32print.OpenPrinter & GetPrinter(level 2).
+    Note: PrinterStatus == 0 and WorkOffline == False in Windows means Normal (Idle & Ready).
     """
-    printers = list_windows_printers()
+    if default_printer is None:
+        default_printer = get_default_windows_printer()
 
-    # 1. Exact case-insensitive match for CONFIGURED_PRINTER_NAME (e.g. HP LaserJet MFP M129-M134)
-    for name in printers:
-        if name.strip().lower() == CONFIGURED_PRINTER_NAME.lower():
-            return name
-
-    # 2. Match HP LaserJet MFP M129-M134 substring
-    for name in printers:
-        if "m129" in name.lower() or "m134" in name.lower():
-            return name
-
-    # 3. Match any physical HP printer
-    for name in printers:
-        if "hp" in name.lower() and not is_forbidden_printer(name):
-            return name
-
-    return CONFIGURED_PRINTER_NAME
-
-
-def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
-    """
-    Inspects the Windows printer via win32print.OpenPrinter & GetPrinter(level 2).
-    Important:
-    - In Windows, PrinterStatus == 0 and WorkOffline == False means "Normal" (Printer Ready).
-    - Never marks the printer offline simply because 0 jobs are currently running.
-    """
     result = {
+        "name": printer_name,
         "printerName": printer_name,
         "exists": False,
         "spoolerAvailable": True,
         "portName": None,
         "driverName": None,
+        "connectionType": "USB",
+        "isDefault": bool(
+            default_printer and printer_name.strip().lower() == default_printer.lower()
+        ),
+        "driverMissing": False,
+        "capabilitiesDetected": False,
         "printerStatusCode": None,
         "workOffline": False,
         "printerAvailable": False,
@@ -198,7 +193,7 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
     }
 
     try:
-        installed = list_windows_printers()
+        installed = list_windows_printers(include_virtual=False)
     except Exception as exc:
         result["spoolerAvailable"] = False
         result["statusMessage"] = str(exc)
@@ -210,7 +205,7 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
 
     if printer_name not in installed:
         result["statusMessage"] = (
-            f"Printer '{printer_name}' is not installed in Windows. Installed: {', '.join(installed)}"
+            f"Printer '{printer_name}' is not connected or installed in Windows."
         )
         return result
 
@@ -231,13 +226,17 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
         driver_name = str(info2.get("pDriverName", "") or "")
 
         work_offline = bool(attributes & PRINTER_ATTRIBUTE_WORK_OFFLINE)
+        driver_missing = not bool(driver_name.strip())
 
         result["portName"] = port_name
         result["driverName"] = driver_name
+        result["driverMissing"] = driver_missing
+        result["connectionType"] = classify_connection_type(port_name, attributes)
         result["printerStatusCode"] = status_flags
         result["workOffline"] = work_offline
         result["spoolerJobCount"] = c_jobs
 
+        caps_detected = False
         # Query hardware capabilities from driver via DeviceCapabilities
         try:
             # DC_PAPERS = 2
@@ -248,6 +247,7 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
                 ]
                 if supported_sizes:
                     result["capabilities"]["supportedPaperSizes"] = supported_sizes
+                    caps_detected = True
         except Exception:
             pass
 
@@ -255,26 +255,35 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
             # DC_DUPLEX = 7
             duplex_cap = win32print.DeviceCapabilities(printer_name, port_name, 7)
             result["capabilities"]["supportsDuplex"] = bool(duplex_cap == 1)
+            caps_detected = True
         except Exception:
             pass
 
         try:
             # DC_COLORDEVICE = 32
             color_cap = win32print.DeviceCapabilities(printer_name, port_name, 32)
-            # HP LaserJet MFP M129-M134 is a monochrome laser printer
             if "m129" in printer_name.lower() or "m134" in printer_name.lower():
                 result["capabilities"]["supportsColor"] = False
             else:
                 result["capabilities"]["supportsColor"] = bool(color_cap == 1)
+            caps_detected = True
         except Exception:
             pass
 
-        # Determine availability & status:
-        # Note: status_flags == 0 in Windows means "Normal" (idle & ready)!
-        if work_offline or (status_flags & PRINTER_STATUS_OFFLINE):
+        result["capabilitiesDetected"] = caps_detected
+
+        if driver_missing:
+            result["printerAvailable"] = False
+            result["status"] = "ERROR"
+            result["statusMessage"] = (
+                f"Windows printer driver is missing for {printer_name}. Please install the appropriate Windows driver."
+            )
+        elif work_offline or (status_flags & PRINTER_STATUS_OFFLINE):
             result["printerAvailable"] = False
             result["status"] = "OFFLINE"
-            result["statusMessage"] = f"{printer_name} is set to Work Offline or disconnected on {port_name}"
+            result["statusMessage"] = (
+                f"{printer_name} is offline or disconnected ({port_name})"
+            )
         elif status_flags & PRINTER_STATUS_PAPER_OUT:
             result["printerAvailable"] = False
             result["status"] = "ERROR"
@@ -290,7 +299,9 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
         elif status_flags & (PRINTER_STATUS_ERROR | PRINTER_STATUS_USER_INTERVENTION):
             result["printerAvailable"] = False
             result["status"] = "ERROR"
-            result["statusMessage"] = f"{printer_name} reported a hardware error (code {status_flags})"
+            result["statusMessage"] = (
+                f"{printer_name} reported a hardware error (code {status_flags})"
+            )
         elif status_flags & PRINTER_STATUS_PAUSED:
             result["printerAvailable"] = False
             result["status"] = "ERROR"
@@ -298,12 +309,15 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
         elif (status_flags & (PRINTER_STATUS_PRINTING | PRINTER_STATUS_PROCESSING)) or c_jobs > 0:
             result["printerAvailable"] = True
             result["status"] = "PRINTING"
-            result["statusMessage"] = f"Printing on {printer_name} ({port_name}) — {c_jobs} job(s) in queue"
+            result["statusMessage"] = (
+                f"Printing on {printer_name} ({port_name}) — {c_jobs} job(s) in queue"
+            )
         else:
-            # Status 0 (Normal) or Warming Up with 0 active jobs -> Printer Ready!
             result["printerAvailable"] = True
             result["status"] = "READY"
-            result["statusMessage"] = f"Printer Ready ({printer_name} on {port_name}, status: Normal)"
+            result["statusMessage"] = (
+                f"Printer Ready ({printer_name} on {port_name})"
+            )
 
     finally:
         win32print.ClosePrinter(handle)
@@ -311,9 +325,107 @@ def inspect_printer_state_and_capabilities(printer_name: str) -> dict:
     return result
 
 
-def api_headers(agent_job_id: str = None) -> dict:
+def discover_all_windows_printers() -> dict:
+    """
+    Discovers all compatible Windows printers (USB, Network, Local) and their live status & capabilities.
+    """
+    default_printer = get_default_windows_printer()
+    try:
+        names = list_windows_printers(include_virtual=False)
+    except Exception as exc:
+        return {
+            "success": False,
+            "spoolerAvailable": False,
+            "defaultPrinter": default_printer or None,
+            "error": str(exc),
+            "printers": [],
+        }
+
+    printers = []
+    for name in names:
+        info = inspect_printer_state_and_capabilities(name, default_printer=default_printer)
+        printers.append(info)
+
+    # Sort: available USB printers first, then default printer, then alphabetical
+    printers.sort(
+        key=lambda p: (
+            not p.get("printerAvailable", False),
+            p.get("connectionType") != "USB",
+            not p.get("isDefault", False),
+            p.get("name", "").lower(),
+        )
+    )
+
+    return {
+        "success": True,
+        "spoolerAvailable": True,
+        "defaultPrinter": default_printer if not is_forbidden_printer(default_printer) else None,
+        "printers": printers,
+    }
+
+
+def resolve_target_printer(preferred_name: str = None, discovered_printers: list = None) -> str:
+    """
+    Resolves the best physical target printer:
+    1. Exact match for vendor's preferred_name if installed.
+    2. If only 1 physical printer is installed, select it automatically.
+    3. Match HP LaserJet or default physical printer.
+    """
+    if discovered_printers is None:
+        discovery = discover_all_windows_printers()
+        discovered_printers = discovery.get("printers", [])
+
+    names = [p["name"] for p in discovered_printers]
+
+    if preferred_name and not is_forbidden_printer(preferred_name):
+        for name in names:
+            if name.strip().lower() == preferred_name.strip().lower():
+                return name
+
+    if len(names) == 1:
+        return names[0]
+
+    for p in discovered_printers:
+        if p.get("isDefault") and p.get("printerAvailable"):
+            return p["name"]
+
+    for p in discovered_printers:
+        if p.get("printerAvailable"):
+            return p["name"]
+
+    if names:
+        return names[0]
+
+    return preferred_name or DEFAULT_TARGET_PRINTER
+
+
+def load_completed_ledger(ledger_path: Path = LEDGER_FILE) -> set:
+    if not ledger_path.exists():
+        return set()
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+        return set(data.get("completedOrderIds", []))
+    except Exception:
+        return set()
+
+
+def record_completed_job(order_id: str, ledger_path: Path = LEDGER_FILE) -> None:
+    completed = load_completed_ledger(ledger_path)
+    completed.add(str(order_id))
+    recent = list(completed)[-500:]
+    try:
+        ledger_path.write_text(
+            json.dumps({"completedOrderIds": recent}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("Could not update completed job ledger: %s", exc)
+
+
+def build_agent_headers(agent_id: str, agent_secret: str, agent_job_id: str = None) -> dict:
     headers = {
-        "x-agent-token": PRINT_AGENT_TOKEN,
+        "x-agent-id": agent_id,
+        "x-agent-secret": agent_secret,
         "Accept": "application/json",
     }
     if agent_job_id:
@@ -321,24 +433,35 @@ def api_headers(agent_job_id: str = None) -> dict:
     return headers
 
 
-def send_heartbeat(printer_info: dict) -> tuple[bool, dict]:
+def send_heartbeat(
+    backend_url: str,
+    agent_id: str,
+    agent_secret: str,
+    device_id: str,
+    primary_printer: dict,
+    all_printers: list,
+) -> tuple[bool, dict]:
     payload = {
-        "agentId": AGENT_DEVICE_ID,
-        "deviceId": AGENT_DEVICE_ID,
+        "agentId": agent_id,
+        "deviceId": device_id,
         "agentVersion": AGENT_VERSION,
-        "printerName": printer_info["printerName"],
-        "portName": printer_info["portName"],
-        "driverName": printer_info["driverName"],
-        "printerAvailable": printer_info["printerAvailable"],
-        "status": printer_info["status"],
-        "statusMessage": printer_info["statusMessage"],
-        "spoolerJobCount": printer_info["spoolerJobCount"],
-        "capabilities": printer_info["capabilities"],
+        "hostname": socket.gethostname(),
+        "osVersion": f"{platform.system()} {platform.release()}",
+        "printerName": primary_printer["printerName"],
+        "portName": primary_printer["portName"],
+        "driverName": primary_printer["driverName"],
+        "driverMissing": primary_printer.get("driverMissing", False),
+        "printerAvailable": primary_printer["printerAvailable"],
+        "status": primary_printer["status"],
+        "statusMessage": primary_printer["statusMessage"],
+        "spoolerJobCount": primary_printer["spoolerJobCount"],
+        "capabilities": primary_printer["capabilities"],
+        "availablePrinters": all_printers,
     }
     try:
         resp = requests.post(
-            f"{BACKEND_API_URL}/agent/heartbeat",
-            headers=api_headers(),
+            f"{backend_url}/agent/heartbeat",
+            headers=build_agent_headers(agent_id, agent_secret),
             json=payload,
             timeout=10,
         )
@@ -351,11 +474,14 @@ def send_heartbeat(printer_info: dict) -> tuple[bool, dict]:
         )
         return False, {"statusCode": resp.status_code, "body": resp.text}
     except Exception as exc:
-        logger.warning("Heartbeat connection error to %s: %s", BACKEND_API_URL, exc)
+        logger.warning("Heartbeat connection error to %s: %s", backend_url, exc)
         return False, {"error": str(exc)}
 
 
 def update_backend_job_status(
+    backend_url: str,
+    agent_id: str,
+    agent_secret: str,
     order_id: str,
     agent_job_id: str,
     status: str,
@@ -372,8 +498,8 @@ def update_backend_job_status(
             payload["spoolerJobId"] = spooler_job_id
 
         resp = requests.patch(
-            f"{BACKEND_API_URL}/agent/jobs/{order_id}/status",
-            headers=api_headers(agent_job_id),
+            f"{backend_url}/agent/jobs/{order_id}/status",
+            headers=build_agent_headers(agent_id, agent_secret, agent_job_id),
             json=payload,
             timeout=15,
         )
@@ -388,7 +514,13 @@ def update_backend_job_status(
 
 
 def download_job_document(
-    order_id: str, agent_job_id: str, expected_sha256: str, dest_path: Path
+    backend_url: str,
+    agent_id: str,
+    agent_secret: str,
+    order_id: str,
+    agent_job_id: str,
+    expected_sha256: str,
+    dest_path: Path,
 ) -> int:
     """
     Streams the private document from MongoDB Atlas GridFS via GET /api/agent/jobs/:id/file
@@ -397,8 +529,8 @@ def download_job_document(
     hasher = hashlib.sha256()
     total_bytes = 0
     with requests.get(
-        f"{BACKEND_API_URL}/agent/jobs/{order_id}/file",
-        headers=api_headers(agent_job_id),
+        f"{backend_url}/agent/jobs/{order_id}/file",
+        headers=build_agent_headers(agent_id, agent_secret, agent_job_id),
         stream=True,
         timeout=60,
     ) as resp:
@@ -486,8 +618,7 @@ def wait_for_spooler_completion(
 ) -> int:
     """
     Monitors the Windows Print Spooler queue for `doc_title` on `printer_name`
-    until the USB printer finishes printing the job.
-    Returns the last seen Windows spooler JobId (or 0 if already cleared).
+    until the printer finishes spooling/printing the job.
     """
     deadline = time.time() + timeout_seconds
     seen_job_id = 0
@@ -525,8 +656,7 @@ def wait_for_spooler_completion(
 
 def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
     """
-    Sends rendered pages directly to HP LaserJet MFP M129-M134 using Windows GDI (win32ui / win32print).
-    Never opens a browser dialog or Microsoft Print to PDF.
+    Sends rendered pages directly to the selected Windows printer using Windows GDI (win32ui / win32print).
     """
     if is_forbidden_printer(printer_name):
         raise RuntimeError(f"Refusing to print to virtual printer '{printer_name}'.")
@@ -534,7 +664,7 @@ def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
     paper_size_name = job.get("paperSize", "A4")
     sides = job.get("sides", "single")
     color_mode = job.get("colorMode", "bw")
-    copies = max(1, min(100, int(job.get("copies", 1))))
+    copies = max(1, min(1000, int(job.get("copies", 1))))
     orientation = job.get("orientation", "auto")
     doc_title = f"SmartXerox-{job.get('token', job.get('orderId'))}"
 
@@ -602,21 +732,38 @@ def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
     return doc_title
 
 
-def process_and_print_job(job: dict, printer_name: str) -> None:
+def process_and_print_job(
+    backend_url: str,
+    agent_id: str,
+    agent_secret: str,
+    job: dict,
+    printer_name: str,
+    ledger_path: Path = LEDGER_FILE,
+) -> None:
     order_id = str(job["orderId"])
     agent_job_id = str(job["agentJobId"])
     token = job.get("token", order_id)
 
-    if order_id in load_completed_ledger():
+    if order_id in load_completed_ledger(ledger_path):
         logger.info("Job %s (%s) already in completed ledger; marking COMPLETED.", token, order_id)
-        update_backend_job_status(order_id, agent_job_id, "COMPLETED")
+        update_backend_job_status(
+            backend_url, agent_id, agent_secret, order_id, agent_job_id, "COMPLETED"
+        )
         return
 
     printer_info = inspect_printer_state_and_capabilities(printer_name)
     if not printer_info["printerAvailable"]:
         reason = printer_info["statusMessage"]
         logger.error("Cannot print job %s: %s", token, reason)
-        update_backend_job_status(order_id, agent_job_id, "FAILED", failure_reason=reason)
+        update_backend_job_status(
+            backend_url,
+            agent_id,
+            agent_secret,
+            order_id,
+            agent_job_id,
+            "FAILED",
+            failure_reason=reason,
+        )
         return
 
     with tempfile.TemporaryDirectory(prefix="smart_xerox_") as tmp_dir:
@@ -624,8 +771,13 @@ def process_and_print_job(job: dict, printer_name: str) -> None:
         local_file = Path(tmp_dir) / f"job_{order_id}.{ext}"
 
         logger.info("[Job %s] Step 1/4: Downloading GridFS document...", token)
-        update_backend_job_status(order_id, agent_job_id, "DOWNLOADING")
+        update_backend_job_status(
+            backend_url, agent_id, agent_secret, order_id, agent_job_id, "DOWNLOADING"
+        )
         bytes_downloaded = download_job_document(
+            backend_url=backend_url,
+            agent_id=agent_id,
+            agent_secret=agent_secret,
             order_id=order_id,
             agent_job_id=agent_job_id,
             expected_sha256=job.get("fileSha256"),
@@ -634,7 +786,9 @@ def process_and_print_job(job: dict, printer_name: str) -> None:
         logger.info("[Job %s] Downloaded %d bytes from GridFS.", token, bytes_downloaded)
 
         logger.info("[Job %s] Step 2/4: Rendering pages at 300 DPI...", token)
-        update_backend_job_status(order_id, agent_job_id, "PROCESSING")
+        update_backend_job_status(
+            backend_url, agent_id, agent_secret, order_id, agent_job_id, "PROCESSING"
+        )
         pil_pages = render_pages_to_pil_images(job, local_file, dpi=300)
 
         logger.info(
@@ -645,161 +799,193 @@ def process_and_print_job(job: dict, printer_name: str) -> None:
             printer_name,
             printer_info.get("portName"),
         )
-        update_backend_job_status(order_id, agent_job_id, "PRINTING")
+        update_backend_job_status(
+            backend_url, agent_id, agent_secret, order_id, agent_job_id, "PRINTING"
+        )
         doc_title = print_via_windows_gdi(printer_name, job, pil_pages)
 
         logger.info("[Job %s] Step 4/4: Waiting for Windows Spooler confirmation...", token)
         spooler_id = wait_for_spooler_completion(printer_name, doc_title)
 
-        record_completed_job(order_id)
+        record_completed_job(order_id, ledger_path)
         update_backend_job_status(
-            order_id, agent_job_id, "COMPLETED", spooler_job_id=spooler_id
+            backend_url,
+            agent_id,
+            agent_secret,
+            order_id,
+            agent_job_id,
+            "COMPLETED",
+            spooler_job_id=spooler_id,
         )
         logger.info("[Job %s] Physical print on '%s' confirmed COMPLETED.", token, printer_name)
 
 
-def run_diagnostics() -> int:
-    """
-    Runs a complete 5-step diagnostic suite and prints structured results:
-    1. Windows Spooler & HP LaserJet MFP M129-M134 detection
-    2. Backend health connectivity
-    3. Agent authentication & heartbeat registration
-    4. Job polling endpoint verification
-    5. GridFS upload + agent GridFS download verification
-    """
+def load_runtime_config(config_path: str = None) -> dict:
+    load_dotenv(BASE_DIR / ".env")
+    load_dotenv(BASE_DIR.parent / "backend" / ".env")
+
+    cfg = {
+        "backendApiUrl": (os.getenv("BACKEND_API_URL") or "http://localhost:5000/api").rstrip("/"),
+        "agentId": os.getenv("AGENT_ID", "").strip(),
+        "agentSecret": os.getenv("AGENT_SECRET", "").strip(),
+        "deviceId": os.getenv("AGENT_DEVICE_ID", f"win-{socket.gethostname()}").strip(),
+        "selectedPrinterName": os.getenv("PRINTER_NAME", "").strip(),
+        "pollIntervalSeconds": max(2, int(os.getenv("POLL_INTERVAL_SECONDS", "3"))),
+        "logFile": str(LOG_FILE),
+        "ledgerFile": str(LEDGER_FILE),
+    }
+
+    if cfg["selectedPrinterName"] == "Exact Windows printer name":
+        cfg["selectedPrinterName"] = ""
+
+    if config_path and Path(config_path).exists():
+        try:
+            file_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            for k, v in file_cfg.items():
+                if v is not None and v != "":
+                    cfg[k] = v
+            cfg["backendApiUrl"] = str(cfg["backendApiUrl"]).rstrip("/")
+        except Exception as exc:
+            sys.stderr.write(f"Failed to read config file {config_path}: {exc}\n")
+
+    return cfg
+
+
+def run_diagnostics(cfg: dict) -> int:
     print("=" * 68)
     print(f"SMART XEROX WINDOWS PRINT AGENT DIAGNOSTICS (v{AGENT_VERSION})")
     print("=" * 68)
 
-    # 1. Printer Detection
-    printer_name = resolve_target_printer()
-    p_info = inspect_printer_state_and_capabilities(printer_name)
-    print("\n[1/5] WINDOWS PRINTER DETECTION")
-    print(f"  Target Printer    : {p_info['printerName']}")
-    print(f"  Spooler Available : {p_info['spoolerAvailable']}")
-    print(f"  Printer Exists    : {p_info['exists']}")
-    print(f"  Port              : {p_info['portName']}")
-    print(f"  Driver            : {p_info['driverName']}")
-    print(f"  Status Code       : {p_info['printerStatusCode']} (0 = Normal)")
-    print(f"  WorkOffline       : {p_info['workOffline']}")
-    print(f"  Active Queue Jobs : {p_info['spoolerJobCount']}")
-    print(f"  Printer Available : {p_info['printerAvailable']} ({p_info['status']})")
-    print(f"  Capabilities      : {json.dumps(p_info['capabilities'])}")
-    print(f"  Status Message    : {p_info['statusMessage']}")
-
-    if not p_info["exists"]:
-        print("  RESULT: FAIL - Target printer not found in Windows.")
-        return 1
-
-    # 2. Backend Connectivity
-    print("\n[2/5] BACKEND CONNECTIVITY")
-    print(f"  Backend API URL   : {BACKEND_API_URL}")
-    try:
-        health_resp = requests.get(f"{BACKEND_API_URL}/health", timeout=10)
-        print(f"  GET /api/health   : HTTP {health_resp.status_code} -> {health_resp.text}")
-        if health_resp.status_code != 200:
-            print("  RESULT: FAIL - Backend health check did not return 200.")
-            return 1
-    except Exception as exc:
-        print(f"  RESULT: FAIL - Cannot reach backend at {BACKEND_API_URL}: {exc}")
-        return 1
-
-    # 3. Agent Authentication & Heartbeat
-    print("\n[3/5] AGENT AUTHENTICATION & HEARTBEAT")
-    ok, hb_data = send_heartbeat(p_info)
-    print(f"  POST /agent/heartbeat : {'PASS' if ok else 'FAIL'} -> {json.dumps(hb_data)}")
-    if not ok:
-        print("  RESULT: FAIL - Agent authentication or heartbeat failed.")
-        return 1
-
-    # Verify frontend printer-status endpoint reflects Printer Ready
-    status_resp = requests.get(f"{BACKEND_API_URL}/orders/printer-status", timeout=10)
-    status_json = status_resp.json().get("printer", {})
-    print(
-        f"  GET /orders/printer-status : connectionState={status_json.get('connectionState')}, "
-        f"statusLabel='{status_json.get('statusLabel')}', online={status_json.get('online')}"
-    )
-
-    # 4. Job Polling
-    print("\n[4/5] JOB POLLING ENDPOINT")
-    poll_resp = requests.get(
-        f"{BACKEND_API_URL}/agent/jobs/next", headers=api_headers(), timeout=10
-    )
-    print(f"  GET /agent/jobs/next : HTTP {poll_resp.status_code} -> {poll_resp.text}")
-    if poll_resp.status_code != 200:
-        print("  RESULT: FAIL - Job polling returned non-200.")
-        return 1
-
-    # 5. GridFS Upload & Agent Download Verification
-    print("\n[5/5] GRIDFS UPLOAD & AGENT STREAM DOWNLOAD TEST")
-    sample_pdf = (
-        b"%PDF-1.4\n"
-        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
-        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n"
-        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >> endobj\n"
-        b"%%EOF\n"
-    )
-    files = {"document": ("diag-check.pdf", sample_pdf, "application/pdf")}
-    inspect_resp = requests.post(
-        f"{BACKEND_API_URL}/orders/inspect", files=files, timeout=15
-    )
-    print(f"  POST /orders/inspect (GridFS Stage) : HTTP {inspect_resp.status_code}")
-    if inspect_resp.status_code == 200:
-        doc_meta = inspect_resp.json().get("document", {})
+    discovery = discover_all_windows_printers()
+    printers = discovery.get("printers", [])
+    print("\n[1/3] WINDOWS MULTI-PRINTER DISCOVERY")
+    print(f"  Spooler Available : {discovery.get('spoolerAvailable')}")
+    print(f"  Default Printer   : {discovery.get('defaultPrinter')}")
+    print(f"  Detected Printers : {len(printers)}")
+    for idx, p in enumerate(printers, 1):
         print(
-            f"  Staged GridFS ID : {doc_meta.get('gridFsFileId')} "
-            f"(pages={doc_meta.get('pageCount')}, sha256={doc_meta.get('sha256', '')[:16]}...)"
+            f"    {idx}. {p['name']} [{p['connectionType']} on {p['portName']}] -> "
+            f"{p['status']} (available={p['printerAvailable']}, color={p['capabilities']['supportsColor']}, "
+            f"duplex={p['capabilities']['supportsDuplex']}, sizes={p['capabilities']['supportedPaperSizes']})"
         )
+
+    target_printer = resolve_target_printer(cfg.get("selectedPrinterName"), printers)
+    p_info = inspect_printer_state_and_capabilities(target_printer)
+    print(f"  Selected Target   : {p_info['printerName']} ({p_info['statusMessage']})")
+
+    print("\n[2/3] BACKEND CONNECTIVITY")
+    backend_url = cfg["backendApiUrl"]
+    print(f"  Backend API URL   : {backend_url}")
+    try:
+        health_resp = requests.get(f"{backend_url}/health", timeout=10)
+        print(f"  GET /api/health   : HTTP {health_resp.status_code} -> {health_resp.text}")
+    except Exception as exc:
+        print(f"  WARNING: Backend not currently reachable at {backend_url}: {exc}")
+
+    print("\n[3/3] AGENT CREDENTIAL STATUS")
+    if cfg.get("agentId") and cfg.get("agentSecret"):
+        ok, hb_data = send_heartbeat(
+            backend_url=backend_url,
+            agent_id=cfg["agentId"],
+            agent_secret=cfg["agentSecret"],
+            device_id=cfg["deviceId"],
+            primary_printer=p_info,
+            all_printers=printers,
+        )
+        print(f"  POST /agent/heartbeat : {'PASS' if ok else 'FAIL'} -> {json.dumps(hb_data)}")
     else:
-        print(f"  RESULT: FAIL - GridFS stage failed: {inspect_resp.text}")
-        return 1
+        print("  Agent is ready to be paired via the Smart Xerox Windows Desktop Application.")
 
     print("\n" + "=" * 68)
-    print("ALL DIAGNOSTIC CHECKS PASSED! SMART XEROX STATUS: PRINTER READY")
-    print("=" * 68)
     return 0
 
 
-def run_agent_loop() -> None:
-    if not PRINT_AGENT_TOKEN:
-        logger.error("PRINT_AGENT_TOKEN is empty. Set PRINT_AGENT_TOKEN in print-agent/.env or backend/.env.")
-        sys.exit(1)
+def run_agent_loop(cfg: dict, config_path: str = None) -> None:
+    log_path = Path(cfg.get("logFile") or LOG_FILE)
+    ledger_path = Path(cfg.get("ledgerFile") or LEDGER_FILE)
+    setup_logger(log_path)
 
-    printer_name = resolve_target_printer()
-    logger.info("Smart Xerox Windows 11 Print Agent v%s started.", AGENT_VERSION)
-    logger.info("Target USB Printer : %s", printer_name)
-    logger.info("Backend API URL    : %s", BACKEND_API_URL)
-    logger.info("Agent Device ID    : %s", AGENT_DEVICE_ID)
+    logger.info("Smart Xerox Windows Print Agent v%s started.", AGENT_VERSION)
+    logger.info("Backend API URL : %s", cfg["backendApiUrl"])
+
+    preferred_printer = cfg.get("selectedPrinterName") or ""
 
     while True:
         try:
-            printer_name = resolve_target_printer()
-            printer_info = inspect_printer_state_and_capabilities(printer_name)
-            online_ok, _ = send_heartbeat(printer_info)
+            # Reload runtime config on each tick if managed by Electron Desktop App
+            if config_path and Path(config_path).exists():
+                latest = load_runtime_config(config_path)
+                cfg.update(latest)
+                if latest.get("selectedPrinterName"):
+                    preferred_printer = latest["selectedPrinterName"]
 
-            if online_ok and printer_info["printerAvailable"]:
+            agent_id = cfg.get("agentId", "").strip()
+            agent_secret = cfg.get("agentSecret", "").strip()
+            backend_url = cfg["backendApiUrl"]
+            device_id = cfg.get("deviceId") or f"win-{socket.gethostname()}"
+
+            discovery = discover_all_windows_printers()
+            discovered_list = discovery.get("printers", [])
+            target_printer_name = resolve_target_printer(preferred_printer, discovered_list)
+            primary_info = inspect_printer_state_and_capabilities(target_printer_name)
+
+            if not agent_id or not agent_secret:
+                logger.info("Waiting for vendor sign-in & desktop pairing...")
+                time.sleep(3)
+                continue
+
+            online_ok, hb_resp = send_heartbeat(
+                backend_url=backend_url,
+                agent_id=agent_id,
+                agent_secret=agent_secret,
+                device_id=device_id,
+                primary_printer=primary_info,
+                all_printers=discovered_list,
+            )
+
+            if online_ok:
+                server_selected = hb_resp.get("tenant", {}).get("selectedPrinterName")
+                if server_selected and server_selected != preferred_printer:
+                    preferred_printer = server_selected
+                    target_printer_name = resolve_target_printer(preferred_printer, discovered_list)
+                    primary_info = inspect_printer_state_and_capabilities(target_printer_name)
+
+            if online_ok and primary_info["printerAvailable"]:
                 resp = requests.get(
-                    f"{BACKEND_API_URL}/agent/jobs/next",
-                    headers=api_headers(),
+                    f"{backend_url}/agent/jobs/next",
+                    headers=build_agent_headers(agent_id, agent_secret),
                     timeout=15,
                 )
                 if resp.status_code == 200:
                     payload = resp.json()
                     job = payload.get("job")
                     if job:
+                        job_printer = job.get("printerName") or target_printer_name
+                        resolved_job_printer = resolve_target_printer(job_printer, discovered_list)
                         logger.info(
-                            "Claimed print job %s (%s)",
+                            "Claimed print job %s (%s) -> target printer '%s'",
                             job.get("token"),
                             job.get("originalName"),
+                            resolved_job_printer,
                         )
                         try:
-                            process_and_print_job(job, printer_name)
+                            process_and_print_job(
+                                backend_url=backend_url,
+                                agent_id=agent_id,
+                                agent_secret=agent_secret,
+                                job=job,
+                                printer_name=resolved_job_printer,
+                                ledger_path=ledger_path,
+                            )
                         except Exception as job_err:
                             logger.exception("Error processing print job %s", job.get("token"))
                             update_backend_job_status(
-                                str(job["orderId"]),
-                                str(job["agentJobId"]),
-                                "FAILED",
+                                backend_url=backend_url,
+                                agent_id=agent_id,
+                                agent_secret=agent_secret,
+                                order_id=str(job["orderId"]),
+                                agent_job_id=str(job["agentJobId"]),
+                                status="FAILED",
                                 failure_reason=str(job_err),
                             )
         except KeyboardInterrupt:
@@ -808,19 +994,35 @@ def run_agent_loop() -> None:
         except Exception as loop_err:
             logger.error("Agent loop error: %s", loop_err)
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(max(2, int(cfg.get("pollIntervalSeconds", 3))))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Smart Xerox Windows 11 USB Print Agent")
+    parser = argparse.ArgumentParser(description="Smart Xerox Windows Background Print Agent")
+    parser.add_argument(
+        "--list-printers-json",
+        action="store_true",
+        help="Enumerate all Windows printers, status, and capabilities as JSON and exit.",
+    )
     parser.add_argument(
         "--diagnose",
         action="store_true",
-        help="Run connectivity, auth, printer detection, and GridFS diagnostic checks and exit.",
+        help="Run printer discovery, backend connectivity, and agent diagnostics and exit.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON runtime config managed by the Smart Xerox Electron Desktop App.",
     )
     args = parser.parse_args()
 
+    if args.list_printers_json:
+        print(json.dumps(discover_all_windows_printers()))
+        sys.exit(0)
+
+    runtime_cfg = load_runtime_config(args.config)
     if args.diagnose:
-        sys.exit(run_diagnostics())
+        sys.exit(run_diagnostics(runtime_cfg))
     else:
-        run_agent_loop()
+        run_agent_loop(runtime_cfg, config_path=args.config)

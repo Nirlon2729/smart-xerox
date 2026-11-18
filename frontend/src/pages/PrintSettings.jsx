@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import toast from "react-hot-toast";
 import { Printer } from "lucide-react";
 import FileCard from "../components/FileCard";
@@ -10,16 +10,22 @@ import { usePrintSession } from "../context/PrintSessionContext";
 import {
   inspectAndStagePdf,
   createPrintOrder,
+  saveCustomerOrderToken,
   getApiErrorMessage
 } from "../services/api";
 import {
   validateCustomPageRangeInput,
-  summarizeSelectedPages
+  summarizeSelectedPages,
+  formatFileSize
 } from "../utils/formatters";
 
 export default function PrintSettings() {
+  const { shopSlug: routeShopSlug } = useParams();
   const navigate = useNavigate();
   const {
+    shopSlug,
+    setShopSlug,
+    shopInfo,
     selectedFile,
     previewObjectUrl,
     documentMeta,
@@ -32,20 +38,29 @@ export default function PrintSettings() {
     clearDocument
   } = usePrintSession();
 
+  const activeSlug = routeShopSlug || shopSlug;
+
   const [customRangeError, setCustomRangeError] = useState(null);
   const [replacing, setReplacing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  // Unique idempotency key per print settings session to prevent duplicate printing
   const idempotencyKeyRef = useRef(
     `job-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
   );
 
   useEffect(() => {
-    if (!documentMeta) {
+    if (routeShopSlug) {
+      setShopSlug(routeShopSlug);
+    }
+  }, [routeShopSlug, setShopSlug]);
+
+  useEffect(() => {
+    if (!documentMeta && activeSlug) {
+      navigate(`/shop/${activeSlug}`, { replace: true });
+    } else if (!documentMeta && !activeSlug) {
       navigate("/", { replace: true });
     }
-  }, [documentMeta, navigate]);
+  }, [documentMeta, activeSlug, navigate]);
 
   const totalPages = documentMeta?.pageCount || 1;
   const isImage = documentMeta?.documentType === "image";
@@ -53,7 +68,11 @@ export default function PrintSettings() {
   useEffect(() => {
     if (!documentMeta) return;
 
-    if (isImage || settings.pageSelectionMode === "all") {
+    if (
+      isImage ||
+      settings.pageSelectionMode === "all" ||
+      settings.pageSelectionMode === "selected"
+    ) {
       setCustomRangeError(null);
       return;
     }
@@ -77,7 +96,6 @@ export default function PrintSettings() {
     updateSettings
   ]);
 
-  // Reset idempotencyKey when user intentionally changes print settings
   useEffect(() => {
     idempotencyKeyRef.current = `job-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }, [
@@ -88,16 +106,17 @@ export default function PrintSettings() {
     settings.orientation,
     settings.pageSelectionMode,
     settings.customPageRange,
+    settings.selectedPages,
     settings.copies
   ]);
 
   if (!documentMeta) return null;
 
   const handleReplaceFile = async (newFile) => {
-    if (replacing || submitting) return;
+    if (replacing || submitting || !activeSlug) return;
     try {
       setReplacing(true);
-      const res = await inspectAndStagePdf(newFile);
+      const res = await inspectAndStagePdf(activeSlug, newFile);
       if (res?.success && res.document) {
         setUploadedDocument(newFile, res.document);
         toast.success(`Replaced with ${res.document.originalName}`);
@@ -111,18 +130,23 @@ export default function PrintSettings() {
 
   const handleRemoveFile = () => {
     clearDocument();
-    navigate("/");
+    navigate(activeSlug ? `/shop/${activeSlug}` : "/");
   };
 
   const handlePrintNow = async () => {
-    if (submitting) return;
+    if (submitting || !activeSlug) return;
     if (customRangeError) {
       toast.error(customRangeError);
       return;
     }
 
     let finalSelectedPages = Array.from({ length: totalPages }, (_, i) => i + 1);
-    if (!isImage && settings.pageSelectionMode === "custom") {
+    if (!isImage && settings.pageSelectionMode === "selected") {
+      finalSelectedPages =
+        settings.selectedPages && settings.selectedPages.length > 0
+          ? settings.selectedPages
+          : [1];
+    } else if (!isImage && settings.pageSelectionMode === "custom") {
       const validation = validateCustomPageRangeInput(
         settings.customPageRange,
         totalPages
@@ -137,7 +161,7 @@ export default function PrintSettings() {
 
     try {
       setSubmitting(true);
-      const response = await createPrintOrder({
+      const response = await createPrintOrder(activeSlug, {
         file: selectedFile,
         uploadId: documentMeta.uploadId,
         idempotencyKey: idempotencyKeyRef.current,
@@ -155,9 +179,12 @@ export default function PrintSettings() {
       });
 
       if (response?.success && response.order) {
+        saveCustomerOrderToken(activeSlug, response.order.token);
         setActiveOrder(response.order);
         toast.success("Sending to printer...");
-        navigate(`/job/${response.order.token}`, { replace: true });
+        navigate(`/shop/${activeSlug}/job/${response.order.token}`, {
+          replace: true
+        });
       } else {
         throw new Error("Could not submit print job.");
       }
@@ -171,7 +198,7 @@ export default function PrintSettings() {
   const activeSelectedPages =
     isImage || settings.pageSelectionMode === "all"
       ? Array.from({ length: totalPages }, (_, i) => i + 1)
-      : settings.selectedPages;
+      : settings.selectedPages || [1];
 
   const totalImpressions = activeSelectedPages.length * settings.copies;
 
@@ -179,12 +206,16 @@ export default function PrintSettings() {
     <div className="space-y-4 pb-28">
       <div>
         <h1 className="text-xl sm:text-2xl font-bold text-zinc-900">
-          Print Settings
+          Printing Options
         </h1>
         <p className="text-xs sm:text-sm text-zinc-600 mt-0.5">
-          Target printer:{" "}
+          Shop:{" "}
           <strong className="text-zinc-900">
-            {printerState?.printerName || "HP USB Printer"}
+            {shopInfo?.shopName || activeSlug}
+          </strong>{" "}
+          • Printer:{" "}
+          <strong className="text-zinc-900">
+            {printerState?.printerName || "Shop Printer"}
           </strong>
         </p>
       </div>
@@ -224,16 +255,31 @@ export default function PrintSettings() {
         customRangeError={customRangeError}
       />
 
-      {/* Compact Print Summary Card */}
-      <div className="bg-white rounded-2xl border border-zinc-200 p-4 text-xs sm:text-sm space-y-1.5">
+      {/* Document Summary Card Before Printing */}
+      <div className="bg-white rounded-2xl border border-zinc-200 p-4 text-xs sm:text-sm space-y-2">
+        <div className="pb-2 border-b border-zinc-100 font-bold uppercase tracking-wider text-xs text-zinc-500">
+          Document Summary
+        </div>
         <div className="flex items-center justify-between text-zinc-600">
-          <span>Summary</span>
+          <span>Document</span>
+          <span className="font-semibold text-zinc-900 truncate max-w-[200px]">
+            {documentMeta.originalName} ({formatFileSize(documentMeta.fileSize)})
+          </span>
+        </div>
+        <div className="flex items-center justify-between text-zinc-600">
+          <span>Print Mode</span>
           <span className="font-mono-code font-semibold text-zinc-900">
             {settings.paperSize} •{" "}
-            {settings.colorMode === "color" ? "Colour" : "B&W"} •{" "}
+            {settings.colorMode === "color" ? "Colour" : "Black & White"} •{" "}
             {isImage || settings.sides === "single"
               ? "Single-sided"
               : "Double-sided"}
+          </span>
+        </div>
+        <div className="flex items-center justify-between text-zinc-600">
+          <span>Orientation</span>
+          <span className="font-mono-code font-semibold text-zinc-900 capitalize">
+            {settings.orientation || "Portrait"}
           </span>
         </div>
         <div className="flex items-center justify-between text-zinc-600">
@@ -247,12 +293,12 @@ export default function PrintSettings() {
       </div>
 
       <BottomActionBar
-        summaryLabel={printerState?.online ? "Ready to print" : "Queued for agent"}
+        summaryLabel={printerState?.online ? "Ready to print" : "Queued for shop printer"}
         summaryValue={`${totalImpressions} ${totalImpressions === 1 ? "page" : "pages"}`}
         summarySubtext={`${settings.paperSize} • ${
           settings.colorMode === "color" ? "Colour" : "B&W"
         }`}
-        primaryLabel="PRINT NOW"
+        primaryLabel="PRINT"
         onPrimaryClick={handlePrintNow}
         primaryDisabled={Boolean(customRangeError) || submitting || replacing}
         primaryLoading={submitting}

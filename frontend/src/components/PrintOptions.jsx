@@ -19,6 +19,7 @@ export default function PrintOptions({
     orientation,
     pageSelectionMode,
     customPageRange,
+    selectedPages = [1],
     copies
   } = settings;
 
@@ -26,11 +27,11 @@ export default function PrintOptions({
     Array.isArray(capabilities?.supportedPaperSizes) &&
     capabilities.supportedPaperSizes.length > 0
       ? capabilities.supportedPaperSizes.filter((s) => ALL_PAPER_SIZES.includes(s))
-      : ["A4", "Letter", "Legal", "A5"];
+      : ["A4", "Legal"];
 
-  const supportsColor = capabilities?.supportsColor !== false;
+  const supportsColor = Boolean(capabilities?.supportsColor);
   const supportsDuplex =
-    capabilities?.supportsDuplex !== false && documentType === "pdf" && totalPages > 1;
+    Boolean(capabilities?.supportsDuplex) && documentType === "pdf" && totalPages > 1;
 
   const handleCopiesStep = (delta) => {
     const next = Math.min(maxCopies, Math.max(1, Number(copies || 1) + delta));
@@ -51,6 +52,22 @@ export default function PrintOptions({
     }
   };
 
+  const handleTogglePageNumber = (pageNum) => {
+    const currentSet = new Set(selectedPages);
+    if (currentSet.has(pageNum)) {
+      if (currentSet.size <= 1) return; // Keep at least 1 page selected
+      currentSet.delete(pageNum);
+    } else {
+      currentSet.add(pageNum);
+    }
+    const sorted = [...currentSet].sort((a, b) => a - b);
+    onUpdateSettings({
+      pageSelectionMode: "selected",
+      selectedPages: sorted,
+      customPageRange: sorted.join(",")
+    });
+  };
+
   const colorOptions = [
     { id: "bw", title: "Black & White", desc: "Monochrome grayscale" },
     ...(supportsColor
@@ -65,35 +82,12 @@ export default function PrintOptions({
       : [])
   ];
 
+  const selectedSet = new Set(selectedPages);
+  const interactivePageLimit = Math.min(totalPages, 60);
+
   return (
     <div className="bg-white rounded-2xl border border-zinc-200 divide-y divide-zinc-100">
-      {/* 1. PAPER SIZE (only sizes supported by configured printer) */}
-      <div className="p-4">
-        <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
-          Paper Size
-        </label>
-        <div className="flex flex-wrap gap-2">
-          {supportedPaperSizes.map((size) => {
-            const active = paperSize === size;
-            return (
-              <button
-                key={size}
-                type="button"
-                onClick={() => onUpdateSettings({ paperSize: size })}
-                className={`min-h-[40px] px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold font-mono-code border transition ${
-                  active
-                    ? "border-[#8D0100] bg-[#8D0100] text-white"
-                    : "border-zinc-200 bg-white text-zinc-800 hover:bg-zinc-50"
-                }`}
-              >
-                {size}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* 2. COLOUR */}
+      {/* 1. COLOUR MODE */}
       <div className="p-4">
         <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
           Colour Mode
@@ -131,10 +125,36 @@ export default function PrintOptions({
         </div>
       </div>
 
+      {/* 2. PAPER SIZE (only sizes supported by configured printer) */}
+      <div className="p-4">
+        <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
+          Paper Size
+        </label>
+        <div className="flex flex-wrap gap-2">
+          {supportedPaperSizes.map((size) => {
+            const active = paperSize === size;
+            return (
+              <button
+                key={size}
+                type="button"
+                onClick={() => onUpdateSettings({ paperSize: size })}
+                className={`min-h-[40px] px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold font-mono-code border transition ${
+                  active
+                    ? "border-[#8D0100] bg-[#8D0100] text-white"
+                    : "border-zinc-200 bg-white text-zinc-800 hover:bg-zinc-50"
+                }`}
+              >
+                {size}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       {/* 3. PRINT SIDES */}
       <div className="p-4">
         <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
-          Print Sides
+          Printing Sides
         </label>
         <div className={`grid gap-2.5 ${sideOptions.length > 1 ? "grid-cols-2" : "grid-cols-1"}`}>
           {sideOptions.map((option) => {
@@ -169,108 +189,139 @@ export default function PrintOptions({
         </div>
       </div>
 
-      {/* 4. ORIENTATION */}
-      <div className="p-4">
-        <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
-          Orientation
-        </label>
-        <div className="grid grid-cols-3 gap-2">
-          {[
-            { id: "auto", label: "Auto" },
-            { id: "portrait", label: "Portrait" },
-            { id: "landscape", label: "Landscape" }
-          ].map((item) => {
-            const active = orientation === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => onUpdateSettings({ orientation: item.id })}
-                className={`min-h-[42px] px-3 py-2 rounded-xl border text-xs sm:text-sm font-semibold transition flex items-center justify-center gap-1.5 ${
-                  active
-                    ? "border-[#8D0100] bg-[#8D0100]/5 text-[#8D0100] ring-1 ring-[#8D0100]"
-                    : "border-zinc-200 bg-white text-zinc-800 hover:bg-zinc-50"
-                }`}
-              >
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* 5. PAGES (shown for PDFs) */}
+      {/* 4. PAGE SELECTION (All pages / Selected pages / Custom page range) */}
       {documentType === "pdf" && (
         <div className="p-4">
           <div className="flex items-center justify-between mb-2.5">
             <label className="text-xs font-bold uppercase tracking-wider text-zinc-500">
-              Pages
+              Page Selection
             </label>
             <span className="text-xs text-zinc-500 font-mono-code">
               Total: {totalPages} {totalPages === 1 ? "page" : "pages"}
             </span>
           </div>
 
-          <div className="grid grid-cols-2 gap-2.5">
-            <button
-              type="button"
-              onClick={() =>
-                onUpdateSettings({
-                  pageSelectionMode: "all",
-                  selectedPages: Array.from({ length: totalPages }, (_, i) => i + 1)
-                })
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              {
+                id: "all",
+                title: "All pages",
+                desc: totalPages === 1 ? "Page 1" : `1–${totalPages}`
+              },
+              {
+                id: "selected",
+                title: "Selected pages",
+                desc: "Tap pages"
+              },
+              {
+                id: "custom",
+                title: "Custom range",
+                desc: "e.g. 1-5, 8"
               }
-              className={`p-3.5 rounded-xl border text-left transition flex items-start justify-between gap-2 ${
-                pageSelectionMode === "all"
-                  ? "border-[#8D0100] bg-[#8D0100]/5 ring-1 ring-[#8D0100]"
-                  : "border-zinc-200 bg-white hover:bg-zinc-50"
-              }`}
-            >
-              <div>
-                <span className="block text-sm font-semibold text-zinc-900">
-                  All pages
-                </span>
-                <span className="block text-xs text-zinc-500 font-mono-code mt-0.5">
-                  {totalPages === 1 ? "Page 1" : `1–${totalPages}`}
-                </span>
-              </div>
-              {pageSelectionMode === "all" && (
-                <span className="w-5 h-5 rounded-md bg-[#8D0100] text-white flex items-center justify-center shrink-0">
-                  <Check className="w-3.5 h-3.5" />
-                </span>
-              )}
-            </button>
-
-            <button
-              type="button"
-              onClick={() =>
-                onUpdateSettings({
-                  pageSelectionMode: "custom",
-                  customPageRange:
-                    customPageRange || (totalPages > 1 ? `1-${Math.min(2, totalPages)}` : "1")
-                })
-              }
-              className={`p-3.5 rounded-xl border text-left transition flex items-start justify-between gap-2 ${
-                pageSelectionMode === "custom"
-                  ? "border-[#8D0100] bg-[#8D0100]/5 ring-1 ring-[#8D0100]"
-                  : "border-zinc-200 bg-white hover:bg-zinc-50"
-              }`}
-            >
-              <div>
-                <span className="block text-sm font-semibold text-zinc-900">
-                  Custom range
-                </span>
-                <span className="block text-xs text-zinc-500 mt-0.5">
-                  Specific pages
-                </span>
-              </div>
-              {pageSelectionMode === "custom" && (
-                <span className="w-5 h-5 rounded-md bg-[#8D0100] text-white flex items-center justify-center shrink-0">
-                  <Check className="w-3.5 h-3.5" />
-                </span>
-              )}
-            </button>
+            ].map((modeItem) => {
+              const active = pageSelectionMode === modeItem.id;
+              return (
+                <button
+                  key={modeItem.id}
+                  type="button"
+                  onClick={() => {
+                    if (modeItem.id === "all") {
+                      onUpdateSettings({
+                        pageSelectionMode: "all",
+                        selectedPages: Array.from({ length: totalPages }, (_, i) => i + 1)
+                      });
+                    } else if (modeItem.id === "selected") {
+                      const nextPages =
+                        selectedPages && selectedPages.length > 0 ? selectedPages : [1];
+                      onUpdateSettings({
+                        pageSelectionMode: "selected",
+                        selectedPages: nextPages,
+                        customPageRange: nextPages.join(",")
+                      });
+                    } else {
+                      onUpdateSettings({
+                        pageSelectionMode: "custom",
+                        customPageRange:
+                          customPageRange ||
+                          (totalPages > 1 ? `1-${Math.min(2, totalPages)}` : "1")
+                      });
+                    }
+                  }}
+                  className={`p-3 rounded-xl border text-left transition flex flex-col justify-between ${
+                    active
+                      ? "border-[#8D0100] bg-[#8D0100]/5 ring-1 ring-[#8D0100]"
+                      : "border-zinc-200 bg-white hover:bg-zinc-50"
+                  }`}
+                >
+                  <span className="block text-xs sm:text-sm font-semibold text-zinc-900">
+                    {modeItem.title}
+                  </span>
+                  <span className="block text-[11px] text-zinc-500 font-mono-code mt-0.5">
+                    {modeItem.desc}
+                  </span>
+                </button>
+              );
+            })}
           </div>
+
+          {pageSelectionMode === "selected" && (
+            <div className="mt-3 pt-3 border-t border-zinc-100">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-medium text-zinc-700">
+                  Tap page numbers to include ({selectedPages.length} selected)
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const all = Array.from({ length: totalPages }, (_, i) => i + 1);
+                      onUpdateSettings({
+                        selectedPages: all,
+                        customPageRange: all.join(",")
+                      });
+                    }}
+                    className="text-[11px] font-semibold text-[#8D0100] hover:underline"
+                  >
+                    Select All
+                  </button>
+                  <span className="text-zinc-300">•</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onUpdateSettings({
+                        selectedPages: [1],
+                        customPageRange: "1"
+                      })
+                    }
+                    className="text-[11px] font-semibold text-zinc-500 hover:underline"
+                  >
+                    Page 1 Only
+                  </button>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto p-1">
+                {Array.from({ length: interactivePageLimit }, (_, i) => i + 1).map(
+                  (pageNum) => {
+                    const isChecked = selectedSet.has(pageNum);
+                    return (
+                      <button
+                        key={pageNum}
+                        type="button"
+                        onClick={() => handleTogglePageNumber(pageNum)}
+                        className={`w-9 h-9 rounded-lg text-xs font-mono-code font-semibold border transition ${
+                          isChecked
+                            ? "bg-[#8D0100] text-white border-[#8D0100]"
+                            : "bg-zinc-50 text-zinc-700 border-zinc-200 hover:bg-zinc-100"
+                        }`}
+                      >
+                        {pageNum}
+                      </button>
+                    );
+                  }
+                )}
+              </div>
+            </div>
+          )}
 
           {pageSelectionMode === "custom" && (
             <div className="mt-3 pt-3 border-t border-zinc-100">
@@ -286,7 +337,7 @@ export default function PrintOptions({
                 inputMode="text"
                 value={customPageRange}
                 onChange={(e) => onUpdateSettings({ customPageRange: e.target.value })}
-                placeholder="e.g. 1-5, 1,3,5, 1-3,7,9-12"
+                placeholder="e.g. 1-5, 8, 11-13"
                 className={`w-full min-h-[44px] px-3.5 py-2 rounded-lg border text-sm font-mono-code focus:outline-none transition ${
                   customRangeError
                     ? "border-red-400 bg-red-50/30"
@@ -310,11 +361,11 @@ export default function PrintOptions({
         </div>
       )}
 
-      {/* 6. COPIES */}
+      {/* 5. NUMBER OF COPIES */}
       <div className="p-4 flex items-center justify-between gap-4">
         <div>
           <span className="block text-xs font-bold uppercase tracking-wider text-zinc-500">
-            Copies
+            Number of Copies
           </span>
           <span className="text-xs text-zinc-500 mt-0.5 block">
             1 to {maxCopies} copies
@@ -352,6 +403,49 @@ export default function PrintOptions({
           >
             <Plus className="w-4 h-4" />
           </button>
+        </div>
+      </div>
+
+      {/* 6. ORIENTATION */}
+      <div className="p-4">
+        <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
+          Orientation
+        </label>
+        <div className="grid grid-cols-2 gap-2.5">
+          {[
+            { id: "portrait", label: "Portrait", desc: "Vertical page" },
+            { id: "landscape", label: "Landscape", desc: "Horizontal page" }
+          ].map((item) => {
+            const active =
+              orientation === item.id ||
+              (orientation === "auto" && item.id === "portrait");
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => onUpdateSettings({ orientation: item.id })}
+                className={`text-left p-3.5 rounded-xl border transition flex items-start justify-between gap-2 ${
+                  active
+                    ? "border-[#8D0100] bg-[#8D0100]/5 ring-1 ring-[#8D0100]"
+                    : "border-zinc-200 bg-white hover:bg-zinc-50"
+                }`}
+              >
+                <div>
+                  <span className="block text-sm font-semibold text-zinc-900">
+                    {item.label}
+                  </span>
+                  <span className="block text-xs text-zinc-500 mt-0.5">
+                    {item.desc}
+                  </span>
+                </div>
+                {active && (
+                  <span className="w-5 h-5 rounded-md bg-[#8D0100] text-white flex items-center justify-center shrink-0">
+                    <Check className="w-3.5 h-3.5" />
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
       </div>
     </div>

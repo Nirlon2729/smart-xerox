@@ -1,31 +1,33 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { useNavigate, useParams, Link } from "react-router-dom";
 import toast from "react-hot-toast";
 import {
   Printer,
   RefreshCw,
   ArrowRight,
-  RotateCcw,
   XCircle,
-  Trash2,
   FileText,
-  Image as ImageIcon
+  Image as ImageIcon,
+  AlertCircle,
+  MapPin,
+  Phone
 } from "lucide-react";
 import UploadBox from "../components/UploadBox";
 import FileCard from "../components/FileCard";
+import DocumentPreview from "../components/DocumentPreview";
 import BottomActionBar from "../components/BottomActionBar";
+import Loader from "../components/Loader";
 import { getConnectionBadgeStyle } from "../components/Header";
 import { getOrderStatusMeta } from "../components/OrderStatus";
 import { usePrintSession } from "../context/PrintSessionContext";
 import {
   inspectAndStagePdf,
-  fetchRecentJobs,
+  fetchOrderByToken,
   cancelPendingOrder,
-  reprintOrderRequest,
-  clearFailedOrdersRequest,
+  getSavedCustomerOrderTokens,
   getApiErrorMessage
 } from "../services/api";
-import { formatFileSize, summarizeSelectedPages } from "../utils/formatters";
+import { summarizeSelectedPages } from "../utils/formatters";
 
 const ALLOWED_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png"];
 const ALLOWED_MIMES = [
@@ -37,10 +39,16 @@ const ALLOWED_MIMES = [
 ];
 
 export default function Home() {
+  const { shopSlug: routeShopSlug } = useParams();
   const navigate = useNavigate();
   const {
-    selectedFile,
+    shopSlug,
+    setShopSlug,
+    shopInfo,
+    shopLoading,
+    shopError,
     documentMeta,
+    previewObjectUrl,
     printerState,
     refreshPrinterStatus,
     shopConfig,
@@ -52,36 +60,74 @@ export default function Home() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState(null);
 
-  const [recentJobs, setRecentJobs] = useState([]);
-  const [loadingJobs, setLoadingJobs] = useState(true);
-  const [confirmReprintJob, setConfirmReprintJob] = useState(null);
-  const [busyJobId, setBusyJobId] = useState(null);
+  const [myRecentJobs, setMyRecentJobs] = useState([]);
+  const [busyJobToken, setBusyJobToken] = useState(null);
 
+  useEffect(() => {
+    if (routeShopSlug) {
+      setShopSlug(routeShopSlug);
+    }
+  }, [routeShopSlug, setShopSlug]);
+
+  const activeSlug = routeShopSlug || shopSlug;
   const maxUploadMb = shopConfig?.maxUploadMb || 20;
   const maxBytes = maxUploadMb * 1024 * 1024;
 
-  const loadRecentJobs = useCallback(async (silent = false) => {
-    if (!silent) setLoadingJobs(true);
-    try {
-      const res = await fetchRecentJobs(15);
-      if (res?.success && Array.isArray(res.orders)) {
-        setRecentJobs(res.orders);
-      }
-    } catch (_err) {
-      // Handled gracefully
-    } finally {
-      if (!silent) setLoadingJobs(false);
+  const loadCustomerRecentJobs = useCallback(async () => {
+    if (!activeSlug) return;
+    const savedTokens = getSavedCustomerOrderTokens(activeSlug);
+    if (savedTokens.length === 0) {
+      setMyRecentJobs([]);
+      return;
     }
-  }, []);
+
+    const results = await Promise.all(
+      savedTokens.slice(0, 6).map(async (tok) => {
+        try {
+          const res = await fetchOrderByToken(activeSlug, tok);
+          return res?.order || null;
+        } catch (_e) {
+          return null;
+        }
+      })
+    );
+    setMyRecentJobs(results.filter(Boolean));
+  }, [activeSlug]);
 
   useEffect(() => {
-    loadRecentJobs(false);
-    const interval = setInterval(() => loadRecentJobs(true), 4000);
+    loadCustomerRecentJobs();
+    const interval = setInterval(loadCustomerRecentJobs, 5000);
     return () => clearInterval(interval);
-  }, [loadRecentJobs]);
+  }, [loadCustomerRecentJobs]);
+
+  if (shopLoading && !shopInfo && !shopError) {
+    return <Loader fullScreen label="Loading print shop..." />;
+  }
+
+  if (shopError) {
+    return (
+      <div className="bg-white rounded-2xl border border-zinc-200 p-6 text-center space-y-4 mt-4">
+        <div className="w-12 h-12 rounded-xl bg-red-50 text-red-600 flex items-center justify-center mx-auto">
+          <AlertCircle className="w-6 h-6" />
+        </div>
+        <h1 className="text-lg font-bold text-zinc-900">Shop Unavailable</h1>
+        <p className="text-xs sm:text-sm text-zinc-600 max-w-xs mx-auto leading-relaxed">
+          {shopError}
+        </p>
+        <div className="pt-2">
+          <Link
+            to="/"
+            className="inline-flex items-center justify-center px-5 py-2.5 rounded-xl bg-[#8D0100] text-white text-xs font-semibold"
+          >
+            Enter Another Shop Code
+          </Link>
+        </div>
+      </div>
+    );
+  }
 
   const validateAndUploadFile = async (file) => {
-    if (uploading) return;
+    if (uploading || !activeSlug) return;
     setUploadError(null);
 
     if (!file) return;
@@ -115,7 +161,7 @@ export default function Home() {
       setUploading(true);
       setUploadProgress(5);
 
-      const response = await inspectAndStagePdf(file, (percent) => {
+      const response = await inspectAndStagePdf(activeSlug, file, (percent) => {
         setUploadProgress(percent);
       });
 
@@ -123,19 +169,19 @@ export default function Home() {
         setUploadedDocument(file, response.document);
         toast.success(
           response.document.documentType === "image"
-            ? "Image uploaded to GridFS"
+            ? "Image uploaded"
             : `PDF uploaded (${response.document.pageCount} ${
                 response.document.pageCount === 1 ? "page" : "pages"
               })`
         );
-        navigate("/settings");
+        navigate(`/shop/${activeSlug}/settings`);
       } else {
         throw new Error("Could not verify document.");
       }
     } catch (err) {
       const message = getApiErrorMessage(
         err,
-        "Unable to upload file. Verify the backend is running."
+        "Unable to upload file. Please check your connection and try again."
       );
       setUploadError(message);
       toast.error(message);
@@ -152,91 +198,87 @@ export default function Home() {
 
   const handleCancelJob = async (job) => {
     try {
-      setBusyJobId(job.id);
-      await cancelPendingOrder(job.token);
+      setBusyJobToken(job.token);
+      await cancelPendingOrder(activeSlug, job.token);
       toast.success(`Cancelled ${job.originalName}`);
-      loadRecentJobs(true);
+      loadCustomerRecentJobs();
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Could not cancel job"));
     } finally {
-      setBusyJobId(null);
+      setBusyJobToken(null);
     }
   };
 
-  const handleConfirmReprint = async () => {
-    if (!confirmReprintJob) return;
-    const job = confirmReprintJob;
-    setConfirmReprintJob(null);
-    try {
-      setBusyJobId(job.id);
-      const res = await reprintOrderRequest(job.token);
-      if (res?.success && res.order) {
-        toast.success("Sending reprint to printer...");
-        loadRecentJobs(true);
-        navigate(`/job/${res.order.token}`);
-      }
-    } catch (err) {
-      toast.error(getApiErrorMessage(err, "Could not reprint document"));
-    } finally {
-      setBusyJobId(null);
-    }
-  };
-
-  const handleClearFailed = async () => {
-    try {
-      const res = await clearFailedOrdersRequest();
-      if (res?.success) {
-        toast.success(res.message || "Cleared failed jobs");
-        loadRecentJobs(true);
-      }
-    } catch (err) {
-      toast.error(getApiErrorMessage(err, "Could not clear failed jobs"));
-    }
-  };
-
-  const hasFailedOrCancelled = recentJobs.some((j) =>
-    ["FAILED", "CANCELLED"].includes(j.status)
-  );
   const connBadge = getConnectionBadgeStyle(printerState?.connectionState);
 
   return (
     <div className={documentMeta ? "pb-24 space-y-5" : "pb-12 space-y-5"}>
-      {/* Live USB Printer Connection Status Card */}
-      <div className="bg-white rounded-2xl border border-zinc-200 p-4 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-3 min-w-0">
-          <div
-            className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border ${connBadge.pillClass}`}
-          >
-            <Printer className="w-5 h-5" />
-          </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-bold text-zinc-900 truncate">
-                {printerState?.printerName || "HP LaserJet MFP M129-M134"}
-              </span>
-              <span
-                className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${connBadge.pillClass}`}
+      {/* Shop Banner & Printer Availability Card */}
+      <div className="bg-white rounded-2xl border border-zinc-200 p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            {shopInfo?.logoUrl ? (
+              <img
+                src={shopInfo.logoUrl}
+                alt={shopInfo.shopName}
+                className="w-11 h-11 rounded-xl object-cover border border-zinc-200 shrink-0"
+              />
+            ) : (
+              <div
+                className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 border ${connBadge.pillClass}`}
               >
-                {connBadge.label}
-              </span>
+                <Printer className="w-5 h-5" />
+              </div>
+            )}
+
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="text-sm sm:text-base font-bold text-zinc-900 truncate">
+                  {shopInfo?.shopName || "Smart Xerox Shop"}
+                </h1>
+                <span
+                  className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${connBadge.pillClass}`}
+                >
+                  {connBadge.label}
+                </span>
+              </div>
+              <p className="text-xs text-zinc-500 truncate mt-0.5">
+                {printerState?.online
+                  ? `Ready to print on ${printerState.printerName}`
+                  : printerState?.statusMessage || "Checking printer connection..."}
+              </p>
             </div>
-            <p className="text-xs text-zinc-500 truncate mt-0.5">
-              {printerState?.statusMessage || "Ready for mobile print jobs"}
-            </p>
           </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              refreshPrinterStatus();
+              loadCustomerRecentJobs();
+            }}
+            aria-label="Refresh printer status"
+            className="w-9 h-9 rounded-lg border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 text-zinc-700 flex items-center justify-center shrink-0 transition"
+          >
+            <RefreshCw className="w-4 h-4" />
+          </button>
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            refreshPrinterStatus();
-            loadRecentJobs(false);
-          }}
-          aria-label="Refresh printer status"
-          className="w-9 h-9 rounded-lg border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 text-zinc-700 flex items-center justify-center shrink-0 transition"
-        >
-          <RefreshCw className="w-4 h-4" />
-        </button>
+        {(shopInfo?.address || shopInfo?.phone) && (
+          <div className="pt-2.5 border-t border-zinc-100 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-500">
+            {shopInfo.address && (
+              <span className="inline-flex items-center gap-1">
+                <MapPin className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                <span>{shopInfo.address}</span>
+              </span>
+            )}
+            {shopInfo.phone && (
+              <span className="inline-flex items-center gap-1">
+                <Phone className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                <span>{shopInfo.phone}</span>
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Upload Box or Currently Staged Document */}
@@ -249,7 +291,7 @@ export default function Home() {
           error={uploadError}
         />
       ) : (
-        <div className="space-y-3">
+        <div className="space-y-4">
           <FileCard
             originalName={documentMeta.originalName}
             fileSize={documentMeta.fileSize}
@@ -261,55 +303,39 @@ export default function Home() {
             onReplace={validateAndUploadFile}
             disabled={uploading}
           />
+
+          <DocumentPreview
+            originalName={documentMeta.originalName}
+            documentType={documentMeta.documentType}
+            pageCount={documentMeta.pageCount}
+            selectedPages={Array.from({ length: documentMeta.pageCount || 1 }, (_, i) => i + 1)}
+            previewObjectUrl={previewObjectUrl}
+          />
         </div>
       )}
 
-      {/* Recent Print Jobs */}
-      <div className="bg-white rounded-2xl border border-zinc-200 p-4">
-        <div className="flex items-center justify-between gap-2 pb-3 border-b border-zinc-100">
-          <div>
+      {/* Customer's Own Recent Print Jobs on This Device */}
+      {myRecentJobs.length > 0 && (
+        <div className="bg-white rounded-2xl border border-zinc-200 p-4">
+          <div className="flex items-center justify-between gap-2 pb-3 border-b border-zinc-100">
             <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-500">
-              Recent Print Jobs
+              Your Recent Print Jobs
             </h2>
           </div>
 
-          {hasFailedOrCancelled && (
-            <button
-              type="button"
-              onClick={handleClearFailed}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-zinc-600 hover:text-red-700 transition"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              <span>Clear Failed</span>
-            </button>
-          )}
-        </div>
-
-        {loadingJobs && recentJobs.length === 0 ? (
-          <p className="text-xs text-zinc-500 py-6 text-center">
-            Loading recent print jobs...
-          </p>
-        ) : recentJobs.length === 0 ? (
-          <p className="text-xs text-zinc-500 py-6 text-center">
-            No recent print jobs yet. Upload a PDF or image above to print.
-          </p>
-        ) : (
           <div className="divide-y divide-zinc-100 mt-1">
-            {recentJobs.map((job) => {
+            {myRecentJobs.map((job) => {
               const meta = getOrderStatusMeta(job.status);
               const isQueued = ["UPLOADING", "QUEUED"].includes(job.status);
-              const canReprint =
-                !job.fileDeleted &&
-                ["COMPLETED", "FAILED", "CANCELLED"].includes(job.status);
-              const isBusy = busyJobId === job.id;
+              const isBusy = busyJobToken === job.token;
 
               return (
                 <div
-                  key={job.id}
+                  key={job.token}
                   className="py-3 flex items-center justify-between gap-3"
                 >
                   <Link
-                    to={`/job/${job.token}`}
+                    to={`/shop/${activeSlug}/job/${job.token}`}
                     className="flex items-start gap-2.5 min-w-0 flex-1 group"
                   >
                     <div className="w-8 h-8 rounded-lg bg-zinc-100 text-zinc-700 flex items-center justify-center shrink-0 mt-0.5">
@@ -324,7 +350,7 @@ export default function Home() {
                         {job.originalName}
                       </p>
                       <p className="text-[11px] text-zinc-500 font-mono-code mt-0.5">
-                        {job.copies}x • {job.paperSize || "A4"} •{" "}
+                        {job.token} • {job.copies}x • {job.paperSize || "A4"} •{" "}
                         {job.colorMode === "color" ? "Colour" : "B&W"} •{" "}
                         {job.documentType === "image"
                           ? "Image"
@@ -335,7 +361,7 @@ export default function Home() {
 
                   <div className="flex items-center gap-2 shrink-0">
                     <Link
-                      to={`/job/${job.token}`}
+                      to={`/shop/${activeSlug}/job/${job.token}`}
                       className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${meta.badgeClass}`}
                     >
                       {meta.label}
@@ -352,66 +378,18 @@ export default function Home() {
                         <XCircle className="w-4 h-4" />
                       </button>
                     )}
-
-                    {canReprint && (
-                      <button
-                        type="button"
-                        disabled={isBusy}
-                        onClick={() => setConfirmReprintJob(job)}
-                        title="Reprint document"
-                        className="p-1.5 rounded-lg text-zinc-600 hover:text-[#8D0100] hover:bg-zinc-100 transition"
-                      >
-                        <RotateCcw className="w-4 h-4" />
-                      </button>
-                    )}
                   </div>
                 </div>
               );
             })}
-          </div>
-        )}
-      </div>
-
-      {/* Explicit Reprint Confirmation Dialog */}
-      {confirmReprintJob && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl border border-zinc-200 p-5 max-w-sm w-full space-y-4 shadow-lg">
-            <h3 className="text-base font-bold text-zinc-900">
-              Confirm Reprint
-            </h3>
-            <p className="text-xs sm:text-sm text-zinc-600 leading-relaxed">
-              Send{" "}
-              <strong className="text-zinc-900">
-                {confirmReprintJob.originalName}
-              </strong>{" "}
-              ({confirmReprintJob.copies}{" "}
-              {confirmReprintJob.copies === 1 ? "copy" : "copies"},{" "}
-              {confirmReprintJob.paperSize || "A4"}) to your USB HP printer now?
-            </p>
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setConfirmReprintJob(null)}
-                className="px-4 py-2 rounded-xl border border-zinc-200 text-xs font-semibold text-zinc-700 hover:bg-zinc-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmReprint}
-                className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
-              >
-                Print Now
-              </button>
-            </div>
           </div>
         </div>
       )}
 
       {documentMeta && (
         <BottomActionBar
-          primaryLabel="Configure & Print"
-          onPrimaryClick={() => navigate("/settings")}
+          primaryLabel="Select Print Options"
+          onPrimaryClick={() => navigate(`/shop/${activeSlug}/settings`)}
           primaryDisabled={!documentMeta || uploading}
           primaryLoading={uploading}
           primaryIcon={ArrowRight}
