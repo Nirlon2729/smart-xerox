@@ -1,0 +1,28 @@
+# Dependencies & virtual environments
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Environment secrets (NEVER commit)
+.env
+.env.local
+.env.*.local
+agent-credentials.json
+*.key
+*.pem
+
+# Build outputs & installers
+dist/
+release/
+out/
+build/
+*.exe
+*.msi
+*.blockmap
+
+# Runtime logs & temp files
+*.log
+private-uploads/*
+!private-uploads/.gitkeep

@@ -1,0 +1,47 @@
+services:
+  # 1. Node.js + Express Backend Web Service (connects to MongoDB Atlas + GridFS)
+  - type: web
+    name: smart-xerox-api
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PRINT_AGENT_TOKEN
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CUSTOMER_ORIGIN
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "20"
+      - key: FILE_RETENTION_MINUTES
+        value: "60"
+
+  # 2. React + Vite Mobile-First Frontend Static Site
+  - type: web
+    name: smart-xerox-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false
+      - key: VITE_MAX_UPLOAD_MB
+        value: "20"
+      - key: VITE_MAX_COPIES
+        value: "100"
