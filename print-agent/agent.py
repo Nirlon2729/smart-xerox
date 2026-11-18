@@ -1,21 +1,24 @@
 """
-Smart Xerox — Multi-Vendor Windows Background Print Agent (v3.0.0)
+Smart Xerox — Universal Multi-Vendor Windows Background Print Agent (v3.1.0)
 
 Features:
-- Multi-printer Windows discovery via pywin32 (USB & Network printers, default printer, ports, drivers, status, capabilities).
-- Never marks a printer offline merely because no print job is running (Status 0 == Normal/Ready).
-- Never uses window.print() or virtual printers (Microsoft Print to PDF, XPS, OneNote, Fax).
+- Universal multi-brand Windows printer discovery via pywin32 (HP, Canon, Epson, Brother, Samsung, Xerox,
+  Ricoh, Kyocera, Pantum, Lexmark, Konica Minolta, Sharp, Toshiba, OKI, Dell, Zebra, and any Windows driver).
+- Distinguishes PHYSICAL, VIRTUAL, and UNKNOWN printers using Windows driver, port, and attribute metadata.
+- Excludes virtual printers (Microsoft Print to PDF, XPS, OneNote, Fax, PDF writers) by default while supporting
+  an advanced option (`--include-virtual` / `virtualPrinters`) for diagnostics.
+- Dynamically reads capabilities (Paper sizes, Colour/B&W, Duplex/Single-sided, Orientations, Max Copies, DPI)
+  from the Windows printer driver via DeviceCapabilities and DEVMODE, with safe fallbacks and `*Known` flags.
+- Preserves vendor's selected printer across restarts and when new printers are connected; auto-selects only when
+  no printer is selected and exactly 1 usable physical printer is detected.
 - Authenticates with unique, revocable per-agent credentials (x-agent-id + x-agent-secret).
-- Sends periodic heartbeats with full availablePrinters list and syncs vendor's selectedPrinterName.
 - Claims tenant-isolated QUEUED print jobs, streams documents from MongoDB Atlas GridFS, verifies SHA-256,
-  renders pages at 300 DPI with PyMuPDF / Pillow, prints via Windows GDI, and waits for Windows Spooler confirmation.
-- Supports CLI modes for Electron Desktop App integration:
-  - `python agent.py --list-printers-json`
-  - `python agent.py --diagnose`
-  - `python agent.py --config <config.json>`
+  validates job settings against printer capabilities, renders pages at 300 DPI with PyMuPDF / Pillow,
+  prints via Windows GDI, and waits for Windows Spooler confirmation.
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -39,18 +42,84 @@ import win32print
 import win32ui
 import win32con
 
-AGENT_VERSION = "3.0.0"
-DEFAULT_TARGET_PRINTER = "HP LaserJet MFP M129-M134"
+AGENT_VERSION = "3.1.0"
 
-# Virtual/forbidden printers that must never be used for physical printing
-FORBIDDEN_PRINTER_KEYWORDS = (
+# Virtual printer driver/name keywords
+VIRTUAL_PRINTER_KEYWORDS = (
     "microsoft print to pdf",
     "print to pdf",
     "xps document writer",
+    "microsoft xps",
     "onenote",
-    "fax",
     "send to onenote",
+    "send to microsoft onenote",
+    "microsoft shared fax",
+    "adobe pdf",
+    "foxit reader pdf",
+    "foxit pdf",
+    "pdfcreator",
+    "cutepdf",
+    "bullzip",
+    "dopdf",
+    "primopdf",
+    "nitro pdf",
+    "pdf24",
+    "clawpdf",
+    "universal document converter",
+    "fineprint",
+    "snagit",
+    "evernote",
+    "paperport",
+    "actmask",
+    "nova pdf",
+    "novapdf",
+    "biopdf",
+    "win2pdf",
+    "virtual printer",
 )
+
+# Virtual port prefixes / names in Windows Print Spooler
+VIRTUAL_PORT_PATTERNS = (
+    "PORTPROMPT:",
+    "FILE:",
+    "NUL:",
+    "XPSPORT:",
+    "SHRFAX:",
+    "PROMPT:",
+    "PDF",
+    "ONENOTE",
+    "FOXIT",
+    "CUTEPDF",
+    "BULLZIP",
+    "PDFCREATOR",
+    "NITRO",
+    "DOPDF",
+    "PRIMO",
+)
+
+# Known printer manufacturers and model prefixes (used for brand/model extraction; any unlisted brand is also supported dynamically)
+KNOWN_PRINTER_BRANDS = [
+    ("HP", ("hp ", "hewlett-packard", "hewlett packard", "laserjet", "deskjet", "officejet", "smart tank", "neverstop", "envy ", "pagewide", "designjet")),
+    ("Canon", ("canon", "pixma", "imagerunner", "i-sensys", "maxify", "lbp", "imageclass", "ir-adv", "selphy")),
+    ("Epson", ("epson", "ecotank", "workforce", "expression", "stylus", "aculaser", "surecolor", "l3110", "l3150", "l3210", "l3250", "l805", "m1100", "m2140")),
+    ("Brother", ("brother", "hl-", "dcp-", "mfc-")),
+    ("Samsung", ("samsung", "xpress", "proxpress", "scx-", "ml-", "clp-", "clx-")),
+    ("Xerox", ("xerox", "phaser", "workcentre", "versalink", "altalink", "docuprint", "docucentre")),
+    ("Ricoh", ("ricoh", "aficio", "sp ", "mp ", "im ")),
+    ("Kyocera", ("kyocera", "ecosys", "taskalfa", "fs-")),
+    ("Pantum", ("pantum",)),
+    ("Lexmark", ("lexmark",)),
+    ("Konica Minolta", ("konica", "minolta", "bizhub", "magicolor", "pagepro")),
+    ("Sharp", ("sharp", "mx-", "ar-")),
+    ("Toshiba", ("toshiba", "e-studio")),
+    ("OKI", ("oki ", "okidata")),
+    ("Dell", ("dell ",)),
+    ("Zebra", ("zebra", "zd", "zt", "gk420", "gx420")),
+    ("FujiFilm", ("fujifilm", "fuji xerox", "apeosport")),
+    ("Panasonic", ("panasonic", "kx-")),
+    ("Kodak", ("kodak",)),
+    ("Microsoft", ("microsoft", "onenote")),
+]
 
 BASE_DIR = Path(__file__).resolve().parent
 APPDATA_DIR = Path(os.getenv("APPDATA") or str(BASE_DIR)) / "SmartXerox"
@@ -62,30 +131,67 @@ except Exception:
 LOG_FILE = APPDATA_DIR / "agent.log"
 LEDGER_FILE = APPDATA_DIR / "completed_jobs.json"
 
-# Windows DMPAPER constants
+# Canonical Windows DMPAPER constants
 PAPER_SIZE_MAP = {
-    "A4": win32con.DMPAPER_A4,          # 9
-    "A3": win32con.DMPAPER_A3,          # 8
-    "Legal": win32con.DMPAPER_LEGAL,    # 5
-    "Letter": win32con.DMPAPER_LETTER,  # 1
-    "A5": win32con.DMPAPER_A5,          # 11
+    "A4": getattr(win32con, "DMPAPER_A4", 9),
+    "A3": getattr(win32con, "DMPAPER_A3", 8),
+    "A5": getattr(win32con, "DMPAPER_A5", 11),
+    "Letter": getattr(win32con, "DMPAPER_LETTER", 1),
+    "Legal": getattr(win32con, "DMPAPER_LEGAL", 5),
+    "B5": getattr(win32con, "DMPAPER_B5", 13),
+    "Executive": getattr(win32con, "DMPAPER_EXECUTIVE", 7),
 }
+
+# Standard paper sizes exposed to the customer & vendor configuration schemas
+STANDARD_CUSTOMER_PAPER_SIZES = ("A4", "A3", "A5", "Letter", "Legal", "B5", "Executive")
 
 # Windows Printer Status Bitmasks (winspool.h)
 PRINTER_STATUS_PAUSED = 0x00000001
 PRINTER_STATUS_ERROR = 0x00000002
+PRINTER_STATUS_PENDING_DELETION = 0x00000004
 PRINTER_STATUS_PAPER_JAM = 0x00000008
 PRINTER_STATUS_PAPER_OUT = 0x00000010
+PRINTER_STATUS_MANUAL_FEED = 0x00000020
+PRINTER_STATUS_PAPER_PROBLEM = 0x00000040
 PRINTER_STATUS_OFFLINE = 0x00000080
+PRINTER_STATUS_IO_ACTIVE = 0x00000100
+PRINTER_STATUS_BUSY = 0x00000200
 PRINTER_STATUS_PRINTING = 0x00000400
+PRINTER_STATUS_OUTPUT_BIN_FULL = 0x00000800
+PRINTER_STATUS_NOT_AVAILABLE = 0x00001000
+PRINTER_STATUS_WAITING = 0x00002000
 PRINTER_STATUS_PROCESSING = 0x00004000
+PRINTER_STATUS_INITIALIZING = 0x00008000
 PRINTER_STATUS_WARMING_UP = 0x00010000
-PRINTER_STATUS_DOOR_OPEN = 0x00400000
+PRINTER_STATUS_TONER_LOW = 0x00020000
+PRINTER_STATUS_NO_TONER = 0x00040000
+PRINTER_STATUS_PAGE_PUNT = 0x00080000
 PRINTER_STATUS_USER_INTERVENTION = 0x00100000
+PRINTER_STATUS_OUT_OF_MEMORY = 0x00200000
+PRINTER_STATUS_DOOR_OPEN = 0x00400000
+PRINTER_STATUS_SERVER_UNKNOWN = 0x00800000
 
-PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x00000400
+PRINTER_ATTRIBUTE_SHARED = 0x00000008
 PRINTER_ATTRIBUTE_NETWORK = 0x00000010
 PRINTER_ATTRIBUTE_LOCAL = 0x00000040
+PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x00000400
+PRINTER_ATTRIBUTE_FAX = 0x00004000
+
+# Windows DEVMODE Field Bitmasks
+DM_ORIENTATION = 0x00000001
+DM_PAPERSIZE = 0x00000002
+DM_COPIES = 0x00000100
+DM_COLOR = 0x00000800
+DM_DUPLEX = 0x00001000
+
+# Windows DeviceCapabilities indices
+DC_PAPERS = 2
+DC_DUPLEX = 7
+DC_ENUMRESOLUTIONS = 13
+DC_PAPERNAMES = 16
+DC_ORIENTATION = 17
+DC_COPIES = 18
+DC_COLORDEVICE = 32
 
 # Windows Job Status Bitmasks
 JOB_STATUS_ERROR = 0x00000002
@@ -112,26 +218,176 @@ def setup_logger(log_path: Path, quiet_stdout: bool = False) -> logging.Logger:
 logger = logging.getLogger("SmartXeroxAgent")
 
 
-def is_forbidden_printer(name: str) -> bool:
-    lower = (name or "").lower()
-    return any(keyword in lower for keyword in FORBIDDEN_PRINTER_KEYWORDS)
+def extract_brand_and_model(printer_name: str, driver_name: str = "") -> tuple[str, str]:
+    """
+    Extracts manufacturer (brand) and model name from a Windows printer name and driver name.
+    Works for all major brands (HP, Canon, Epson, Brother, Samsung, Xerox, Ricoh, Kyocera, Pantum, Lexmark, etc.)
+    and dynamically falls back to the first word of the printer/driver name for any other brand.
+    """
+    raw_name = (printer_name or "").strip()
+    # Strip network share prefix like \\SERVER\Printer Name
+    clean_name = re.sub(r"^\\\\[^\\]+\\", "", raw_name).strip()
+    raw_driver = (driver_name or "").strip()
+    combined_lower = f"{clean_name} {raw_driver}".lower()
+
+    detected_brand = None
+    for brand_label, patterns in KNOWN_PRINTER_BRANDS:
+        for pat in patterns:
+            if pat in combined_lower:
+                detected_brand = brand_label
+                break
+        if detected_brand:
+            break
+
+    if not detected_brand:
+        # Dynamically infer brand from first word if alphabetic and not generic
+        tokens = re.split(r"[\s_\-]+", clean_name or raw_driver)
+        first_token = tokens[0] if tokens else ""
+        if (
+            first_token
+            and len(first_token) >= 2
+            and first_token.lower() not in ("generic", "universal", "local", "network", "usb", "printer", "series", "class")
+        ):
+            detected_brand = first_token
+        else:
+            detected_brand = "Generic"
+
+    model = clean_name
+    if detected_brand and detected_brand != "Generic":
+        # Remove leading brand prefix from model if redundant, e.g., "HP LaserJet M1005" -> "LaserJet M1005"
+        brand_prefix_re = re.compile(rf"^{re.escape(detected_brand)}\s+", re.IGNORECASE)
+        stripped = brand_prefix_re.sub("", clean_name).strip()
+        if stripped:
+            model = stripped
+
+    return detected_brand, (model or clean_name or "Windows Printer")
 
 
-def classify_connection_type(port_name: str, attributes: int = 0) -> str:
-    port_upper = (port_name or "").upper()
+def classify_printer_category(
+    printer_name: str,
+    driver_name: str = "",
+    port_name: str = "",
+    attributes: int = 0,
+) -> tuple[str, bool]:
+    """
+    Classifies a Windows printer into ('PHYSICAL' | 'VIRTUAL' | 'UNKNOWN', is_virtual: bool).
+    Uses driver name, printer name, port name, and Windows printer attributes.
+    Never assumes a printer is physical merely because it contains a brand name.
+    """
+    name_lower = (printer_name or "").strip().lower()
+    driver_lower = (driver_name or "").strip().lower()
+    port_upper = (port_name or "").strip().upper()
+
+    # 1. Explicit fax attribute
+    if attributes & PRINTER_ATTRIBUTE_FAX:
+        return "VIRTUAL", True
+
+    # 2. Check exact fax name or virtual printer keywords in printer name or driver name
+    if name_lower == "fax" or driver_lower == "fax" or "fax" in port_upper:
+        return "VIRTUAL", True
+
+    for kw in VIRTUAL_PRINTER_KEYWORDS:
+        if kw in name_lower or kw in driver_lower:
+            return "VIRTUAL", True
+
+    # 3. Check virtual port patterns (PORTPROMPT:, FILE:, NUL:, XPSPort:, SHRFAX:, PDF ports)
+    if port_upper:
+        for vp in VIRTUAL_PORT_PATTERNS:
+            if port_upper == vp or port_upper.startswith(vp):
+                return "VIRTUAL", True
+
+    # 4. Verify physical hardware / network / shared port evidence
+    is_usb_port = "USB" in port_upper or "DOT4" in port_upper
+    is_wifi_or_wsd = port_upper.startswith("WSD") or "WIFI" in port_upper or "WIRELESS" in port_upper
+    is_network_port = (
+        bool(attributes & PRINTER_ATTRIBUTE_NETWORK)
+        or port_upper.startswith("IP_")
+        or port_upper.startswith("TCP")
+        or port_upper.startswith("STANDARD TCP/IP")
+        or port_upper.startswith("HTTP://")
+        or port_upper.startswith("HTTPS://")
+        or port_upper.startswith("IPP")
+        or port_upper.startswith("LPR")
+        or bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?$", port_upper))
+    )
+    is_shared_port = (
+        bool(attributes & PRINTER_ATTRIBUTE_SHARED)
+        or port_upper.startswith("\\\\")
+        or (printer_name or "").strip().startswith("\\\\")
+    )
+    is_hardware_serial_parallel = port_upper.startswith("LPT") or port_upper.startswith("COM")
+
+    if is_usb_port or is_wifi_or_wsd or is_network_port or is_shared_port:
+        return "PHYSICAL", False
+
+    if is_hardware_serial_parallel and driver_lower and "generic / text only" not in driver_lower:
+        return "PHYSICAL", False
+
+    # 5. If port/driver is ambiguous or unrecognized, classify as UNKNOWN rather than falsely claiming PHYSICAL
+    return "UNKNOWN", False
+
+
+def is_forbidden_printer(
+    name: str,
+    driver_name: str = "",
+    port_name: str = "",
+    attributes: int = 0,
+) -> bool:
+    """
+    Returns True if the printer is classified as a virtual/software printer.
+    """
+    category, is_virt = classify_printer_category(name, driver_name, port_name, attributes)
+    return is_virt or category == "VIRTUAL"
+
+
+def classify_connection_type(
+    port_name: str,
+    attributes: int = 0,
+    printer_name: str = "",
+    is_virtual: bool = False,
+) -> str:
+    """
+    Determines the printer connection type: USB, WIFI, NETWORK, SHARED, LOCAL, VIRTUAL, or UNKNOWN.
+    """
+    if is_virtual:
+        return "VIRTUAL"
+
+    port_upper = (port_name or "").strip().upper()
+    raw_name = (printer_name or "").strip()
+
     if "USB" in port_upper or "DOT4" in port_upper:
         return "USB"
+
+    if port_upper.startswith("WSD") or "WIFI" in port_upper or "WIRELESS" in port_upper:
+        return "WIFI"
+
+    if (
+        (attributes & PRINTER_ATTRIBUTE_SHARED)
+        or port_upper.startswith("\\\\")
+        or raw_name.startswith("\\\\")
+    ) and not (attributes & PRINTER_ATTRIBUTE_NETWORK):
+        return "SHARED"
+
     if (
         (attributes & PRINTER_ATTRIBUTE_NETWORK)
         or port_upper.startswith("IP_")
-        or port_upper.startswith("WSD")
         or port_upper.startswith("TCP")
+        or port_upper.startswith("STANDARD TCP/IP")
         or port_upper.startswith("HTTP")
+        or port_upper.startswith("IPP")
+        or port_upper.startswith("LPR")
         or port_upper.startswith("\\\\")
+        or raw_name.startswith("\\\\")
+        or bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?$", port_upper))
     ):
         return "NETWORK"
+
+    if port_upper.startswith("LPT") or port_upper.startswith("COM"):
+        return "LOCAL"
+
     if port_upper:
         return "LOCAL"
+
     return "UNKNOWN"
 
 
@@ -144,8 +400,8 @@ def get_default_windows_printer() -> str:
 
 def list_windows_printers(include_virtual: bool = False) -> list:
     """
-    Enumerates installed local and network printers via Windows Print Spooler.
-    Filters out virtual printers (Print to PDF, XPS, OneNote, Fax) unless include_virtual=True.
+    Enumerates installed local and network/shared printers via Windows Print Spooler.
+    Filters out virtual printers unless include_virtual=True.
     """
     try:
         flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
@@ -158,24 +414,182 @@ def list_windows_printers(include_virtual: bool = False) -> list:
         raise RuntimeError(f"Windows Print Spooler is unavailable: {exc}") from exc
 
 
-def inspect_printer_state_and_capabilities(printer_name: str, default_printer: str = None) -> dict:
+def query_printer_capabilities(
+    printer_name: str,
+    port_name: str,
+    devmode=None,
+) -> tuple[dict, bool]:
     """
-    Inspects a Windows printer via win32print.OpenPrinter & GetPrinter(level 2).
+    Dynamically queries a Windows printer's driver capabilities via win32print.DeviceCapabilities
+    and DEVMODE structure without brand-specific hardcoding.
+    Returns (capabilities_dict, any_capability_detected_bool).
+    """
+    caps = {
+        "supportedPaperSizes": ["A4"],
+        "paperSizesKnown": False,
+        "supportsBW": True,
+        "supportsColor": False,
+        "colorSupportKnown": False,
+        "supportsSingleSided": True,
+        "supportsDuplex": False,
+        "duplexSupportKnown": False,
+        "supportsCopies": True,
+        "maxCopies": 99,
+        "copiesSupportKnown": False,
+        "supportedOrientations": ["portrait", "landscape"],
+        "orientationSupportKnown": False,
+        "resolutionsDpi": [],
+    }
+    any_detected = False
+
+    # 1. Paper Sizes (DC_PAPERS = 2)
+    try:
+        paper_codes = win32print.DeviceCapabilities(printer_name, port_name, DC_PAPERS)
+        if paper_codes and isinstance(paper_codes, (list, tuple)):
+            code_set = set(int(c) for c in paper_codes if isinstance(c, (int, float)))
+            matched_sizes = [
+                label
+                for label in STANDARD_CUSTOMER_PAPER_SIZES
+                if PAPER_SIZE_MAP.get(label) in code_set
+            ]
+            if matched_sizes:
+                caps["supportedPaperSizes"] = matched_sizes
+                caps["paperSizesKnown"] = True
+                any_detected = True
+    except Exception:
+        pass
+
+    # Fallback check on DEVMODE.PaperSize if DC_PAPERS was not exposed
+    if not caps["paperSizesKnown"] and devmode is not None:
+        try:
+            dm_paper = int(getattr(devmode, "PaperSize", 0) or 0)
+            for label, code in PAPER_SIZE_MAP.items():
+                if dm_paper == code:
+                    caps["supportedPaperSizes"] = [label] if label == "A4" else ["A4", label]
+                    break
+        except Exception:
+            pass
+
+    # 2. Duplex / Double-Sided Support (DC_DUPLEX = 7)
+    try:
+        duplex_cap = win32print.DeviceCapabilities(printer_name, port_name, DC_DUPLEX)
+        if duplex_cap in (0, 1):
+            caps["supportsDuplex"] = bool(int(duplex_cap) == 1)
+            caps["duplexSupportKnown"] = True
+            any_detected = True
+    except Exception:
+        pass
+
+    if not caps["duplexSupportKnown"] and devmode is not None:
+        try:
+            dm_fields = int(getattr(devmode, "Fields", 0) or 0)
+            if dm_fields & DM_DUPLEX:
+                caps["supportsDuplex"] = True
+                caps["duplexSupportKnown"] = True
+                any_detected = True
+        except Exception:
+            pass
+
+    # 3. Colour vs Monochrome Support (DC_COLORDEVICE = 32 + DEVMODE fallback)
+    try:
+        color_cap = win32print.DeviceCapabilities(printer_name, port_name, DC_COLORDEVICE)
+        if color_cap in (0, 1):
+            caps["supportsColor"] = bool(int(color_cap) == 1)
+            caps["colorSupportKnown"] = True
+            any_detected = True
+    except Exception:
+        pass
+
+    if not caps["colorSupportKnown"] and devmode is not None:
+        try:
+            dm_fields = int(getattr(devmode, "Fields", 0) or 0)
+            dm_color = int(getattr(devmode, "Color", 0) or 0)
+            if (dm_fields & DM_COLOR) and dm_color == getattr(win32con, "DMCOLOR_COLOR", 2):
+                caps["supportsColor"] = True
+                caps["colorSupportKnown"] = True
+                any_detected = True
+            elif dm_color == getattr(win32con, "DMCOLOR_MONOCHROME", 1):
+                caps["supportsColor"] = False
+                caps["colorSupportKnown"] = True
+                any_detected = True
+        except Exception:
+            pass
+
+    # 4. Maximum Hardware Copies (DC_COPIES = 18)
+    try:
+        copies_cap = win32print.DeviceCapabilities(printer_name, port_name, DC_COPIES)
+        if copies_cap is not None and int(copies_cap) >= 1:
+            caps["maxCopies"] = int(copies_cap)
+            caps["supportsCopies"] = True
+            caps["copiesSupportKnown"] = True
+            any_detected = True
+    except Exception:
+        pass
+
+    # 5. Orientation Support (DC_ORIENTATION = 17)
+    try:
+        orient_cap = win32print.DeviceCapabilities(printer_name, port_name, DC_ORIENTATION)
+        if orient_cap in (90, 270):
+            caps["supportedOrientations"] = ["portrait", "landscape"]
+            caps["orientationSupportKnown"] = True
+            any_detected = True
+        elif orient_cap == 0:
+            caps["supportedOrientations"] = ["portrait"]
+            caps["orientationSupportKnown"] = True
+            any_detected = True
+    except Exception:
+        pass
+
+    # 6. Print Resolutions in DPI (DC_ENUMRESOLUTIONS = 13)
+    try:
+        res_raw = win32print.DeviceCapabilities(printer_name, port_name, DC_ENUMRESOLUTIONS)
+        if res_raw and isinstance(res_raw, (list, tuple)):
+            dpis = sorted(
+                {
+                    int(item[0]) if isinstance(item, (list, tuple)) and len(item) >= 1 else int(item)
+                    for item in res_raw
+                    if (isinstance(item, (list, tuple)) and len(item) >= 1 and isinstance(item[0], (int, float)) and item[0] > 0)
+                    or (isinstance(item, int) and item > 0)
+                }
+            )
+            if dpis:
+                caps["resolutionsDpi"] = dpis[:10]
+    except Exception:
+        pass
+
+    return caps, any_detected
+
+
+def inspect_printer_state_and_capabilities(
+    printer_name: str,
+    default_printer: str = None,
+    allow_virtual: bool = False,
+) -> dict:
+    """
+    Inspects any Windows printer via win32print.OpenPrinter & GetPrinter(level 2).
     Note: PrinterStatus == 0 and WorkOffline == False in Windows means Normal (Idle & Ready).
     """
     if default_printer is None:
         default_printer = get_default_windows_printer()
 
+    clean_name = (printer_name or "").strip()
+    brand, model = extract_brand_and_model(clean_name, "")
+
     result = {
-        "name": printer_name,
-        "printerName": printer_name,
+        "name": clean_name or "No Printer Selected",
+        "printerName": clean_name or "No Printer Selected",
+        "manufacturer": brand,
+        "model": model,
         "exists": False,
         "spoolerAvailable": True,
         "portName": None,
         "driverName": None,
-        "connectionType": "USB",
+        "connectionType": "UNKNOWN",
+        "printerCategory": "UNKNOWN",
+        "isVirtual": False,
+        "isShared": False,
         "isDefault": bool(
-            default_printer and printer_name.strip().lower() == default_printer.lower()
+            default_printer and clean_name and clean_name.lower() == default_printer.lower()
         ),
         "driverMissing": False,
         "capabilitiesDetected": False,
@@ -183,140 +597,167 @@ def inspect_printer_state_and_capabilities(printer_name: str, default_printer: s
         "workOffline": False,
         "printerAvailable": False,
         "status": "OFFLINE",
-        "statusMessage": f"Printer '{printer_name}' not found in Windows",
+        "statusMessage": (
+            f"Printer '{clean_name}' not found in Windows"
+            if clean_name
+            else "No Windows printer selected"
+        ),
         "spoolerJobCount": 0,
         "capabilities": {
-            "supportedPaperSizes": ["A4", "Letter", "Legal", "A5"],
+            "supportedPaperSizes": ["A4"],
+            "paperSizesKnown": False,
+            "supportsBW": True,
             "supportsColor": False,
+            "colorSupportKnown": False,
+            "supportsSingleSided": True,
             "supportsDuplex": False,
+            "duplexSupportKnown": False,
+            "supportsCopies": True,
+            "maxCopies": 99,
+            "copiesSupportKnown": False,
+            "supportedOrientations": ["portrait", "landscape"],
+            "orientationSupportKnown": False,
+            "resolutionsDpi": [],
         },
     }
 
+    if not clean_name or clean_name in (
+        "No Printer Selected",
+        "No Printer Detected",
+        "Multiple Printers Detected — Select One",
+    ):
+        return result
+
     try:
-        installed = list_windows_printers(include_virtual=False)
+        all_enumerated = list_windows_printers(include_virtual=True)
     except Exception as exc:
         result["spoolerAvailable"] = False
         result["statusMessage"] = str(exc)
         return result
 
-    if is_forbidden_printer(printer_name):
-        result["statusMessage"] = f"Virtual printer '{printer_name}' is not allowed."
-        return result
+    matched_installed_name = None
+    for candidate in all_enumerated:
+        if candidate.strip().lower() == clean_name.lower():
+            matched_installed_name = candidate
+            break
 
-    if printer_name not in installed:
+    if not matched_installed_name:
         result["statusMessage"] = (
-            f"Printer '{printer_name}' is not connected or installed in Windows."
+            f"Printer '{clean_name}' is disconnected or not installed in Windows."
         )
         return result
 
+    result["name"] = matched_installed_name
+    result["printerName"] = matched_installed_name
     result["exists"] = True
 
     try:
-        handle = win32print.OpenPrinter(printer_name)
+        handle = win32print.OpenPrinter(matched_installed_name)
     except Exception as exc:
-        result["statusMessage"] = f"Cannot open printer '{printer_name}': {exc}"
+        result["statusMessage"] = f"Cannot open printer '{matched_installed_name}': {exc}"
         return result
 
     try:
         info2 = win32print.GetPrinter(handle, 2)
-        status_flags = int(info2.get("Status", 0))
-        attributes = int(info2.get("Attributes", 0))
-        c_jobs = int(info2.get("cJobs", 0))
-        port_name = str(info2.get("pPortName", "") or "")
-        driver_name = str(info2.get("pDriverName", "") or "")
+        status_flags = int(info2.get("Status", 0) or 0)
+        attributes = int(info2.get("Attributes", 0) or 0)
+        c_jobs = int(info2.get("cJobs", 0) or 0)
+        port_name = str(info2.get("pPortName", "") or "").strip()
+        driver_name = str(info2.get("pDriverName", "") or "").strip()
+        devmode = info2.get("pDevMode")
+
+        brand, model = extract_brand_and_model(matched_installed_name, driver_name)
+        category, is_virtual = classify_printer_category(
+            matched_installed_name, driver_name, port_name, attributes
+        )
+        conn_type = classify_connection_type(
+            port_name, attributes, matched_installed_name, is_virtual=is_virtual
+        )
 
         work_offline = bool(attributes & PRINTER_ATTRIBUTE_WORK_OFFLINE)
-        driver_missing = not bool(driver_name.strip())
+        driver_missing = not bool(driver_name)
 
-        result["portName"] = port_name
-        result["driverName"] = driver_name
+        result["manufacturer"] = brand
+        result["model"] = model
+        result["portName"] = port_name or None
+        result["driverName"] = driver_name or None
         result["driverMissing"] = driver_missing
-        result["connectionType"] = classify_connection_type(port_name, attributes)
+        result["printerCategory"] = category
+        result["isVirtual"] = is_virtual
+        result["isShared"] = bool(
+            (attributes & PRINTER_ATTRIBUTE_SHARED)
+            or port_name.startswith("\\\\")
+            or matched_installed_name.startswith("\\\\")
+        )
+        result["connectionType"] = conn_type
         result["printerStatusCode"] = status_flags
         result["workOffline"] = work_offline
         result["spoolerJobCount"] = c_jobs
 
-        caps_detected = False
-        # Query hardware capabilities from driver via DeviceCapabilities
-        try:
-            # DC_PAPERS = 2
-            paper_codes = win32print.DeviceCapabilities(printer_name, port_name, 2)
-            if paper_codes:
-                supported_sizes = [
-                    label for label, code in PAPER_SIZE_MAP.items() if code in paper_codes
-                ]
-                if supported_sizes:
-                    result["capabilities"]["supportedPaperSizes"] = supported_sizes
-                    caps_detected = True
-        except Exception:
-            pass
+        if is_virtual and not allow_virtual:
+            result["printerAvailable"] = False
+            result["status"] = "OFFLINE"
+            result["statusMessage"] = (
+                f"Virtual software printer '{matched_installed_name}' is excluded from physical shop printing."
+            )
+            return result
 
-        try:
-            # DC_DUPLEX = 7
-            duplex_cap = win32print.DeviceCapabilities(printer_name, port_name, 7)
-            result["capabilities"]["supportsDuplex"] = bool(duplex_cap == 1)
-            caps_detected = True
-        except Exception:
-            pass
-
-        try:
-            # DC_COLORDEVICE = 32
-            color_cap = win32print.DeviceCapabilities(printer_name, port_name, 32)
-            if "m129" in printer_name.lower() or "m134" in printer_name.lower():
-                result["capabilities"]["supportsColor"] = False
-            else:
-                result["capabilities"]["supportsColor"] = bool(color_cap == 1)
-            caps_detected = True
-        except Exception:
-            pass
-
+        caps, caps_detected = query_printer_capabilities(
+            matched_installed_name, port_name, devmode=devmode
+        )
+        result["capabilities"] = caps
         result["capabilitiesDetected"] = caps_detected
 
         if driver_missing:
             result["printerAvailable"] = False
             result["status"] = "ERROR"
             result["statusMessage"] = (
-                f"Windows printer driver is missing for {printer_name}. Please install the appropriate Windows driver."
+                f"Windows printer driver is missing for {matched_installed_name}. "
+                f"Please install the official {brand} Windows driver."
             )
-        elif work_offline or (status_flags & PRINTER_STATUS_OFFLINE):
+        elif work_offline or (status_flags & (PRINTER_STATUS_OFFLINE | PRINTER_STATUS_NOT_AVAILABLE | PRINTER_STATUS_SERVER_UNKNOWN)):
             result["printerAvailable"] = False
             result["status"] = "OFFLINE"
             result["statusMessage"] = (
-                f"{printer_name} is offline or disconnected ({port_name})"
+                f"{matched_installed_name} is offline or disconnected ({port_name or conn_type})"
             )
         elif status_flags & PRINTER_STATUS_PAPER_OUT:
             result["printerAvailable"] = False
             result["status"] = "ERROR"
-            result["statusMessage"] = f"{printer_name} is out of paper"
-        elif status_flags & PRINTER_STATUS_PAPER_JAM:
+            result["statusMessage"] = f"{matched_installed_name} is out of paper"
+        elif status_flags & (PRINTER_STATUS_PAPER_JAM | PRINTER_STATUS_PAPER_PROBLEM):
             result["printerAvailable"] = False
             result["status"] = "ERROR"
-            result["statusMessage"] = f"Paper jam on {printer_name}"
+            result["statusMessage"] = f"Paper jam or paper feed problem on {matched_installed_name}"
         elif status_flags & PRINTER_STATUS_DOOR_OPEN:
             result["printerAvailable"] = False
             result["status"] = "ERROR"
-            result["statusMessage"] = f"Cover/door open on {printer_name}"
-        elif status_flags & (PRINTER_STATUS_ERROR | PRINTER_STATUS_USER_INTERVENTION):
+            result["statusMessage"] = f"Cover or door open on {matched_installed_name}"
+        elif status_flags & PRINTER_STATUS_NO_TONER:
+            result["printerAvailable"] = False
+            result["status"] = "ERROR"
+            result["statusMessage"] = f"{matched_installed_name} is out of toner/ink"
+        elif status_flags & (PRINTER_STATUS_ERROR | PRINTER_STATUS_USER_INTERVENTION | PRINTER_STATUS_OUT_OF_MEMORY):
             result["printerAvailable"] = False
             result["status"] = "ERROR"
             result["statusMessage"] = (
-                f"{printer_name} reported a hardware error (code {status_flags})"
+                f"{matched_installed_name} reported a hardware error (status code {status_flags})"
             )
         elif status_flags & PRINTER_STATUS_PAUSED:
             result["printerAvailable"] = False
             result["status"] = "ERROR"
-            result["statusMessage"] = f"{printer_name} print queue is paused in Windows"
-        elif (status_flags & (PRINTER_STATUS_PRINTING | PRINTER_STATUS_PROCESSING)) or c_jobs > 0:
+            result["statusMessage"] = f"{matched_installed_name} print queue is paused in Windows"
+        elif (status_flags & (PRINTER_STATUS_PRINTING | PRINTER_STATUS_PROCESSING | PRINTER_STATUS_BUSY)) or c_jobs > 0:
             result["printerAvailable"] = True
             result["status"] = "PRINTING"
             result["statusMessage"] = (
-                f"Printing on {printer_name} ({port_name}) — {c_jobs} job(s) in queue"
+                f"Printing on {matched_installed_name} ({port_name or conn_type}) — {c_jobs} job(s) in queue"
             )
         else:
             result["printerAvailable"] = True
             result["status"] = "READY"
             result["statusMessage"] = (
-                f"Printer Ready ({printer_name} on {port_name})"
+                f"Printer Ready ({matched_installed_name} on {port_name or conn_type})"
             )
 
     finally:
@@ -325,13 +766,14 @@ def inspect_printer_state_and_capabilities(printer_name: str, default_printer: s
     return result
 
 
-def discover_all_windows_printers() -> dict:
+def discover_all_windows_printers(include_virtual: bool = False) -> dict:
     """
-    Discovers all compatible Windows printers (USB, Network, Local) and their live status & capabilities.
+    Discovers all Windows printers (USB, Wi-Fi, Network, Shared, Local) and their live status & capabilities.
+    Separates physical/usable printers from virtual software printers.
     """
     default_printer = get_default_windows_printer()
     try:
-        names = list_windows_printers(include_virtual=False)
+        all_names = list_windows_printers(include_virtual=True)
     except Exception as exc:
         return {
             "success": False,
@@ -339,64 +781,203 @@ def discover_all_windows_printers() -> dict:
             "defaultPrinter": default_printer or None,
             "error": str(exc),
             "printers": [],
+            "physicalPrinters": [],
+            "virtualPrinters": [],
         }
 
-    printers = []
-    for name in names:
-        info = inspect_printer_state_and_capabilities(name, default_printer=default_printer)
-        printers.append(info)
+    physical_printers = []
+    virtual_printers = []
 
-    # Sort: available USB printers first, then default printer, then alphabetical
-    printers.sort(
-        key=lambda p: (
+    for name in all_names:
+        info = inspect_printer_state_and_capabilities(
+            name, default_printer=default_printer, allow_virtual=True
+        )
+        if info.get("isVirtual") or info.get("printerCategory") == "VIRTUAL":
+            virtual_printers.append(info)
+        else:
+            physical_printers.append(info)
+
+    # Sort physical printers: Online/Ready first, then USB/Network/Wi-Fi physical before UNKNOWN, then Windows Default, then alphabetical
+    def _sort_key(p: dict):
+        return (
             not p.get("printerAvailable", False),
-            p.get("connectionType") != "USB",
+            p.get("printerCategory") != "PHYSICAL",
+            p.get("connectionType") not in ("USB", "WIFI", "NETWORK", "SHARED"),
             not p.get("isDefault", False),
             p.get("name", "").lower(),
         )
-    )
+
+    physical_printers.sort(key=_sort_key)
+    virtual_printers.sort(key=lambda p: p.get("name", "").lower())
+
+    active_list = (physical_printers + virtual_printers) if include_virtual else physical_printers
+
+    default_is_virtual = any(
+        vp["name"].lower() == default_printer.lower() for vp in virtual_printers
+    ) if default_printer else False
 
     return {
         "success": True,
         "spoolerAvailable": True,
-        "defaultPrinter": default_printer if not is_forbidden_printer(default_printer) else None,
-        "printers": printers,
+        "defaultPrinter": default_printer if (default_printer and not default_is_virtual) else None,
+        "printers": active_list,
+        "physicalPrinters": physical_printers,
+        "virtualPrinters": virtual_printers,
     }
 
 
-def resolve_target_printer(preferred_name: str = None, discovered_printers: list = None) -> str:
+def resolve_target_printer(
+    preferred_name: str = None,
+    discovered_printers: list = None,
+    auto_select_single: bool = True,
+) -> str:
     """
-    Resolves the best physical target printer:
-    1. Exact match for vendor's preferred_name if installed.
-    2. If only 1 physical printer is installed, select it automatically.
-    3. Match HP LaserJet or default physical printer.
+    Resolves the vendor's active printer according to universal selection rules:
+    1. If the vendor has already selected a preferred printer (`preferred_name`), ALWAYS keep it
+       (even if currently offline/disconnected, so it shows Offline and auto-recovers when reconnected,
+       and never changes when another printer is plugged in).
+    2. If no preferred printer is selected and `auto_select_single=True`:
+       - If exactly ONE usable physical printer is detected, automatically select it.
+       - If MULTIPLE usable physical printers are detected, return "" so the vendor is prompted
+         to select their printer.
+       - If NO physical printer is detected, return "".
     """
     if discovered_printers is None:
-        discovery = discover_all_windows_printers()
-        discovered_printers = discovery.get("printers", [])
+        discovery = discover_all_windows_printers(include_virtual=False)
+        discovered_printers = discovery.get("physicalPrinters", discovery.get("printers", []))
 
-    names = [p["name"] for p in discovered_printers]
+    usable_printers = [
+        p for p in discovered_printers
+        if not p.get("isVirtual") and p.get("printerCategory") != "VIRTUAL"
+    ]
 
-    if preferred_name and not is_forbidden_printer(preferred_name):
-        for name in names:
-            if name.strip().lower() == preferred_name.strip().lower():
-                return name
+    clean_pref = (preferred_name or "").strip()
+    if clean_pref in (
+        "No Printer Selected",
+        "No Printer Detected",
+        "Multiple Printers Detected — Select One",
+        "Detecting Windows Printers...",
+        "Exact Windows printer name",
+    ):
+        clean_pref = ""
 
-    if len(names) == 1:
-        return names[0]
+    if clean_pref and not is_forbidden_printer(clean_pref):
+        for p in usable_printers:
+            if p["name"].strip().lower() == clean_pref.lower():
+                return p["name"]
+        # Vendor's selected printer is not currently enumerated (e.g. USB unplugged);
+        # keep it as the target so status reports OFFLINE until reconnected.
+        return clean_pref
 
-    for p in discovered_printers:
-        if p.get("isDefault") and p.get("printerAvailable"):
-            return p["name"]
+    if auto_select_single and len(usable_printers) == 1:
+        return usable_printers[0]["name"]
 
-    for p in discovered_printers:
-        if p.get("printerAvailable"):
-            return p["name"]
+    return ""
 
-    if names:
-        return names[0]
 
-    return preferred_name or DEFAULT_TARGET_PRINTER
+def build_unselected_printer_state(usable_printers: list) -> dict:
+    """
+    Builds a clear status summary when no printer is selected yet (either 0 physical printers
+    detected, or multiple physical printers detected awaiting vendor choice).
+    """
+    count = len(usable_printers)
+    if count > 1:
+        label = "Multiple Printers Detected — Select One"
+        msg = (
+            f"{count} physical Windows printers detected ({', '.join(p['name'] for p in usable_printers[:4])}). "
+            "Please select which printer Smart Xerox should use."
+        )
+    else:
+        label = "No Printer Detected"
+        msg = (
+            "No physical Windows printer detected. Connect your printer via USB or network "
+            "and ensure the manufacturer's Windows printer driver is installed."
+        )
+
+    return {
+        "name": label,
+        "printerName": label,
+        "manufacturer": None,
+        "model": None,
+        "exists": False,
+        "spoolerAvailable": True,
+        "portName": None,
+        "driverName": None,
+        "connectionType": "UNKNOWN",
+        "printerCategory": "UNKNOWN",
+        "isVirtual": False,
+        "isShared": False,
+        "isDefault": False,
+        "driverMissing": False,
+        "capabilitiesDetected": False,
+        "printerStatusCode": None,
+        "workOffline": False,
+        "printerAvailable": False,
+        "requiresManualSelection": count > 1,
+        "status": "OFFLINE",
+        "statusMessage": msg,
+        "spoolerJobCount": 0,
+        "capabilities": {
+            "supportedPaperSizes": ["A4"],
+            "paperSizesKnown": False,
+            "supportsBW": True,
+            "supportsColor": False,
+            "colorSupportKnown": False,
+            "supportsSingleSided": True,
+            "supportsDuplex": False,
+            "duplexSupportKnown": False,
+            "supportsCopies": True,
+            "maxCopies": 99,
+            "copiesSupportKnown": False,
+            "supportedOrientations": ["portrait", "landscape"],
+            "orientationSupportKnown": False,
+            "resolutionsDpi": [],
+        },
+    }
+
+
+def validate_job_against_printer_capabilities(job: dict, printer_info: dict) -> None:
+    """
+    Verifies that the target Windows printer supports the job's requested options.
+    Raises ValueError with a clear message if an unsupported option is requested.
+    """
+    p_name = printer_info.get("printerName") or printer_info.get("name") or "Selected Printer"
+    if printer_info.get("isVirtual") or printer_info.get("printerCategory") == "VIRTUAL":
+        raise ValueError(f"Refusing to print to virtual printer '{p_name}'.")
+
+    caps = printer_info.get("capabilities") or {}
+
+    color_mode = str(job.get("colorMode") or "bw").lower()
+    if (
+        color_mode == "color"
+        and caps.get("colorSupportKnown") is True
+        and not caps.get("supportsColor")
+    ):
+        raise ValueError(
+            f"Printer '{p_name}' does not support Colour printing (Monochrome / Black & White only)."
+        )
+
+    sides = str(job.get("sides") or "single").lower()
+    if (
+        sides == "duplex"
+        and caps.get("duplexSupportKnown") is True
+        and not caps.get("supportsDuplex")
+    ):
+        raise ValueError(
+            f"Printer '{p_name}' does not support automatic Duplex (double-sided) printing."
+        )
+
+    paper_size = str(job.get("paperSize") or "A4")
+    supported_sizes = caps.get("supportedPaperSizes") or []
+    if (
+        caps.get("paperSizesKnown") is True
+        and supported_sizes
+        and paper_size not in supported_sizes
+    ):
+        raise ValueError(
+            f"Printer '{p_name}' does not support paper size '{paper_size}'. "
+            f"Supported paper sizes: {', '.join(supported_sizes)}."
+        )
 
 
 def load_completed_ledger(ledger_path: Path = LEDGER_FILE) -> set:
@@ -448,10 +1029,15 @@ def send_heartbeat(
         "hostname": socket.gethostname(),
         "osVersion": f"{platform.system()} {platform.release()}",
         "printerName": primary_printer["printerName"],
+        "manufacturer": primary_printer.get("manufacturer"),
+        "model": primary_printer.get("model"),
         "portName": primary_printer["portName"],
         "driverName": primary_printer["driverName"],
+        "connectionType": primary_printer.get("connectionType", "UNKNOWN"),
+        "printerCategory": primary_printer.get("printerCategory", "UNKNOWN"),
         "driverMissing": primary_printer.get("driverMissing", False),
         "printerAvailable": primary_printer["printerAvailable"],
+        "requiresManualSelection": primary_printer.get("requiresManualSelection", False),
         "status": primary_printer["status"],
         "statusMessage": primary_printer["statusMessage"],
         "spoolerJobCount": primary_printer["spoolerJobCount"],
@@ -657,6 +1243,7 @@ def wait_for_spooler_completion(
 def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
     """
     Sends rendered pages directly to the selected Windows printer using Windows GDI (win32ui / win32print).
+    Works universally across HP, Canon, Epson, Brother, Samsung, Xerox, Ricoh, Kyocera, Pantum, Lexmark, etc.
     """
     if is_forbidden_printer(printer_name):
         raise RuntimeError(f"Refusing to print to virtual printer '{printer_name}'.")
@@ -693,6 +1280,12 @@ def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
                 if use_landscape
                 else win32con.DMORIENT_PORTRAIT
             )
+            try:
+                devmode.Fields |= (
+                    DM_PAPERSIZE | DM_COLOR | DM_DUPLEX | DM_ORIENTATION
+                )
+            except Exception:
+                pass
     finally:
         win32print.ClosePrinter(handle)
 
@@ -755,6 +1348,23 @@ def process_and_print_job(
     if not printer_info["printerAvailable"]:
         reason = printer_info["statusMessage"]
         logger.error("Cannot print job %s: %s", token, reason)
+        update_backend_job_status(
+            backend_url,
+            agent_id,
+            agent_secret,
+            order_id,
+            agent_job_id,
+            "FAILED",
+            failure_reason=reason,
+        )
+        return
+
+    # Validate requested job options against the selected printer's hardware capabilities
+    try:
+        validate_job_against_printer_capabilities(job, printer_info)
+    except ValueError as cap_err:
+        reason = str(cap_err)
+        logger.error("Job %s rejected by printer capability check: %s", token, reason)
         update_backend_job_status(
             backend_url,
             agent_id,
@@ -855,24 +1465,31 @@ def load_runtime_config(config_path: str = None) -> dict:
 
 def run_diagnostics(cfg: dict) -> int:
     print("=" * 68)
-    print(f"SMART XEROX WINDOWS PRINT AGENT DIAGNOSTICS (v{AGENT_VERSION})")
+    print(f"SMART XEROX UNIVERSAL WINDOWS PRINT AGENT DIAGNOSTICS (v{AGENT_VERSION})")
     print("=" * 68)
 
-    discovery = discover_all_windows_printers()
-    printers = discovery.get("printers", [])
-    print("\n[1/3] WINDOWS MULTI-PRINTER DISCOVERY")
+    discovery = discover_all_windows_printers(include_virtual=False)
+    printers = discovery.get("physicalPrinters", discovery.get("printers", []))
+    virtual_printers = discovery.get("virtualPrinters", [])
+    print("\n[1/3] UNIVERSAL WINDOWS MULTI-PRINTER DISCOVERY")
     print(f"  Spooler Available : {discovery.get('spoolerAvailable')}")
     print(f"  Default Printer   : {discovery.get('defaultPrinter')}")
-    print(f"  Detected Printers : {len(printers)}")
+    print(f"  Physical Printers : {len(printers)}")
+    print(f"  Virtual Filtered  : {len(virtual_printers)}")
     for idx, p in enumerate(printers, 1):
         print(
-            f"    {idx}. {p['name']} [{p['connectionType']} on {p['portName']}] -> "
+            f"    {idx}. [{p.get('manufacturer')} {p.get('model')}] {p['name']} "
+            f"[{p['connectionType']} / {p.get('printerCategory')} on {p['portName']}] -> "
             f"{p['status']} (available={p['printerAvailable']}, color={p['capabilities']['supportsColor']}, "
             f"duplex={p['capabilities']['supportsDuplex']}, sizes={p['capabilities']['supportedPaperSizes']})"
         )
 
     target_printer = resolve_target_printer(cfg.get("selectedPrinterName"), printers)
-    p_info = inspect_printer_state_and_capabilities(target_printer)
+    p_info = (
+        inspect_printer_state_and_capabilities(target_printer)
+        if target_printer
+        else build_unselected_printer_state(printers)
+    )
     print(f"  Selected Target   : {p_info['printerName']} ({p_info['statusMessage']})")
 
     print("\n[2/3] BACKEND CONNECTIVITY")
@@ -907,7 +1524,7 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
     ledger_path = Path(cfg.get("ledgerFile") or LEDGER_FILE)
     setup_logger(log_path)
 
-    logger.info("Smart Xerox Windows Print Agent v%s started.", AGENT_VERSION)
+    logger.info("Smart Xerox Universal Windows Print Agent v%s started.", AGENT_VERSION)
     logger.info("Backend API URL : %s", cfg["backendApiUrl"])
 
     preferred_printer = cfg.get("selectedPrinterName") or ""
@@ -918,18 +1535,22 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
             if config_path and Path(config_path).exists():
                 latest = load_runtime_config(config_path)
                 cfg.update(latest)
-                if latest.get("selectedPrinterName"):
-                    preferred_printer = latest["selectedPrinterName"]
+                if latest.get("selectedPrinterName") is not None:
+                    preferred_printer = latest.get("selectedPrinterName") or preferred_printer
 
             agent_id = cfg.get("agentId", "").strip()
             agent_secret = cfg.get("agentSecret", "").strip()
             backend_url = cfg["backendApiUrl"]
             device_id = cfg.get("deviceId") or f"win-{socket.gethostname()}"
 
-            discovery = discover_all_windows_printers()
-            discovered_list = discovery.get("printers", [])
+            discovery = discover_all_windows_printers(include_virtual=False)
+            discovered_list = discovery.get("physicalPrinters", discovery.get("printers", []))
             target_printer_name = resolve_target_printer(preferred_printer, discovered_list)
-            primary_info = inspect_printer_state_and_capabilities(target_printer_name)
+            primary_info = (
+                inspect_printer_state_and_capabilities(target_printer_name)
+                if target_printer_name
+                else build_unselected_printer_state(discovered_list)
+            )
 
             if not agent_id or not agent_secret:
                 logger.info("Waiting for vendor sign-in & desktop pairing...")
@@ -946,13 +1567,28 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
             )
 
             if online_ok:
-                server_selected = hb_resp.get("tenant", {}).get("selectedPrinterName")
-                if server_selected and server_selected != preferred_printer:
+                server_selected = (
+                    hb_resp.get("tenant", {}).get("selectedPrinterName") or ""
+                ).strip()
+                if (
+                    server_selected
+                    and server_selected not in (
+                        "No Printer Selected",
+                        "No Printer Detected",
+                        "Multiple Printers Detected — Select One",
+                        "Detecting Windows Printers...",
+                    )
+                    and server_selected != preferred_printer
+                ):
                     preferred_printer = server_selected
                     target_printer_name = resolve_target_printer(preferred_printer, discovered_list)
-                    primary_info = inspect_printer_state_and_capabilities(target_printer_name)
+                    primary_info = (
+                        inspect_printer_state_and_capabilities(target_printer_name)
+                        if target_printer_name
+                        else build_unselected_printer_state(discovered_list)
+                    )
 
-            if online_ok and primary_info["printerAvailable"]:
+            if online_ok and primary_info["printerAvailable"] and target_printer_name:
                 resp = requests.get(
                     f"{backend_url}/agent/jobs/next",
                     headers=build_agent_headers(agent_id, agent_secret),
@@ -963,7 +1599,10 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
                     job = payload.get("job")
                     if job:
                         job_printer = job.get("printerName") or target_printer_name
-                        resolved_job_printer = resolve_target_printer(job_printer, discovered_list)
+                        resolved_job_printer = (
+                            resolve_target_printer(job_printer, discovered_list)
+                            or target_printer_name
+                        )
                         logger.info(
                             "Claimed print job %s (%s) -> target printer '%s'",
                             job.get("token"),
@@ -1000,11 +1639,16 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Smart Xerox Windows Background Print Agent")
+    parser = argparse.ArgumentParser(description="Smart Xerox Universal Windows Background Print Agent")
     parser.add_argument(
         "--list-printers-json",
         action="store_true",
         help="Enumerate all Windows printers, status, and capabilities as JSON and exit.",
+    )
+    parser.add_argument(
+        "--include-virtual",
+        action="store_true",
+        help="Include virtual printers (PDF/XPS/OneNote/Fax) in main printers list.",
     )
     parser.add_argument(
         "--diagnose",
@@ -1020,7 +1664,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.list_printers_json:
-        print(json.dumps(discover_all_windows_printers()))
+        print(json.dumps(discover_all_windows_printers(include_virtual=args.include_virtual)))
         sys.exit(0)
 
     runtime_cfg = load_runtime_config(args.config)

@@ -291,7 +291,139 @@ async function runTests() {
     assert.strictEqual(shopInfoA.data.printer.capabilities.supportsColor, false);
     assert.strictEqual(shopInfoB.data.printer.printerName, "Canon Color Duplex Beta");
     assert.strictEqual(shopInfoB.data.printer.capabilities.supportsColor, true);
-    console.log("  PASS: Each shop exposes only its own printer and verified hardware capabilities.");
+
+    // Connect a second physical printer (Epson EcoTank Wi-Fi) to Vendor A -> must NOT overwrite selectedPrinterName
+    const hbAMulti = await apiRequest(baseUrl, "POST", "/agent/heartbeat", {
+      headers: {
+        "x-agent-id": credsA.agentId,
+        "x-agent-secret": credsA.agentSecret
+      },
+      body: {
+        deviceId: credsA.deviceId,
+        agentVersion: "3.1.0",
+        printerName: "HP LaserJet Alpha Mono",
+        availablePrinters: [
+          {
+            name: "HP LaserJet Alpha Mono",
+            manufacturer: "HP",
+            model: "LaserJet Alpha Mono",
+            portName: "USB001",
+            driverName: "HP LaserJet Driver",
+            connectionType: "USB",
+            printerCategory: "PHYSICAL",
+            isDefault: true,
+            printerAvailable: true,
+            status: "READY",
+            capabilities: {
+              supportedPaperSizes: ["A4", "Legal"],
+              supportsColor: false,
+              supportsDuplex: false
+            }
+          },
+          {
+            name: "Epson EcoTank L3250",
+            manufacturer: "Epson",
+            model: "EcoTank L3250",
+            portName: "WSD-88412",
+            driverName: "EPSON L3250 Series",
+            connectionType: "WIFI",
+            printerCategory: "PHYSICAL",
+            isDefault: false,
+            printerAvailable: true,
+            status: "READY",
+            capabilities: {
+              supportedPaperSizes: ["A4", "A5", "B5"],
+              supportsColor: true,
+              supportsDuplex: false
+            }
+          }
+        ]
+      }
+    });
+    assert.strictEqual(hbAMulti.status, 200);
+    assert.strictEqual(
+      hbAMulti.data.tenant.selectedPrinterName,
+      "HP LaserJet Alpha Mono",
+      "Connecting a second printer must NOT overwrite the vendor's selected printer"
+    );
+
+    // Disconnect Vendor A's selected HP printer while Epson stays connected -> selected printer must show OFFLINE
+    const hbADisconnected = await apiRequest(baseUrl, "POST", "/agent/heartbeat", {
+      headers: {
+        "x-agent-id": credsA.agentId,
+        "x-agent-secret": credsA.agentSecret
+      },
+      body: {
+        deviceId: credsA.deviceId,
+        agentVersion: "3.1.0",
+        printerName: "HP LaserJet Alpha Mono",
+        availablePrinters: [
+          {
+            name: "Epson EcoTank L3250",
+            manufacturer: "Epson",
+            model: "EcoTank L3250",
+            portName: "WSD-88412",
+            driverName: "EPSON L3250 Series",
+            connectionType: "WIFI",
+            printerCategory: "PHYSICAL",
+            printerAvailable: true,
+            status: "READY",
+            capabilities: {
+              supportedPaperSizes: ["A4", "A5", "B5"],
+              supportsColor: true,
+              supportsDuplex: false
+            }
+          }
+        ]
+      }
+    });
+    assert.strictEqual(hbADisconnected.status, 200);
+    const shopInfoADisc = await apiRequest(baseUrl, "GET", `/shops/${vendorA.shopSlug}`);
+    assert.strictEqual(
+      shopInfoADisc.data.printer.printerAvailable,
+      false,
+      "Disconnected selected printer must report printerAvailable=false"
+    );
+    assert.strictEqual(
+      shopInfoADisc.data.printer.selectedPrinterDisconnected,
+      true,
+      "Disconnected selected printer must flag selectedPrinterDisconnected=true"
+    );
+
+    // Reconnect Vendor A's HP printer -> automatically READY again
+    await apiRequest(baseUrl, "POST", "/agent/heartbeat", {
+      headers: {
+        "x-agent-id": credsA.agentId,
+        "x-agent-secret": credsA.agentSecret
+      },
+      body: {
+        deviceId: credsA.deviceId,
+        agentVersion: "3.1.0",
+        printerName: "HP LaserJet Alpha Mono",
+        availablePrinters: [
+          {
+            name: "HP LaserJet Alpha Mono",
+            manufacturer: "HP",
+            model: "LaserJet Alpha Mono",
+            portName: "USB001",
+            driverName: "HP LaserJet Driver",
+            connectionType: "USB",
+            printerCategory: "PHYSICAL",
+            isDefault: true,
+            printerAvailable: true,
+            status: "READY",
+            capabilities: {
+              supportedPaperSizes: ["A4", "Legal"],
+              supportsColor: false,
+              supportsDuplex: false
+            }
+          }
+        ]
+      }
+    });
+    const shopInfoAReconn = await apiRequest(baseUrl, "GET", `/shops/${vendorA.shopSlug}`);
+    assert.strictEqual(shopInfoAReconn.data.printer.printerAvailable, true);
+    console.log("  PASS: Each shop exposes only its own printer, preserves selection across multi-printer & disconnect/reconnect events.");
 
     // 5. Customer Uploads & Cross-Tenant GridFS Protection
     console.log("\n[5/8] Testing customer uploads and cross-tenant GridFS binding checks...");

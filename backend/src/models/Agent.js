@@ -3,13 +3,22 @@ const mongoose = require("mongoose");
 const detectedPrinterSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
+    manufacturer: { type: String, default: null },
+    model: { type: String, default: null },
     portName: { type: String, default: null },
     driverName: { type: String, default: null },
     connectionType: {
       type: String,
-      enum: ["USB", "NETWORK", "LOCAL", "UNKNOWN"],
+      enum: ["USB", "WIFI", "NETWORK", "SHARED", "LOCAL", "VIRTUAL", "UNKNOWN"],
       default: "USB"
     },
+    printerCategory: {
+      type: String,
+      enum: ["PHYSICAL", "VIRTUAL", "UNKNOWN"],
+      default: "PHYSICAL"
+    },
+    isVirtual: { type: Boolean, default: false },
+    isShared: { type: Boolean, default: false },
     isDefault: { type: Boolean, default: false },
     printerAvailable: { type: Boolean, default: false },
     workOffline: { type: Boolean, default: false },
@@ -25,10 +34,27 @@ const detectedPrinterSchema = new mongoose.Schema(
     capabilities: {
       supportedPaperSizes: {
         type: [String],
-        default: ["A4", "Letter", "Legal", "A5"]
+        default: ["A4"]
       },
+      paperSizesKnown: { type: Boolean, default: true },
+      supportsBW: { type: Boolean, default: true },
       supportsColor: { type: Boolean, default: false },
-      supportsDuplex: { type: Boolean, default: false }
+      colorSupportKnown: { type: Boolean, default: true },
+      supportsSingleSided: { type: Boolean, default: true },
+      supportsDuplex: { type: Boolean, default: false },
+      duplexSupportKnown: { type: Boolean, default: true },
+      supportsCopies: { type: Boolean, default: true },
+      maxCopies: { type: Number, default: 99 },
+      copiesSupportKnown: { type: Boolean, default: true },
+      supportedOrientations: {
+        type: [String],
+        default: ["portrait", "landscape"]
+      },
+      orientationSupportKnown: { type: Boolean, default: true },
+      resolutionsDpi: {
+        type: [Number],
+        default: []
+      }
     }
   },
   { _id: false }
@@ -135,10 +161,27 @@ const agentSchema = new mongoose.Schema(
     capabilities: {
       supportedPaperSizes: {
         type: [String],
-        default: ["A4", "Letter", "Legal", "A5"]
+        default: ["A4"]
       },
+      paperSizesKnown: { type: Boolean, default: true },
+      supportsBW: { type: Boolean, default: true },
       supportsColor: { type: Boolean, default: false },
-      supportsDuplex: { type: Boolean, default: false }
+      colorSupportKnown: { type: Boolean, default: true },
+      supportsSingleSided: { type: Boolean, default: true },
+      supportsDuplex: { type: Boolean, default: false },
+      duplexSupportKnown: { type: Boolean, default: true },
+      supportsCopies: { type: Boolean, default: true },
+      maxCopies: { type: Number, default: 99 },
+      copiesSupportKnown: { type: Boolean, default: true },
+      supportedOrientations: {
+        type: [String],
+        default: ["portrait", "landscape"]
+      },
+      orientationSupportKnown: { type: Boolean, default: true },
+      resolutionsDpi: {
+        type: [Number],
+        default: []
+      }
     }
   },
   { timestamps: true }

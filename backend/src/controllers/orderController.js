@@ -94,46 +94,69 @@ async function getActivePrinterState(tenantId) {
 
   // Resolve target printer on the agent
   let activePrinterObj = null;
+  let selectedPrinterDisconnected = false;
+
   if (preferredPrinterName && availablePrinters.length > 0) {
     activePrinterObj =
       availablePrinters.find(
         (p) => p.name.toLowerCase() === preferredPrinterName.toLowerCase()
       ) || null;
+    if (!activePrinterObj) {
+      selectedPrinterDisconnected = true;
+    }
+  } else if (preferredPrinterName && availablePrinters.length === 0 && agent) {
+    if (
+      agent.printerName &&
+      agent.printerName.toLowerCase() === preferredPrinterName.toLowerCase()
+    ) {
+      selectedPrinterDisconnected = !agent.printerAvailable;
+    } else {
+      selectedPrinterDisconnected = true;
+    }
   }
 
-  if (!activePrinterObj && availablePrinters.length === 1 && tenant?.autoSelectSinglePrinter !== false) {
+  if (
+    !preferredPrinterName &&
+    !activePrinterObj &&
+    availablePrinters.length === 1 &&
+    tenant?.autoSelectSinglePrinter !== false
+  ) {
     activePrinterObj = availablePrinters[0];
   }
 
-  if (!activePrinterObj && agent?.printerName && availablePrinters.length > 0) {
-    activePrinterObj =
-      availablePrinters.find(
-        (p) => p.name.toLowerCase() === String(agent.printerName).toLowerCase()
-      ) || availablePrinters.find((p) => p.isDefault) || availablePrinters[0];
-  }
+  const requiresManualSelection = Boolean(
+    !preferredPrinterName && availablePrinters.length > 1
+  );
 
   const resolvedPrinterName =
     activePrinterObj?.name ||
     preferredPrinterName ||
-    agent?.printerName ||
-    "No Printer Selected";
+    (requiresManualSelection
+      ? "Multiple Printers Detected — Select One"
+      : agent?.printerName || "No Printer Selected");
 
-  const resolvedPortName = activePrinterObj?.portName ?? agent?.portName ?? null;
-  const resolvedDriverName = activePrinterObj?.driverName ?? agent?.driverName ?? null;
+  const resolvedPortName = activePrinterObj?.portName ?? (selectedPrinterDisconnected ? null : agent?.portName ?? null);
+  const resolvedDriverName = activePrinterObj?.driverName ?? (selectedPrinterDisconnected ? null : agent?.driverName ?? null);
   const resolvedDriverMissing = Boolean(
-    activePrinterObj?.driverMissing ?? agent?.driverMissing ?? false
+    activePrinterObj?.driverMissing ?? (selectedPrinterDisconnected ? false : agent?.driverMissing ?? false)
   );
-  const resolvedStatus = activePrinterObj?.status || agent?.lastStatus || "OFFLINE";
+  const resolvedStatus = selectedPrinterDisconnected || requiresManualSelection
+    ? "OFFLINE"
+    : activePrinterObj?.status || agent?.lastStatus || "OFFLINE";
   const resolvedSpoolerJobs =
-    activePrinterObj?.spoolerJobCount ?? agent?.spoolerJobCount ?? 0;
+    activePrinterObj?.spoolerJobCount ?? (selectedPrinterDisconnected ? 0 : agent?.spoolerJobCount ?? 0);
 
   const rawAvailableFlag =
-    activePrinterObj !== null
-      ? activePrinterObj.printerAvailable
-      : agent?.printerAvailable;
+    selectedPrinterDisconnected || requiresManualSelection
+      ? false
+      : activePrinterObj !== null
+        ? activePrinterObj.printerAvailable
+        : agent?.printerAvailable;
 
   const printerAvailable = Boolean(
     agentOnline &&
+      !selectedPrinterDisconnected &&
+      !requiresManualSelection &&
       (rawAvailableFlag === true || ["READY", "ONLINE", "PRINTING"].includes(resolvedStatus)) &&
       resolvedStatus !== "OFFLINE" &&
       resolvedStatus !== "ERROR"
@@ -151,13 +174,21 @@ async function getActivePrinterState(tenantId) {
       agent?.statusMessage ||
       `Connected to ${resolvedPrinterName}${resolvedPortName ? ` on ${resolvedPortName}` : ""}`;
   } else if (agentOnline && !printerAvailable) {
-    connectionState = "PRINTER_OFFLINE";
-    statusLabel = resolvedDriverMissing ? "Driver Missing" : "Printer Offline";
-    statusMessage = resolvedDriverMissing
-      ? `Windows printer driver is missing for ${resolvedPrinterName}. Please install the manufacturer's Windows driver.`
-      : activePrinterObj?.statusMessage ||
-        agent?.statusMessage ||
-        `${resolvedPrinterName} is offline or disconnected.`;
+    connectionState = requiresManualSelection ? "SELECTION_REQUIRED" : "PRINTER_OFFLINE";
+    statusLabel = requiresManualSelection
+      ? "Select Active Printer"
+      : resolvedDriverMissing
+        ? "Driver Missing"
+        : "Printer Offline";
+    statusMessage = requiresManualSelection
+      ? `${availablePrinters.length} printers detected. Please select your active shop printer in Smart Xerox.`
+      : resolvedDriverMissing
+        ? `Windows printer driver is missing for ${resolvedPrinterName}. Please install the manufacturer's Windows driver.`
+        : selectedPrinterDisconnected
+          ? `${preferredPrinterName} is offline or disconnected from Windows.`
+          : activePrinterObj?.statusMessage ||
+            agent?.statusMessage ||
+            `${resolvedPrinterName} is offline or disconnected.`;
   }
 
   const detectedCaps = activePrinterObj?.capabilities || agent?.capabilities || {
@@ -195,11 +226,17 @@ async function getActivePrinterState(tenantId) {
     statusLabel,
     agentOnline,
     printerAvailable,
+    requiresManualSelection,
+    selectedPrinterDisconnected,
     agentId: agent?.agentId || agent?.deviceId || null,
     agentVersion: agent?.agentVersion || null,
     deviceId: agent?.deviceId || null,
     hostname: agent?.hostname || null,
     printerName: resolvedPrinterName,
+    manufacturer: activePrinterObj?.manufacturer || null,
+    model: activePrinterObj?.model || null,
+    connectionType: activePrinterObj?.connectionType || null,
+    printerCategory: activePrinterObj?.printerCategory || null,
     selectedPrinterName: preferredPrinterName || (availablePrinters.length === 1 ? availablePrinters[0].name : null),
     portName: resolvedPortName,
     driverName: resolvedDriverName,
@@ -332,7 +369,7 @@ const createJobSchema = z.object({
   copies: z.number().int().min(1).max(1000).default(1),
   colorMode: z.enum(["bw", "color"]).default("bw"),
   sides: z.enum(["single", "duplex"]).default("single"),
-  paperSize: z.enum(["A4", "A3", "Legal", "Letter", "A5"]).default("A4"),
+  paperSize: z.enum(["A4", "A3", "Legal", "Letter", "A5", "B5", "Executive"]).default("A4"),
   orientation: z.enum(["portrait", "landscape", "auto"]).default("auto")
 });
 

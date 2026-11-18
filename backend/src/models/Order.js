@@ -80,7 +80,7 @@ const orderSchema = new mongoose.Schema(
     },
     paperSize: {
       type: String,
-      enum: ["A4", "A3", "Legal", "Letter", "A5"],
+      enum: ["A4", "A3", "Legal", "Letter", "A5", "B5", "Executive"],
       default: "A4"
     },
     orientation: {

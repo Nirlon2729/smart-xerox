@@ -46,7 +46,7 @@ import {
   getApiErrorMessage
 } from "./services/desktopApi";
 
-const ALL_PAPER_SIZES = ["A4", "A3", "Legal", "Letter", "A5"];
+const ALL_PAPER_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "B5", "Executive"];
 
 const NAV_ITEMS = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -104,6 +104,9 @@ export default function App() {
   // Live Vendor Data
   const [printerState, setPrinterState] = useState(null);
   const [localPrinters, setLocalPrinters] = useState([]);
+  const [localVirtualPrinters, setLocalVirtualPrinters] = useState([]);
+  const [showVirtualPrinters, setShowVirtualPrinters] = useState(false);
+  const [expandedPrinterName, setExpandedPrinterName] = useState(null);
   const [discoveringPrinters, setDiscoveringPrinters] = useState(false);
   const [stats, setStats] = useState({
     todaysJobs: 0,
@@ -212,20 +215,50 @@ export default function App() {
   }, []);
 
   // 2. Discover local Windows printers via Python agent IPC
-  const refreshLocalPrinters = useCallback(async (showSpinner = false) => {
-    if (!window.electronAPI) return;
-    if (showSpinner) setDiscoveringPrinters(true);
-    try {
-      const res = await window.electronAPI.discoverLocalPrinters();
-      if (res?.printers && Array.isArray(res.printers)) {
-        setLocalPrinters(res.printers);
-      }
-    } catch (_e) {
-      // Handled gracefully
-    } finally {
-      if (showSpinner) setDiscoveringPrinters(false);
-    }
+  const applyLocalDiscoveryResult = useCallback((res) => {
+    if (!res) return;
+    const physical = Array.isArray(res.physicalPrinters)
+      ? res.physicalPrinters
+      : Array.isArray(res.printers)
+        ? res.printers.filter((p) => !p.isVirtual && p.printerCategory !== "VIRTUAL")
+        : [];
+    const virtualList = Array.isArray(res.virtualPrinters)
+      ? res.virtualPrinters
+      : Array.isArray(res.printers)
+        ? res.printers.filter((p) => p.isVirtual || p.printerCategory === "VIRTUAL")
+        : [];
+    setLocalPrinters(physical);
+    setLocalVirtualPrinters(virtualList);
   }, []);
+
+  const refreshLocalPrinters = useCallback(
+    async (showSpinner = false) => {
+      if (!window.electronAPI) return;
+      if (showSpinner) setDiscoveringPrinters(true);
+      try {
+        const res = await window.electronAPI.discoverLocalPrinters({
+          includeVirtual: true
+        });
+        applyLocalDiscoveryResult(res);
+      } catch (_e) {
+        // Handled gracefully
+      } finally {
+        if (showSpinner) setDiscoveringPrinters(false);
+      }
+    },
+    [applyLocalDiscoveryResult]
+  );
+
+  // Subscribe to real-time printer change notifications from Electron main process
+  useEffect(() => {
+    if (!window.electronAPI || typeof window.electronAPI.onPrintersUpdated !== "function") {
+      return undefined;
+    }
+    const unsubscribe = window.electronAPI.onPrintersUpdated((res) => {
+      applyLocalDiscoveryResult(res);
+    });
+    return unsubscribe;
+  }, [applyLocalDiscoveryResult]);
 
   // 3. Refresh local background agent status
   const refreshLocalAgentStatus = useCallback(async () => {
@@ -832,24 +865,81 @@ export default function App() {
   }
 
   // Merge local hardware discovery with cloud printer state
-  const mergedPrinters =
+  const basePhysicalPrinters =
     localPrinters.length > 0
       ? localPrinters
-      : printerState?.availablePrinters || [];
+      : (printerState?.availablePrinters || []).filter(
+          (p) => !p.isVirtual && p.printerCategory !== "VIRTUAL"
+        );
+
+  const selectedPrinterPref =
+    session.tenant?.selectedPrinterName || printerState?.selectedPrinterName || null;
+
+  // If the vendor had selected a printer that is currently disconnected/unplugged from Windows,
+  // keep it in the list as OFFLINE (Disconnected) so the vendor sees its status and never loses their selection.
+  const selectedExistsInList = selectedPrinterPref
+    ? basePhysicalPrinters.some(
+        (p) => p.name.toLowerCase() === String(selectedPrinterPref).toLowerCase()
+      )
+    : false;
+
+  const mergedPhysicalPrinters =
+    selectedPrinterPref && !selectedExistsInList
+      ? [
+          {
+            name: selectedPrinterPref,
+            printerName: selectedPrinterPref,
+            manufacturer: printerState?.manufacturer || null,
+            model: printerState?.model || selectedPrinterPref,
+            portName: printerState?.portName || null,
+            driverName: printerState?.driverName || null,
+            connectionType: printerState?.connectionType || "USB",
+            printerCategory: "PHYSICAL",
+            isVirtual: false,
+            isDefault: false,
+            isDisconnected: true,
+            driverMissing: false,
+            printerAvailable: false,
+            status: "OFFLINE",
+            statusMessage: `${selectedPrinterPref} is disconnected or turned off. Reconnect via USB or network to resume printing.`,
+            spoolerJobCount: 0,
+            capabilities: printerState?.detectedCapabilities ||
+              printerState?.capabilities || {
+                supportedPaperSizes: ["A4"],
+                supportsColor: false,
+                supportsDuplex: false
+              }
+          },
+          ...basePhysicalPrinters
+        ]
+      : basePhysicalPrinters;
+
+  const mergedPrinters = showVirtualPrinters
+    ? [...mergedPhysicalPrinters, ...localVirtualPrinters]
+    : mergedPhysicalPrinters;
+
+  const requiresManualPrinterSelection =
+    !selectedPrinterPref && basePhysicalPrinters.length > 1;
 
   const activePrinterName =
-    session.tenant?.selectedPrinterName ||
-    printerState?.selectedPrinterName ||
-    (mergedPrinters.length === 1 ? mergedPrinters[0].name : printerState?.printerName) ||
-    "No Printer Selected";
+    selectedPrinterPref ||
+    (basePhysicalPrinters.length === 1
+      ? basePhysicalPrinters[0].name
+      : requiresManualPrinterSelection
+        ? "Multiple Printers Detected — Select One"
+        : "No Printer Detected");
 
   const activeLocalPrinterObj =
-    mergedPrinters.find(
+    mergedPhysicalPrinters.find(
       (p) => p.name.toLowerCase() === String(activePrinterName).toLowerCase()
-    ) || mergedPrinters[0] || null;
+    ) ||
+    (basePhysicalPrinters.length === 1 ? basePhysicalPrinters[0] : null);
 
   const isPrinterOnline = Boolean(
-    activeLocalPrinterObj ? activeLocalPrinterObj.printerAvailable : printerState?.printerAvailable
+    !requiresManualPrinterSelection &&
+      (activeLocalPrinterObj
+        ? activeLocalPrinterObj.printerAvailable
+        : printerState?.printerAvailable)
   );
   const isAgentOnline = Boolean(localAgentStatus.running || printerState?.agentOnline);
 
@@ -1059,6 +1149,29 @@ export default function App() {
               ================================================================ */}
           {activeTab === "dashboard" && (
             <div className="space-y-6">
+              {requiresManualPrinterSelection && (
+                <div className="rounded-2xl border-2 border-amber-400 bg-amber-50 p-4 text-amber-950 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <h4 className="text-sm font-bold">
+                        Multiple Windows Printers Detected ({basePhysicalPrinters.length}) — Select Your Active Shop Printer
+                      </h4>
+                      <p className="text-xs text-amber-800 mt-0.5">
+                        Smart Xerox detected {basePhysicalPrinters.map((p) => p.name).join(", ")}. Choose which printer to use for incoming customer jobs.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("printers")}
+                    className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold shrink-0"
+                  >
+                    Select Shop Printer →
+                  </button>
+                </div>
+              )}
+
               {/* Top Status Cards */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div
@@ -1291,6 +1404,20 @@ export default function App() {
               ================================================================ */}
           {activeTab === "printers" && (
             <div className="space-y-6">
+              {requiresManualPrinterSelection && (
+                <div className="rounded-2xl border-2 border-[#8D0100] bg-[#8D0100]/5 p-5 space-y-2">
+                  <div className="flex items-center gap-2 text-[#8D0100]">
+                    <Printer className="w-5 h-5" />
+                    <h4 className="text-sm font-bold">
+                      Multiple Physical Printers Detected — Choose Your Active Smart Xerox Printer
+                    </h4>
+                  </div>
+                  <p className="text-xs text-zinc-600">
+                    We detected {basePhysicalPrinters.length} physical printers connected to this Windows computer. Click <strong>Set as Default for Smart Xerox</strong> on the printer you want to use for customer print jobs. Your choice will be remembered automatically across restarts.
+                  </p>
+                </div>
+              )}
+
               <div
                 className={`rounded-2xl border p-5 ${
                   isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
@@ -1299,41 +1426,78 @@ export default function App() {
                 <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-zinc-100">
                   <div>
                     <h3 className="text-base font-bold">
-                      Detected Windows Printers ({mergedPrinters.length})
+                      Universal Windows Printer Discovery ({mergedPhysicalPrinters.length} Physical
+                      {showVirtualPrinters ? ` • ${localVirtualPrinters.length} Virtual` : ""})
                     </h3>
                     <p className="text-xs text-zinc-500 mt-0.5">
-                      Automatically detects connected USB and network printers in Windows. Virtual PDF/XPS printers are excluded.
+                      Automatically discovers USB, Wi-Fi, Network, Shared, and Local printers across all brands (HP, Canon, Epson, Brother, Samsung, Xerox, Ricoh, Kyocera, Pantum, Lexmark, and more) via Windows Print Spooler.
                     </p>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => refreshLocalPrinters(true)}
-                    disabled={discoveringPrinters}
-                    className="px-3.5 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold inline-flex items-center gap-1.5"
-                  >
-                    <RefreshCw
-                      className={`w-3.5 h-3.5 ${discoveringPrinters ? "animate-spin" : ""}`}
-                    />
-                    <span>Scan Printers Now</span>
-                  </button>
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    <label className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-zinc-200 text-xs font-semibold cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={showVirtualPrinters}
+                        onChange={(e) => setShowVirtualPrinters(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-[#8D0100]"
+                      />
+                      <span>Show Virtual Printers ({localVirtualPrinters.length})</span>
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={() => refreshLocalPrinters(true)}
+                      disabled={discoveringPrinters}
+                      className="px-3.5 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold inline-flex items-center gap-1.5"
+                    >
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${discoveringPrinters ? "animate-spin" : ""}`}
+                      />
+                      <span>Refresh Printers</span>
+                    </button>
+                  </div>
                 </div>
 
                 {mergedPrinters.length === 0 ? (
-                  <div className="py-10 text-center space-y-2">
+                  <div className="py-10 text-center space-y-3">
                     <AlertTriangle className="w-8 h-8 text-amber-500 mx-auto" />
-                    <p className="text-sm font-semibold">
+                    <p className="text-sm font-bold">
                       No Physical Windows Printers Detected
                     </p>
-                    <p className="text-xs text-zinc-500 max-w-md mx-auto">
-                      Connect your printer via USB or network and ensure its Windows printer driver is installed. Smart Xerox will detect it automatically.
+                    <p className="text-xs text-zinc-500 max-w-lg mx-auto leading-relaxed">
+                      Connect your printer via USB cable, Wi-Fi, or Ethernet network and ensure the manufacturer&apos;s official Windows printer driver (HP, Canon, Epson, Brother, Xerox, Ricoh, Kyocera, etc.) is installed in Windows Settings → Bluetooth &amp; devices → Printers &amp; scanners. Smart Xerox will detect it automatically without restarting.
                     </p>
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
                     {mergedPrinters.map((p) => {
+                      const isVirtual = Boolean(
+                        p.isVirtual || p.printerCategory === "VIRTUAL"
+                      );
                       const isSelected =
+                        !isVirtual &&
                         p.name.toLowerCase() === String(activePrinterName).toLowerCase();
+                      const isExpanded = expandedPrinterName === p.name;
+                      const caps = p.capabilities || {};
+                      const brandLabel = p.manufacturer || "Windows Compatible";
+                      const modelLabel = p.model || p.name;
+                      const categoryLabel =
+                        p.printerCategory === "VIRTUAL"
+                          ? "Virtual Software Printer"
+                          : p.printerCategory === "UNKNOWN"
+                            ? "Unknown Classification"
+                            : "Physical Printer";
+
+                      const statusText = p.driverMissing
+                        ? "Driver Error"
+                        : p.status === "ERROR"
+                          ? "Hardware Error"
+                          : p.status === "PRINTING"
+                            ? "Printing"
+                            : p.printerAvailable
+                              ? "Ready"
+                              : "Offline";
 
                       return (
                         <div
@@ -1341,15 +1505,17 @@ export default function App() {
                           className={`rounded-2xl border p-4 space-y-3 transition ${
                             isSelected
                               ? "border-[#8D0100] ring-1 ring-[#8D0100] bg-[#8D0100]/5"
-                              : isDark
-                                ? "border-zinc-800 bg-zinc-950"
-                                : "border-zinc-200 bg-zinc-50/60"
+                              : isVirtual
+                                ? "border-zinc-200 bg-zinc-100/70 opacity-80"
+                                : isDark
+                                  ? "border-zinc-800 bg-zinc-950"
+                                  : "border-zinc-200 bg-zinc-50/60"
                           }`}
                         >
                           <div className="flex items-start justify-between gap-2">
                             <div className="flex items-center gap-2.5 min-w-0">
                               <div className="w-10 h-10 rounded-xl bg-[#8D0100]/10 text-[#8D0100] flex items-center justify-center shrink-0">
-                                {p.connectionType === "NETWORK" ? (
+                                {["NETWORK", "WIFI", "SHARED"].includes(p.connectionType) ? (
                                   <Wifi className="w-5 h-5" />
                                 ) : (
                                   <Usb className="w-5 h-5" />
@@ -1357,7 +1523,10 @@ export default function App() {
                               </div>
                               <div className="min-w-0">
                                 <div className="flex items-center gap-1.5 flex-wrap">
-                                  <h4 className="text-sm font-bold truncate">
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-[#8D0100]/10 text-[#8D0100]">
+                                    {brandLabel}
+                                  </span>
+                                  <h4 className="text-sm font-bold truncate" title={p.name}>
                                     {p.name}
                                   </h4>
                                   {p.isDefault && (
@@ -1365,62 +1534,131 @@ export default function App() {
                                       Windows Default
                                     </span>
                                   )}
+                                  {isSelected && (
+                                    <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-[#8D0100] text-white">
+                                      Smart Xerox Default
+                                    </span>
+                                  )}
                                 </div>
-                                <p className="text-xs text-zinc-500 font-mono-code mt-0.5">
-                                  {p.connectionType || "USB"} • Port: {p.portName || "N/A"}
+                                <p className="text-xs text-zinc-500 font-mono-code mt-0.5 truncate">
+                                  Model: {modelLabel} • {p.connectionType || "USB"} • Port:{" "}
+                                  {p.portName || "N/A"}
                                 </p>
                               </div>
                             </div>
 
-                            <span
-                              className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border shrink-0 ${
-                                p.printerAvailable
-                                  ? "bg-emerald-50 text-emerald-800 border-emerald-200"
-                                  : "bg-amber-50 text-amber-800 border-amber-200"
-                              }`}
-                            >
-                              {p.printerAvailable ? "Online" : "Offline"}
-                            </span>
+                            <div className="flex flex-col items-end gap-1 shrink-0">
+                              <span
+                                className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
+                                  p.printerAvailable && !isVirtual
+                                    ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                                    : p.status === "ERROR" || p.driverMissing
+                                      ? "bg-red-50 text-red-700 border-red-200"
+                                      : "bg-amber-50 text-amber-800 border-amber-200"
+                                }`}
+                              >
+                                {p.printerAvailable ? "Online" : "Offline"} • {statusText}
+                              </span>
+                              <span className="text-[10px] font-semibold text-zinc-400">
+                                {categoryLabel}
+                              </span>
+                            </div>
                           </div>
 
                           {p.driverMissing && (
                             <div className="p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 flex items-start gap-2">
                               <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                               <span>
-                                Windows printer driver is missing for this printer. Please install the manufacturer&apos;s Windows driver.
+                                Windows printer driver is missing for <strong>{p.name}</strong>. Please install the official <strong>{brandLabel}</strong> Windows driver so Windows Print Spooler can communicate with the device.
                               </span>
                             </div>
                           )}
 
-                          <div className="text-xs text-zinc-500 space-y-1">
-                            <div>Driver: {p.driverName || "Missing driver"}</div>
-                            <div>
-                              Detected Capabilities:{" "}
-                              <span className="font-mono-code font-medium text-zinc-700">
-                                {(p.capabilities?.supportedPaperSizes || ["A4"]).join(", ")} •{" "}
-                                {p.capabilities?.supportsColor ? "Colour & B&W" : "B&W Only"} •{" "}
-                                {p.capabilities?.supportsDuplex ? "Duplex" : "Single-sided"}
+                          {!p.printerAvailable && !p.driverMissing && !isVirtual && (
+                            <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800 flex items-start gap-2">
+                              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                              <span>
+                                {p.statusMessage ||
+                                  `${p.name} is currently offline or disconnected. Check power and USB/network cable. Smart Xerox will automatically mark it Ready when reconnected.`}
+                              </span>
+                            </div>
+                          )}
+
+                          <div className="text-xs text-zinc-500 space-y-1.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="truncate">
+                                Driver: <strong className="text-zinc-700">{p.driverName || "Missing Windows driver"}</strong>
+                              </span>
+                            </div>
+
+                            <div className="flex flex-wrap gap-1.5 pt-0.5">
+                              <span className="px-2 py-0.5 rounded-md bg-white border border-zinc-200 text-[11px] font-semibold text-zinc-700">
+                                {caps.supportsColor
+                                  ? "Colour & B&W"
+                                  : caps.colorSupportKnown === false
+                                    ? "B&W (Colour Unknown)"
+                                    : "B&W Only"}
+                              </span>
+                              <span className="px-2 py-0.5 rounded-md bg-white border border-zinc-200 text-[11px] font-semibold text-zinc-700">
+                                {caps.supportsDuplex
+                                  ? "Auto Duplex & Single-Sided"
+                                  : caps.duplexSupportKnown === false
+                                    ? "Single-Sided (Duplex Unknown)"
+                                    : "Single-Sided Only"}
+                              </span>
+                              <span className="px-2 py-0.5 rounded-md bg-white border border-zinc-200 text-[11px] font-mono-code font-semibold text-zinc-700">
+                                Sizes: {(caps.supportedPaperSizes || ["A4"]).join(", ")}
+                                {caps.paperSizesKnown === false ? " (Fallback)" : ""}
                               </span>
                             </div>
                           </div>
 
-                          <div className="pt-1 flex items-center justify-between">
-                            <span className="text-[11px] text-zinc-500">
-                              Queue: {p.spoolerJobCount || 0} job(s)
-                            </span>
+                          {isExpanded && (
+                            <div className="p-3 rounded-xl bg-white border border-zinc-200 text-xs text-zinc-700 space-y-1.5 font-mono-code">
+                              <div>Brand / Manufacturer : {brandLabel}</div>
+                              <div>Model                : {modelLabel}</div>
+                              <div>Windows Printer Name : {p.name}</div>
+                              <div>Windows Driver       : {p.driverName || "N/A"}</div>
+                              <div>Port / Connection    : {p.portName || "N/A"} ({p.connectionType || "UNKNOWN"})</div>
+                              <div>Classification       : {categoryLabel}</div>
+                              <div>Status Detail        : {p.statusMessage || statusText}</div>
+                              <div>Orientations         : {(caps.supportedOrientations || ["portrait", "landscape"]).join(", ")}</div>
+                              <div>Hardware Max Copies  : {caps.maxCopies || 99}</div>
+                            </div>
+                          )}
 
-                            {isSelected ? (
+                          <div className="pt-1 flex items-center justify-between gap-2 flex-wrap">
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] text-zinc-500">
+                                Queue: {p.spoolerJobCount || 0} job(s)
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedPrinterName(isExpanded ? null : p.name)
+                                }
+                                className="text-[11px] font-semibold text-[#8D0100] hover:underline"
+                              >
+                                {isExpanded ? "Hide Details" : "Printer Details"}
+                              </button>
+                            </div>
+
+                            {isVirtual ? (
+                              <span className="px-2.5 py-1 rounded-lg bg-zinc-200 text-zinc-600 text-[11px] font-semibold">
+                                Virtual Printer (Disabled for Shop Jobs)
+                              </span>
+                            ) : isSelected ? (
                               <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#8D0100] text-white text-xs font-semibold">
                                 <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>Selected Shop Printer</span>
+                                <span>Active Smart Xerox Printer</span>
                               </span>
                             ) : (
                               <button
                                 type="button"
                                 onClick={() => handleSelectPrinter(p.name)}
-                                className="px-3 py-1.5 rounded-xl border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-800 text-xs font-semibold"
+                                className="px-3 py-1.5 rounded-xl border border-[#8D0100] bg-white hover:bg-[#8D0100] hover:text-white text-[#8D0100] text-xs font-semibold transition"
                               >
-                                Select This Printer
+                                Set as Default for Smart Xerox
                               </button>
                             )}
                           </div>

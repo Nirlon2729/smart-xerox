@@ -549,9 +549,21 @@ ipcMain.handle("session:save", async (_event, payload) => {
     raw.admin = payload.admin;
   }
   if (payload.tenant !== undefined) {
+    const prevSelectedPrinter =
+      raw.tenant &&
+      payload.tenant &&
+      String(raw.tenant.id || raw.tenant.tenantId) ===
+        String(payload.tenant.id || payload.tenant.tenantId)
+        ? raw.tenant.selectedPrinterName
+        : null;
     raw.tenant = payload.tenant;
-    if (raw.tenant && raw.tenant.shopSlug) {
-      raw.tenant.publicUrl = `${raw.customerBaseUrl || DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
+    if (raw.tenant) {
+      if (!raw.tenant.selectedPrinterName && prevSelectedPrinter) {
+        raw.tenant.selectedPrinterName = prevSelectedPrinter;
+      }
+      if (raw.tenant.shopSlug) {
+        raw.tenant.publicUrl = `${raw.customerBaseUrl || DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
+      }
     }
   }
   if (payload.vendorToken !== undefined) {
@@ -601,8 +613,71 @@ ipcMain.handle("session:clear", async (_event, { keepAgentRunning = false } = {}
   return { success: true };
 });
 
-ipcMain.handle("printers:discover-local", async () => {
-  return runAgentCliJson(["--list-printers-json"]);
+let lastPrinterSnapshotHash = "";
+let printerMonitorTimer = null;
+let printerMonitorBusy = false;
+
+function computePrinterSnapshotHash(discovery) {
+  if (!discovery || !Array.isArray(discovery.physicalPrinters || discovery.printers)) {
+    return "";
+  }
+  const list = discovery.physicalPrinters || discovery.printers || [];
+  return JSON.stringify(
+    list.map((p) => ({
+      name: p.name,
+      portName: p.portName,
+      driverName: p.driverName,
+      connectionType: p.connectionType,
+      isDefault: p.isDefault,
+      printerAvailable: p.printerAvailable,
+      status: p.status,
+      workOffline: p.workOffline,
+      driverMissing: p.driverMissing,
+      spoolerJobCount: p.spoolerJobCount
+    }))
+  );
+}
+
+async function pollAndNotifyPrinters(includeVirtual = false) {
+  const args = ["--list-printers-json"];
+  if (includeVirtual) {
+    args.push("--include-virtual");
+  }
+  const res = await runAgentCliJson(args);
+  const nextHash = computePrinterSnapshotHash(res);
+  if (nextHash && nextHash !== lastPrinterSnapshotHash) {
+    lastPrinterSnapshotHash = nextHash;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("printers:updated", res);
+    }
+  }
+  return res;
+}
+
+function startPrinterMonitor() {
+  if (printerMonitorTimer) return;
+  printerMonitorTimer = setInterval(async () => {
+    if (printerMonitorBusy || isQuitting) return;
+    printerMonitorBusy = true;
+    try {
+      await pollAndNotifyPrinters(false);
+    } catch (_e) {
+      // Ignore transient errors
+    } finally {
+      printerMonitorBusy = false;
+    }
+  }, 4500);
+}
+
+function stopPrinterMonitor() {
+  if (printerMonitorTimer) {
+    clearInterval(printerMonitorTimer);
+    printerMonitorTimer = null;
+  }
+}
+
+ipcMain.handle("printers:discover-local", async (_event, opts = {}) => {
+  return pollAndNotifyPrinters(Boolean(opts?.includeVirtual));
 });
 
 ipcMain.handle("printers:set-selected", async (_event, { printerName }) => {
@@ -731,6 +806,7 @@ if (process.argv.includes("--cli-self-test")) {
       configureWindowsAutoStart(s.autoStartWithWindows);
       createTray();
       createMainWindow();
+      startPrinterMonitor();
       if (s.hasAgentCredentials) {
         startBackgroundAgent();
       }
@@ -738,11 +814,13 @@ if (process.argv.includes("--cli-self-test")) {
 
     app.on("before-quit", () => {
       isQuitting = true;
+      stopPrinterMonitor();
       stopBackgroundAgent();
     });
 
     app.on("window-all-closed", () => {
       if (process.platform !== "darwin" && !tray) {
+        stopPrinterMonitor();
         stopBackgroundAgent();
         app.quit();
       }

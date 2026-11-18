@@ -1,7 +1,7 @@
 import React from "react";
 import { Minus, Plus, Check, AlertCircle } from "lucide-react";
 
-const ALL_PAPER_SIZES = ["A4", "A3", "Legal", "Letter", "A5"];
+const ALL_PAPER_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "B5", "Executive"];
 
 export default function PrintOptions({
   settings,
@@ -27,7 +27,7 @@ export default function PrintOptions({
     Array.isArray(capabilities?.supportedPaperSizes) &&
     capabilities.supportedPaperSizes.length > 0
       ? capabilities.supportedPaperSizes.filter((s) => ALL_PAPER_SIZES.includes(s))
-      : ["A4", "Legal"];
+      : ["A4"];
 
   const supportsColor = Boolean(capabilities?.supportsColor);
   const supportsDuplex =

@@ -122,6 +122,32 @@ export function PrintSessionProvider({ children }) {
     };
   }, [selectedFile]);
 
+  useEffect(() => {
+    const caps = printerState?.capabilities;
+    if (!caps) return;
+    setSettings((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      if (!caps.supportsColor && prev.colorMode === "color") {
+        next.colorMode = "bw";
+        changed = true;
+      }
+      if (!caps.supportsDuplex && prev.sides === "duplex") {
+        next.sides = "single";
+        changed = true;
+      }
+      const allowedSizes =
+        Array.isArray(caps.supportedPaperSizes) && caps.supportedPaperSizes.length > 0
+          ? caps.supportedPaperSizes
+          : ["A4"];
+      if (!allowedSizes.includes(prev.paperSize)) {
+        next.paperSize = allowedSizes.includes("A4") ? "A4" : allowedSizes[0];
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [printerState?.capabilities]);
+
   const setUploadedDocument = useCallback(
     (file, serverMeta) => {
       setSelectedFile(file);

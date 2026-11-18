@@ -421,7 +421,7 @@ async function selectVendorPrinter(req, res) {
  */
 async function updateVendorPrinterCapabilities(req, res) {
   const { useManualOverride, supportedPaperSizes, supportsColor, supportsDuplex } = req.body;
-  const validSizes = ["A4", "A3", "Legal", "Letter", "A5"];
+  const validSizes = ["A4", "A3", "Legal", "Letter", "A5", "B5", "Executive"];
   const filteredSizes = Array.isArray(supportedPaperSizes)
     ? supportedPaperSizes.filter((s) => validSizes.includes(s))
     : ["A4"];

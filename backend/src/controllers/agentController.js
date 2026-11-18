@@ -11,8 +11,10 @@ const {
 } = require("../services/gridfsService");
 
 const LEASE_DURATION_MS = 3 * 60 * 1000; // 3 minutes per active download/processing lease
-const VALID_PAPER_SIZES = ["A4", "A3", "Legal", "Letter", "A5"];
+const VALID_PAPER_SIZES = ["A4", "A3", "Legal", "Letter", "A5", "B5", "Executive"];
 const ALLOWED_STATUSES = ["READY", "ONLINE", "PRINTING", "OFFLINE", "ERROR"];
+const ALLOWED_CONNECTION_TYPES = ["USB", "WIFI", "NETWORK", "SHARED", "LOCAL", "VIRTUAL", "UNKNOWN"];
+const ALLOWED_PRINTER_CATEGORIES = ["PHYSICAL", "VIRTUAL", "UNKNOWN"];
 
 /**
  * Recovers jobs that stalled during DOWNLOADING or PROCESSING (before reaching the physical printer spooler).
@@ -60,19 +62,48 @@ async function recoverExpiredLeases(tenantId = null) {
 function sanitizeCapabilities(caps) {
   if (!caps || typeof caps !== "object") {
     return {
-      supportedPaperSizes: ["A4", "Letter", "Legal", "A5"],
+      supportedPaperSizes: ["A4"],
+      paperSizesKnown: false,
+      supportsBW: true,
       supportsColor: false,
-      supportsDuplex: false
+      colorSupportKnown: false,
+      supportsSingleSided: true,
+      supportsDuplex: false,
+      duplexSupportKnown: false,
+      supportsCopies: true,
+      maxCopies: 99,
+      copiesSupportKnown: false,
+      supportedOrientations: ["portrait", "landscape"],
+      orientationSupportKnown: false,
+      resolutionsDpi: []
     };
   }
   const reportedSizes = Array.isArray(caps.supportedPaperSizes)
     ? caps.supportedPaperSizes.filter((s) => VALID_PAPER_SIZES.includes(s))
-    : ["A4", "Letter", "Legal", "A5"];
+    : ["A4"];
+
+  const reportedOrientations = Array.isArray(caps.supportedOrientations)
+    ? caps.supportedOrientations.filter((o) => ["portrait", "landscape"].includes(o))
+    : ["portrait", "landscape"];
 
   return {
     supportedPaperSizes: reportedSizes.length > 0 ? reportedSizes : ["A4"],
+    paperSizesKnown: caps.paperSizesKnown !== false,
+    supportsBW: caps.supportsBW !== false,
     supportsColor: Boolean(caps.supportsColor),
-    supportsDuplex: Boolean(caps.supportsDuplex)
+    colorSupportKnown: caps.colorSupportKnown !== false,
+    supportsSingleSided: caps.supportsSingleSided !== false,
+    supportsDuplex: Boolean(caps.supportsDuplex),
+    duplexSupportKnown: caps.duplexSupportKnown !== false,
+    supportsCopies: caps.supportsCopies !== false,
+    maxCopies: Number(caps.maxCopies) > 0 ? Number(caps.maxCopies) : 99,
+    copiesSupportKnown: caps.copiesSupportKnown !== false,
+    supportedOrientations:
+      reportedOrientations.length > 0 ? reportedOrientations : ["portrait", "landscape"],
+    orientationSupportKnown: caps.orientationSupportKnown !== false,
+    resolutionsDpi: Array.isArray(caps.resolutionsDpi)
+      ? caps.resolutionsDpi.map(Number).filter((n) => Number.isFinite(n) && n > 0).slice(0, 10)
+      : []
   };
 }
 
@@ -85,11 +116,20 @@ function sanitizeDetectedPrinter(p) {
 
   return {
     name: String(p.name || p.printerName || "").trim(),
+    manufacturer: p.manufacturer ? String(p.manufacturer).trim() : null,
+    model: p.model ? String(p.model).trim() : null,
     portName: p.portName ? String(p.portName).trim() : null,
     driverName: p.driverName ? String(p.driverName).trim() : null,
-    connectionType: ["USB", "NETWORK", "LOCAL", "UNKNOWN"].includes(p.connectionType)
+    connectionType: ALLOWED_CONNECTION_TYPES.includes(p.connectionType)
       ? p.connectionType
       : "USB",
+    printerCategory: ALLOWED_PRINTER_CATEGORIES.includes(p.printerCategory)
+      ? p.printerCategory
+      : p.isVirtual
+        ? "VIRTUAL"
+        : "PHYSICAL",
+    isVirtual: Boolean(p.isVirtual || p.printerCategory === "VIRTUAL"),
+    isShared: Boolean(p.isShared || p.connectionType === "SHARED"),
     isDefault: Boolean(p.isDefault),
     printerAvailable: isReady,
     workOffline: Boolean(p.workOffline),
@@ -127,12 +167,12 @@ async function heartbeat(req, res) {
   const sanitizedPrinters = Array.isArray(availablePrinters)
     ? availablePrinters
         .map(sanitizeDetectedPrinter)
-        .filter((p) => Boolean(p.name))
+        .filter((p) => Boolean(p.name) && !p.isVirtual)
     : [];
 
   let selectedPrinterName = req.tenant.selectedPrinterName;
 
-  // Auto-select if only one compatible printer is detected and none is selected yet
+  // Auto-select ONLY if no printer is selected yet and exactly one usable physical printer is detected
   if (
     !selectedPrinterName &&
     req.tenant.autoSelectSinglePrinter !== false &&
@@ -153,26 +193,39 @@ async function heartbeat(req, res) {
         )
       : null;
 
+  // If vendor had a selectedPrinterName, but it is NOT in availablePrinters (e.g. USB disconnected)
+  // and availablePrinters was explicitly reported, mark the selected printer as OFFLINE (disconnected).
+  const isSelectedDisconnected = Boolean(
+    selectedPrinterName &&
+      Array.isArray(availablePrinters) &&
+      !matchedSelected
+  );
+
   const resolvedPrinterName =
     matchedSelected?.name ||
-    String(printerName || selectedPrinterName || req.agent.printerName || "No Printer Selected").trim();
+    selectedPrinterName ||
+    String(printerName || req.agent.printerName || "No Printer Selected").trim();
 
   const normalizedStatus = matchedSelected
     ? matchedSelected.status
-    : ALLOWED_STATUSES.includes(status)
-      ? status
-      : "READY";
+    : isSelectedDisconnected
+      ? "OFFLINE"
+      : ALLOWED_STATUSES.includes(status)
+        ? status
+        : "READY";
 
   const isPrinterReady = matchedSelected
     ? matchedSelected.printerAvailable
-    : printerAvailable !== undefined
-      ? Boolean(printerAvailable)
-      : ["READY", "ONLINE", "PRINTING"].includes(normalizedStatus);
+    : isSelectedDisconnected
+      ? false
+      : printerAvailable !== undefined
+        ? Boolean(printerAvailable)
+        : ["READY", "ONLINE", "PRINTING"].includes(normalizedStatus);
 
   const now = new Date();
   const updateFields = {
     printerName: resolvedPrinterName,
-    agentVersion: String(agentVersion || "3.0.0").trim(),
+    agentVersion: String(agentVersion || "3.1.0").trim(),
     hostname: hostname ? String(hostname).trim() : req.agent.hostname,
     osVersion: osVersion ? String(osVersion).trim() : req.agent.osVersion,
     portName: matchedSelected ? matchedSelected.portName : portName ? String(portName).trim() : null,
@@ -183,9 +236,11 @@ async function heartbeat(req, res) {
     lastStatus: normalizedStatus,
     statusMessage: matchedSelected
       ? matchedSelected.statusMessage
-      : statusMessage
-        ? String(statusMessage).slice(0, 300)
-        : null,
+      : isSelectedDisconnected
+        ? `${selectedPrinterName} is offline or disconnected from Windows.`
+        : statusMessage
+          ? String(statusMessage).slice(0, 300)
+          : null,
     spoolerJobCount: matchedSelected
       ? matchedSelected.spoolerJobCount
       : Number(spoolerJobCount) || 0,
