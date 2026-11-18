@@ -19,9 +19,16 @@ app.use(
   })
 );
 
+const normalizeOriginValue = (val) => {
+  const trimmed = String(val || "").trim().replace(/\/+$/, "");
+  if (!trimmed || trimmed === "*") return trimmed;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+};
+
 const configuredOrigins = (process.env.CUSTOMER_ORIGIN || "http://localhost:5173,http://localhost:5174")
   .split(",")
-  .map((o) => o.trim().replace(/\/+$/, ""))
+  .map(normalizeOriginValue)
   .filter(Boolean);
 
 const isPrivateLanOrigin = (origin) => {

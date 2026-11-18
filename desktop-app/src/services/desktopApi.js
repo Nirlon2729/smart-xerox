@@ -3,9 +3,22 @@ import axios from "axios";
 let activeApiBaseUrl = "http://localhost:5000/api";
 let activeVendorToken = "";
 
+function normalizeDesktopApiUrl(url) {
+  const cleaned = String(url || "").trim().replace(/\/+$/, "");
+  if (!cleaned) return "http://localhost:5000/api";
+  let withProtocol = cleaned;
+  if (!/^https?:\/\//i.test(withProtocol)) {
+    const isLocal = /^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(
+      withProtocol
+    );
+    withProtocol = `${isLocal ? "http" : "https"}://${withProtocol}`;
+  }
+  return withProtocol.endsWith("/api") ? withProtocol : `${withProtocol}/api`;
+}
+
 export function configureDesktopApi({ apiBaseUrl, vendorToken }) {
   if (apiBaseUrl) {
-    activeApiBaseUrl = String(apiBaseUrl).trim().replace(/\/+$/, "");
+    activeApiBaseUrl = normalizeDesktopApiUrl(apiBaseUrl);
   }
   if (vendorToken !== undefined) {
     activeVendorToken = vendorToken || "";
@@ -42,7 +55,7 @@ export function getApiErrorMessage(error, fallback = "Operation failed. Please t
 
 export async function vendorLogin(email, password, apiBaseUrlOverride = null) {
   if (apiBaseUrlOverride) {
-    activeApiBaseUrl = String(apiBaseUrlOverride).trim().replace(/\/+$/, "");
+    activeApiBaseUrl = normalizeDesktopApiUrl(apiBaseUrlOverride);
   }
   const { data } = await getClient().post("/vendor/login", { email, password });
   return data;

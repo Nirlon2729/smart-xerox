@@ -44,12 +44,21 @@ function isLocalOrLanHost(urlStr) {
   }
 }
 
+function normalizePublicOrigin(value) {
+  const trimmed = String(value || "").trim().replace(/\/+$/, "");
+  if (!trimmed || trimmed === "*") return "";
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+}
+
 function buildShopPublicUrl(shopSlug, customBaseUrl = null) {
   const candidates = [
     customBaseUrl,
     process.env.PUBLIC_SHOP_BASE_URL,
     ...(process.env.CUSTOMER_ORIGIN || "").split(",").map((s) => s.trim())
-  ].filter(Boolean);
+  ]
+    .map(normalizePublicOrigin)
+    .filter(Boolean);
 
   const publicOrigin = candidates.find((url) => !isLocalOrLanHost(url));
   const cleanBase = (publicOrigin || "https://smartxerox.com").replace(/\/+$/, "");

@@ -1,10 +1,26 @@
 import axios from "axios";
 
+function normalizeConfiguredApiUrl(value) {
+  const cleaned = String(value || "").trim().replace(/\/+$/, "");
+  if (!cleaned) return "";
+  let withProtocol = cleaned;
+  if (!/^https?:\/\//i.test(withProtocol) && !withProtocol.startsWith("/")) {
+    const isLocal = /^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(
+      withProtocol
+    );
+    withProtocol = `${isLocal ? "http" : "https"}://${withProtocol}`;
+  }
+  if (!withProtocol.endsWith("/api")) {
+    withProtocol = `${withProtocol}/api`;
+  }
+  return withProtocol;
+}
+
 /**
  * Resolves the backend API base URL for mobile browsers, LAN testing, and Render HTTPS production.
  */
 export function resolveApiBaseUrl() {
-  const rawEnvUrl = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/+$/, "");
+  const rawEnvUrl = normalizeConfiguredApiUrl(import.meta.env.VITE_API_BASE_URL);
 
   if (typeof window !== "undefined" && window.location?.hostname) {
     const currentHost = window.location.hostname;

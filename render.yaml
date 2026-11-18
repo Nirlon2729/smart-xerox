@@ -19,9 +19,15 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: CUSTOMER_ORIGIN
-        sync: false
+        fromService:
+          type: web
+          name: smart-xerox-web
+          property: host
       - key: PUBLIC_SHOP_BASE_URL
-        sync: false
+        fromService:
+          type: web
+          name: smart-xerox-web
+          property: host
       - key: MAX_UPLOAD_MB
         value: "20"
       - key: FILE_RETENTION_MINUTES
@@ -40,7 +46,10 @@ services:
         destination: /index.html
     envVars:
       - key: VITE_API_BASE_URL
-        sync: false
+        fromService:
+          type: web
+          name: smart-xerox-api
+          property: host
       - key: VITE_MAX_UPLOAD_MB
         value: "20"
       - key: VITE_MAX_COPIES
