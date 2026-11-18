@@ -2,11 +2,12 @@
   "name": "smart-xerox-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "Backend API for a single-shop QR-based Xerox printing system",
+  "description": "Multi-vendor SaaS backend API for Smart Xerox printing platform",
   "main": "src/server.js",
   "scripts": {
     "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node tests/multiVendorIsolation.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

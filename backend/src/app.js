@@ -4,9 +4,11 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 const rateLimit = require("express-rate-limit");
 
+const shopRoutes = require("./routes/shopRoutes");
 const orderRoutes = require("./routes/orderRoutes");
 const agentRoutes = require("./routes/agentRoutes");
 const adminRoutes = require("./routes/adminRoutes");
+const superAdminRoutes = require("./routes/superAdminRoutes");
 const { notFound, errorHandler } = require("./middleware/errorMiddleware");
 
 const app = express();
@@ -17,7 +19,7 @@ app.use(
   })
 );
 
-const configuredOrigins = (process.env.CUSTOMER_ORIGIN || "http://localhost:5173")
+const configuredOrigins = (process.env.CUSTOMER_ORIGIN || "http://localhost:5173,http://localhost:5174")
   .split(",")
   .map((o) => o.trim().replace(/\/+$/, ""))
   .filter(Boolean);
@@ -39,15 +41,22 @@ const isPrivateLanOrigin = (origin) => {
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow same-origin, server-to-server, print-agent, or mobile native requests without Origin header
-      if (!origin) return callback(null, true);
-
-      const normalized = origin.replace(/\/+$/, "");
-      if (configuredOrigins.includes(normalized)) {
+      // Allow same-origin, server-to-server, print-agent, or Electron desktop file:// / null origins
+      if (
+        !origin ||
+        origin === "null" ||
+        origin.startsWith("file://") ||
+        origin.startsWith("app://")
+      ) {
         return callback(null, true);
       }
 
-      // Allow phones on the same Wi-Fi LAN in development
+      const normalized = origin.replace(/\/+$/, "");
+      if (configuredOrigins.includes(normalized) || configuredOrigins.includes("*")) {
+        return callback(null, true);
+      }
+
+      // Allow local/LAN origins in development or local Electron dev server
       if (process.env.NODE_ENV !== "production" && isPrivateLanOrigin(normalized)) {
         return callback(null, true);
       }
@@ -62,6 +71,8 @@ app.use(
       "Content-Type",
       "Authorization",
       "Accept",
+      "x-agent-id",
+      "x-agent-secret",
       "x-agent-token",
       "x-agent-job-id"
     ]
@@ -70,12 +81,15 @@ app.use(
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
-app.use(morgan("dev"));
+if (process.env.NODE_ENV !== "test") {
+  app.use(morgan("dev"));
+}
 
 app.get("/api/health", (_req, res) => {
   res.json({
     success: true,
-    service: "smart-xerox-personal-print-api",
+    service: "smart-xerox-multi-vendor-print-api",
+    architecture: "multi-tenant",
     storage: "mongodb-gridfs",
     timestamp: new Date().toISOString()
   });
@@ -83,15 +97,27 @@ app.get("/api/health", (_req, res) => {
 
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 120,
+  limit: 240,
   standardHeaders: true,
   legacyHeaders: false
 });
 
-app.use("/api/orders", apiLimiter, orderRoutes);
-app.use("/api/jobs", apiLimiter, orderRoutes);
+// 1. Customer Shop-Scoped Routes (/api/shops/:shopSlug/*)
+app.use("/api/shops", apiLimiter, shopRoutes);
+
+// 2. Vendor Desktop App Routes (/api/vendor/* and /api/admin/*)
+app.use("/api/vendor", apiLimiter, adminRoutes);
+app.use("/api/admin", apiLimiter, adminRoutes);
+
+// 3. Super Admin Platform Routes (/api/super-admin/*)
+app.use("/api/super-admin", apiLimiter, superAdminRoutes);
+
+// 4. Print Agent Routes (/api/agent/*)
 app.use("/api/agent", agentRoutes);
-app.use("/api/admin", adminRoutes);
+
+// 5. Legacy unscoped /api/orders & /api/jobs guard
+app.use("/api/orders", orderRoutes);
+app.use("/api/jobs", orderRoutes);
 
 app.use(notFound);
 app.use(errorHandler);

@@ -1,24 +1,15 @@
 const router = require("express").Router();
-const asyncHandler = require("../utils/asyncHandler");
-const {
-  uploadDocument,
-  getPrinterStatus,
-  inspectDocument,
-  createOrder,
-  listRecentOrders,
-  getOrderByToken,
-  cancelOrder,
-  reprintOrder,
-  clearFailedOrders
-} = require("../controllers/orderController");
 
-router.get("/printer-status", asyncHandler(getPrinterStatus));
-router.get("/", asyncHandler(listRecentOrders));
-router.post("/inspect", uploadDocument, asyncHandler(inspectDocument));
-router.post("/", uploadDocument, asyncHandler(createOrder));
-router.delete("/failed", asyncHandler(clearFailedOrders));
-router.get("/:token", asyncHandler(getOrderByToken));
-router.post("/:token/cancel", asyncHandler(cancelOrder));
-router.post("/:token/reprint", asyncHandler(reprintOrder));
+/**
+ * Legacy unscoped /api/orders endpoints are disabled in multi-vendor mode to prevent cross-tenant leakage.
+ * All customer requests must use /api/shops/:shopSlug/orders/* and vendor requests must use /api/vendor/orders/*.
+ */
+router.use((_req, res) => {
+  res.status(400).json({
+    success: false,
+    message:
+      "Unscoped order endpoint is disabled in multi-vendor mode. Use /api/shops/:shopSlug/... for customer orders or /api/vendor/... for authenticated vendor operations."
+  });
+});
 
 module.exports = router;

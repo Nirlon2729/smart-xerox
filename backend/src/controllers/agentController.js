@@ -1,6 +1,8 @@
 const crypto = require("crypto");
 const Order = require("../models/Order");
 const Agent = require("../models/Agent");
+const Tenant = require("../models/Tenant");
+const { recordAuditLog } = require("../utils/auditLogger");
 const {
   openGridFSDownloadStream,
   deleteGridFSFile,
@@ -8,17 +10,26 @@ const {
 } = require("../services/gridfsService");
 
 const LEASE_DURATION_MS = 3 * 60 * 1000; // 3 minutes per active download/processing lease
+const VALID_PAPER_SIZES = ["A4", "A3", "Legal", "Letter", "A5"];
+const ALLOWED_STATUSES = ["READY", "ONLINE", "PRINTING", "OFFLINE", "ERROR"];
 
 /**
  * Recovers jobs that stalled during DOWNLOADING or PROCESSING (before reaching the physical printer spooler).
  * Never auto-requeues a job already in PRINTING state to avoid accidental duplicate physical prints.
  */
-async function recoverExpiredLeases() {
+async function recoverExpiredLeases(tenantId = null) {
   const now = new Date();
+  const baseFilter = {
+    status: { $in: ["DOWNLOADING", "PROCESSING"] },
+    leaseExpiresAt: { $ne: null, $lt: now }
+  };
+  if (tenantId) {
+    baseFilter.tenantId = tenantId;
+  }
+
   await Order.updateMany(
     {
-      status: { $in: ["DOWNLOADING", "PROCESSING"] },
-      leaseExpiresAt: { $ne: null, $lt: now },
+      ...baseFilter,
       retryCount: { $lt: 2 }
     },
     {
@@ -33,8 +44,7 @@ async function recoverExpiredLeases() {
 
   await Order.updateMany(
     {
-      status: { $in: ["DOWNLOADING", "PROCESSING"] },
-      leaseExpiresAt: { $ne: null, $lt: now },
+      ...baseFilter,
       retryCount: { $gte: 2 }
     },
     {
@@ -46,113 +56,203 @@ async function recoverExpiredLeases() {
   );
 }
 
+function sanitizeCapabilities(caps) {
+  if (!caps || typeof caps !== "object") {
+    return {
+      supportedPaperSizes: ["A4", "Letter", "Legal", "A5"],
+      supportsColor: false,
+      supportsDuplex: false
+    };
+  }
+  const reportedSizes = Array.isArray(caps.supportedPaperSizes)
+    ? caps.supportedPaperSizes.filter((s) => VALID_PAPER_SIZES.includes(s))
+    : ["A4", "Letter", "Legal", "A5"];
+
+  return {
+    supportedPaperSizes: reportedSizes.length > 0 ? reportedSizes : ["A4"],
+    supportsColor: Boolean(caps.supportsColor),
+    supportsDuplex: Boolean(caps.supportsDuplex)
+  };
+}
+
+function sanitizeDetectedPrinter(p) {
+  const normalizedStatus = ALLOWED_STATUSES.includes(p.status) ? p.status : "OFFLINE";
+  const isReady =
+    p.printerAvailable !== undefined
+      ? Boolean(p.printerAvailable)
+      : ["READY", "ONLINE", "PRINTING"].includes(normalizedStatus);
+
+  return {
+    name: String(p.name || p.printerName || "").trim(),
+    portName: p.portName ? String(p.portName).trim() : null,
+    driverName: p.driverName ? String(p.driverName).trim() : null,
+    connectionType: ["USB", "NETWORK", "LOCAL", "UNKNOWN"].includes(p.connectionType)
+      ? p.connectionType
+      : "USB",
+    isDefault: Boolean(p.isDefault),
+    printerAvailable: isReady,
+    workOffline: Boolean(p.workOffline),
+    driverMissing: Boolean(p.driverMissing),
+    capabilitiesDetected: p.capabilitiesDetected !== false,
+    status: normalizedStatus,
+    statusMessage: p.statusMessage ? String(p.statusMessage).slice(0, 300) : null,
+    spoolerJobCount: Number(p.spoolerJobCount) || 0,
+    capabilities: sanitizeCapabilities(p.capabilities)
+  };
+}
+
 /**
  * POST /api/agent/heartbeat
- * Receives live printer status, availability, version, and capabilities from the Windows 11 print agent.
+ * Receives live printer discovery, status, availability, and capabilities from the vendor's paired Windows agent.
  */
 async function heartbeat(req, res) {
   const {
     deviceId,
-    agentId,
     agentVersion,
+    hostname,
+    osVersion,
     printerName,
     portName,
     driverName,
+    driverMissing,
     printerAvailable,
     status,
     statusMessage,
     spoolerJobCount,
-    capabilities
+    capabilities,
+    availablePrinters
   } = req.body;
 
-  const resolvedDeviceId = String(deviceId || agentId || "").trim();
-  const resolvedPrinterName = String(printerName || "").trim();
+  const sanitizedPrinters = Array.isArray(availablePrinters)
+    ? availablePrinters
+        .map(sanitizeDetectedPrinter)
+        .filter((p) => Boolean(p.name))
+    : [];
 
-  if (!resolvedDeviceId || !resolvedPrinterName) {
-    return res
-      .status(400)
-      .json({ success: false, message: "deviceId (or agentId) and printerName are required" });
+  let selectedPrinterName = req.tenant.selectedPrinterName;
+
+  // Auto-select if only one compatible printer is detected and none is selected yet
+  if (
+    !selectedPrinterName &&
+    req.tenant.autoSelectSinglePrinter !== false &&
+    sanitizedPrinters.length === 1
+  ) {
+    selectedPrinterName = sanitizedPrinters[0].name;
+    await Tenant.updateOne(
+      { _id: req.tenantId },
+      { $set: { selectedPrinterName } }
+    );
   }
 
-  const allowedStatuses = ["READY", "ONLINE", "PRINTING", "OFFLINE", "ERROR"];
-  const normalizedStatus = allowedStatuses.includes(status) ? status : "READY";
-  const isPrinterReady =
-    printerAvailable !== undefined
+  // Resolve primary reported printer (matching vendor's selectedPrinterName if present in availablePrinters)
+  const matchedSelected =
+    selectedPrinterName && sanitizedPrinters.length > 0
+      ? sanitizedPrinters.find(
+          (p) => p.name.toLowerCase() === selectedPrinterName.toLowerCase()
+        )
+      : null;
+
+  const resolvedPrinterName =
+    matchedSelected?.name ||
+    String(printerName || selectedPrinterName || req.agent.printerName || "No Printer Selected").trim();
+
+  const normalizedStatus = matchedSelected
+    ? matchedSelected.status
+    : ALLOWED_STATUSES.includes(status)
+      ? status
+      : "READY";
+
+  const isPrinterReady = matchedSelected
+    ? matchedSelected.printerAvailable
+    : printerAvailable !== undefined
       ? Boolean(printerAvailable)
       : ["READY", "ONLINE", "PRINTING"].includes(normalizedStatus);
 
   const now = new Date();
   const updateFields = {
     printerName: resolvedPrinterName,
-    agentVersion: String(agentVersion || "2.0.0").trim(),
-    portName: portName ? String(portName).trim() : null,
-    driverName: driverName ? String(driverName).trim() : null,
+    agentVersion: String(agentVersion || "3.0.0").trim(),
+    hostname: hostname ? String(hostname).trim() : req.agent.hostname,
+    osVersion: osVersion ? String(osVersion).trim() : req.agent.osVersion,
+    portName: matchedSelected ? matchedSelected.portName : portName ? String(portName).trim() : null,
+    driverName: matchedSelected ? matchedSelected.driverName : driverName ? String(driverName).trim() : null,
+    driverMissing: matchedSelected ? matchedSelected.driverMissing : Boolean(driverMissing),
     printerAvailable: isPrinterReady,
     lastSeenAt: now,
     lastStatus: normalizedStatus,
-    statusMessage: statusMessage ? String(statusMessage).slice(0, 300) : null,
-    spoolerJobCount: Number(spoolerJobCount) || 0,
+    statusMessage: matchedSelected
+      ? matchedSelected.statusMessage
+      : statusMessage
+        ? String(statusMessage).slice(0, 300)
+        : null,
+    spoolerJobCount: matchedSelected
+      ? matchedSelected.spoolerJobCount
+      : Number(spoolerJobCount) || 0,
+    capabilities: matchedSelected
+      ? matchedSelected.capabilities
+      : sanitizeCapabilities(capabilities),
     active: true
   };
 
-  if (capabilities && typeof capabilities === "object") {
-    const validSizes = ["A4", "A3", "Legal", "Letter", "A5"];
-    const reportedSizes = Array.isArray(capabilities.supportedPaperSizes)
-      ? capabilities.supportedPaperSizes.filter((s) => validSizes.includes(s))
-      : ["A4", "Letter", "Legal", "A5"];
-
-    updateFields.capabilities = {
-      supportedPaperSizes: reportedSizes.length > 0 ? reportedSizes : ["A4"],
-      supportsColor:
-        capabilities.supportsColor !== undefined
-          ? Boolean(capabilities.supportsColor)
-          : false,
-      supportsDuplex:
-        capabilities.supportsDuplex !== undefined
-          ? Boolean(capabilities.supportsDuplex)
-          : false
-    };
+  if (deviceId) {
+    updateFields.deviceId = String(deviceId).trim();
+  }
+  if (sanitizedPrinters.length > 0 || Array.isArray(availablePrinters)) {
+    updateFields.availablePrinters = sanitizedPrinters;
   }
 
   const updatedAgent = await Agent.findOneAndUpdate(
-    { deviceId: resolvedDeviceId },
+    { _id: req.agent._id, tenantId: req.tenantId },
     { $set: updateFields },
-    { upsert: true, new: true }
+    { new: true }
   );
 
-  recoverExpiredLeases().catch(() => {});
+  recoverExpiredLeases(req.tenantId).catch(() => {});
   cleanupExpiredGridFSFiles(Order).catch(() => {});
 
   res.json({
     success: true,
     heartbeatAt: now.toISOString(),
+    tenant: {
+      tenantId: req.tenantId,
+      shopName: req.tenant.shopName,
+      shopSlug: req.tenant.shopSlug,
+      selectedPrinterName: selectedPrinterName || resolvedPrinterName
+    },
     agent: {
+      agentId: updatedAgent.agentId,
       deviceId: updatedAgent.deviceId,
       agentVersion: updatedAgent.agentVersion,
       printerName: updatedAgent.printerName,
       portName: updatedAgent.portName,
       printerAvailable: updatedAgent.printerAvailable,
-      lastStatus: updatedAgent.lastStatus
+      lastStatus: updatedAgent.lastStatus,
+      availablePrintersCount: updatedAgent.availablePrinters?.length || 0
     }
   });
 }
 
 /**
  * GET /api/agent/jobs/next
- * Atomically claims the next QUEUED job for the Windows 11 print agent.
+ * Atomically claims the next QUEUED job strictly belonging to this agent's paired vendor tenantId.
  */
-async function nextJob(_req, res) {
-  await recoverExpiredLeases();
+async function nextJob(req, res) {
+  await recoverExpiredLeases(req.tenantId);
 
   const agentJobId = crypto.randomUUID();
   const leaseExpiresAt = new Date(Date.now() + LEASE_DURATION_MS);
 
   const job = await Order.findOneAndUpdate(
-    { status: "QUEUED", fileDeleted: { $ne: true } },
+    {
+      tenantId: req.tenantId,
+      status: "QUEUED",
+      fileDeleted: { $ne: true }
+    },
     {
       $set: {
         status: "DOWNLOADING",
         agentJobId,
+        claimedByAgentId: req.agent.agentId,
         leaseExpiresAt,
         failureReason: null
       }
@@ -164,10 +264,28 @@ async function nextJob(_req, res) {
     return res.json({ success: true, job: null });
   }
 
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: "AGENT",
+    actorId: req.agent.agentId,
+    action: "JOB_CLAIMED",
+    targetType: "Order",
+    targetId: job._id,
+    details: { token: job.token, agentJobId },
+    req
+  });
+
+  const resolvedPrinter =
+    req.tenant.selectedPrinterName ||
+    job.targetPrinterName ||
+    req.agent.printerName;
+
   res.json({
     success: true,
     job: {
       orderId: job._id,
+      tenantId: job.tenantId,
+      shopSlug: job.shopSlug,
       token: job.token,
       originalName: job.originalName,
       gridFsFileId: job.gridFsFileId,
@@ -183,7 +301,7 @@ async function nextJob(_req, res) {
       sides: job.sides,
       paperSize: job.paperSize || "A4",
       orientation: job.orientation || "auto",
-      printerName: process.env.PRINTER_NAME || "HP LaserJet MFP M129-M134",
+      printerName: resolvedPrinter,
       agentJobId: job.agentJobId
     }
   });
@@ -191,11 +309,25 @@ async function nextJob(_req, res) {
 
 /**
  * GET /api/agent/jobs/:id/file
- * Streams the private document directly from MongoDB Atlas GridFS to the authorized print agent.
+ * Streams the private document from MongoDB Atlas GridFS to the authorized print agent,
+ * enforcing exact tenantId ownership on both the Order and GridFS file document.
  */
 async function downloadJobFile(req, res) {
-  const job = await Order.findById(req.params.id);
+  const job = await Order.findOne({
+    _id: req.params.id,
+    tenantId: req.tenantId
+  });
+
   if (!job) {
+    await recordAuditLog({
+      tenantId: req.tenantId,
+      actorType: "AGENT",
+      actorId: req.agent.agentId,
+      action: "CROSS_TENANT_OR_MISSING_FILE_DOWNLOAD_BLOCKED",
+      targetType: "Order",
+      targetId: req.params.id,
+      req
+    });
     return res.status(404).json({ success: false, message: "Print job not found" });
   }
 
@@ -204,6 +336,13 @@ async function downloadJobFile(req, res) {
     return res.status(409).json({
       success: false,
       message: "Agent job lease mismatch"
+    });
+  }
+
+  if (job.claimedByAgentId && job.claimedByAgentId !== req.agent.agentId) {
+    return res.status(403).json({
+      success: false,
+      message: "This print job is leased to another agent"
     });
   }
 
@@ -217,7 +356,18 @@ async function downloadJobFile(req, res) {
   job.leaseExpiresAt = new Date(Date.now() + LEASE_DURATION_MS);
   await job.save();
 
-  const { fileDoc, stream } = await openGridFSDownloadStream(job.gridFsFileId);
+  const { fileDoc, stream } = await openGridFSDownloadStream(job.gridFsFileId, req.tenantId);
+
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: "AGENT",
+    actorId: req.agent.agentId,
+    action: "FILE_DOWNLOADED",
+    targetType: "GridFSFile",
+    targetId: job.gridFsFileId,
+    details: { orderId: job._id, token: job.token },
+    req
+  });
 
   res.setHeader("Content-Type", job.mimeType || fileDoc.contentType || "application/octet-stream");
   res.setHeader("Content-Length", String(fileDoc.length));
@@ -242,7 +392,8 @@ async function downloadJobFile(req, res) {
 
 /**
  * PATCH /api/agent/jobs/:id/status
- * Updates job status through DOWNLOADING -> PROCESSING -> PRINTING -> COMPLETED / FAILED.
+ * Updates job status through DOWNLOADING -> PROCESSING -> PRINTING -> COMPLETED / FAILED,
+ * strictly enforcing tenantId and agentJobId ownership.
  */
 async function updateJobStatus(req, res) {
   const { status, failureReason, agentJobId, spoolerJobId } = req.body;
@@ -267,7 +418,10 @@ async function updateJobStatus(req, res) {
     update.completedAt = new Date();
   }
 
-  const query = { _id: req.params.id };
+  const query = {
+    _id: req.params.id,
+    tenantId: req.tenantId
+  };
   if (agentJobId) {
     query.agentJobId = agentJobId;
   }
@@ -281,7 +435,7 @@ async function updateJobStatus(req, res) {
   if (!job) {
     return res
       .status(404)
-      .json({ success: false, message: "Job not found or agent job ID mismatch" });
+      .json({ success: false, message: "Job not found or agent job lease mismatch" });
   }
 
   if (status === "COMPLETED" && job.gridFsFileId) {
@@ -290,7 +444,7 @@ async function updateJobStatus(req, res) {
         ? Number(process.env.FILE_RETENTION_MINUTES)
         : 60;
     if (retentionMinutes <= 0) {
-      await deleteGridFSFile(job.gridFsFileId);
+      await deleteGridFSFile(job.gridFsFileId, req.tenantId);
       job.fileDeleted = true;
       await job.save();
     }

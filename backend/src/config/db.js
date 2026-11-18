@@ -13,6 +13,20 @@ async function connectDB() {
     bucketName: "printDocuments"
   });
 
+  // Safely relax legacy single-shop global unique index on agents.deviceId if present
+  try {
+    const agentsColl = mongoose.connection.db.collection("agents");
+    const indexes = await agentsColl.indexes();
+    const legacyDeviceIdx = indexes.find(
+      (idx) => idx.name === "deviceId_1" && idx.unique === true
+    );
+    if (legacyDeviceIdx) {
+      await agentsColl.dropIndex("deviceId_1");
+    }
+  } catch (_err) {
+    // Collection may not exist yet; safe to ignore
+  }
+
   console.log("MongoDB Atlas connected (GridFS bucket: printDocuments)");
   return mongoose.connection;
 }

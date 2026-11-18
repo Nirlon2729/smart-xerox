@@ -5,19 +5,21 @@ const multer = require("multer");
 const { z } = require("zod");
 const Order = require("../models/Order");
 const Agent = require("../models/Agent");
+const Tenant = require("../models/Tenant");
 const { createPrintToken } = require("../utils/token");
 const { inspectUploadedBuffer } = require("../utils/fileValidator");
 const { parseAndValidatePages } = require("../utils/pageRange");
+const { buildShopPublicUrl } = require("../utils/agentCredentials");
+const { recordAuditLog } = require("../utils/auditLogger");
 const {
   uploadBufferToGridFS,
   findGridFSFileById,
-  openGridFSDownloadStream,
   markGridFSFileBoundToJob,
   deleteGridFSFile
 } = require("../services/gridfsService");
 
-const maxUploadMb = Number(process.env.MAX_UPLOAD_MB) || 20;
-const maxCopiesAllowed = Number(process.env.MAX_COPIES) || 100;
+const defaultMaxUploadMb = Number(process.env.MAX_UPLOAD_MB) || 20;
+const defaultMaxCopiesAllowed = Number(process.env.MAX_COPIES) || 100;
 
 const ALLOWED_EXTENSIONS = new Set([".pdf", ".jpg", ".jpeg", ".png"]);
 const ALLOWED_MIMES = new Set([
@@ -29,10 +31,9 @@ const ALLOWED_MIMES = new Set([
   "application/octet-stream"
 ]);
 
-// Use memoryStorage so buffers are validated and streamed directly to MongoDB Atlas GridFS
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: maxUploadMb * 1024 * 1024 },
+  limits: { fileSize: defaultMaxUploadMb * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const originalName = String(file.originalname || "").trim().toLowerCase();
     const ext = path.extname(originalName);
@@ -48,22 +49,39 @@ const upload = multer({
 });
 
 /**
- * Helper to resolve live printer status & capabilities from the most recently active Agent.
- * Distinguishes:
- * - AGENT_OFFLINE (no heartbeat within AGENT_HEARTBEAT_TIMEOUT_SECONDS)
- * - PRINTER_OFFLINE (agent is online, but USB printer is disconnected/offline/error)
- * - PRINTER_READY (both agent and USB printer are online and ready)
+ * Resolves live printer & agent state strictly for a specific vendor tenantId.
+ * Supports multi-printer detection, automatic single-printer selection, and manual capability overrides.
  */
-async function getActivePrinterState() {
+async function getActivePrinterState(tenantId) {
   const heartbeatTimeoutSeconds = Number(process.env.AGENT_HEARTBEAT_TIMEOUT_SECONDS) || 30;
-  const configuredPrinterName = process.env.PRINTER_NAME || "HP LaserJet MFP M129-M134";
+  if (!tenantId) {
+    throw Object.assign(new Error("tenantId is required to resolve printer state"), {
+      statusCode: 400
+    });
+  }
 
-  // Prefer the agent matching configured PRINTER_NAME if present, otherwise most recently seen active agent
-  let agent = await Agent.findOne({ active: true, printerName: configuredPrinterName })
+  const tenant = await Tenant.findById(tenantId).lean();
+  const preferredPrinterName = tenant?.selectedPrinterName || null;
+
+  const agents = await Agent.find({
+    tenantId,
+    active: true,
+    revokedAt: null
+  })
     .sort({ lastSeenAt: -1 })
     .lean();
-  if (!agent) {
-    agent = await Agent.findOne({ active: true }).sort({ lastSeenAt: -1 }).lean();
+
+  let agent = null;
+  if (preferredPrinterName && agents.length > 0) {
+    agent =
+      agents.find(
+        (a) =>
+          a.printerName === preferredPrinterName ||
+          (Array.isArray(a.availablePrinters) &&
+            a.availablePrinters.some((p) => p.name === preferredPrinterName))
+      ) || agents[0];
+  } else {
+    agent = agents[0] || null;
   }
 
   const now = Date.now();
@@ -72,36 +90,104 @@ async function getActivePrinterState() {
     agent && lastSeenMs > 0 && now - lastSeenMs <= heartbeatTimeoutSeconds * 1000
   );
 
+  const availablePrinters = Array.isArray(agent?.availablePrinters) ? agent.availablePrinters : [];
+
+  // Resolve target printer on the agent
+  let activePrinterObj = null;
+  if (preferredPrinterName && availablePrinters.length > 0) {
+    activePrinterObj =
+      availablePrinters.find(
+        (p) => p.name.toLowerCase() === preferredPrinterName.toLowerCase()
+      ) || null;
+  }
+
+  if (!activePrinterObj && availablePrinters.length === 1 && tenant?.autoSelectSinglePrinter !== false) {
+    activePrinterObj = availablePrinters[0];
+  }
+
+  if (!activePrinterObj && agent?.printerName && availablePrinters.length > 0) {
+    activePrinterObj =
+      availablePrinters.find(
+        (p) => p.name.toLowerCase() === String(agent.printerName).toLowerCase()
+      ) || availablePrinters.find((p) => p.isDefault) || availablePrinters[0];
+  }
+
+  const resolvedPrinterName =
+    activePrinterObj?.name ||
+    preferredPrinterName ||
+    agent?.printerName ||
+    "No Printer Selected";
+
+  const resolvedPortName = activePrinterObj?.portName ?? agent?.portName ?? null;
+  const resolvedDriverName = activePrinterObj?.driverName ?? agent?.driverName ?? null;
+  const resolvedDriverMissing = Boolean(
+    activePrinterObj?.driverMissing ?? agent?.driverMissing ?? false
+  );
+  const resolvedStatus = activePrinterObj?.status || agent?.lastStatus || "OFFLINE";
+  const resolvedSpoolerJobs =
+    activePrinterObj?.spoolerJobCount ?? agent?.spoolerJobCount ?? 0;
+
+  const rawAvailableFlag =
+    activePrinterObj !== null
+      ? activePrinterObj.printerAvailable
+      : agent?.printerAvailable;
+
   const printerAvailable = Boolean(
     agentOnline &&
-      (agent.printerAvailable === true ||
-        ["READY", "ONLINE", "PRINTING"].includes(agent.lastStatus)) &&
-      agent.lastStatus !== "OFFLINE"
+      (rawAvailableFlag === true || ["READY", "ONLINE", "PRINTING"].includes(resolvedStatus)) &&
+      resolvedStatus !== "OFFLINE" &&
+      resolvedStatus !== "ERROR"
   );
 
   let connectionState = "AGENT_OFFLINE";
   let statusLabel = "Agent Offline";
-  let statusMessage = "Windows print agent is not running on the laptop.";
+  let statusMessage = "Shop desktop print agent is currently offline.";
 
   if (agentOnline && printerAvailable) {
     connectionState = "PRINTER_READY";
-    statusLabel = agent.lastStatus === "PRINTING" ? "Printing..." : "Printer Ready";
+    statusLabel = resolvedStatus === "PRINTING" ? "Printing..." : "Printer Ready";
     statusMessage =
-      agent.statusMessage ||
-      `Connected to ${agent.printerName}${agent.portName ? ` on ${agent.portName}` : ""}`;
+      activePrinterObj?.statusMessage ||
+      agent?.statusMessage ||
+      `Connected to ${resolvedPrinterName}${resolvedPortName ? ` on ${resolvedPortName}` : ""}`;
   } else if (agentOnline && !printerAvailable) {
     connectionState = "PRINTER_OFFLINE";
-    statusLabel = "Printer Offline";
-    statusMessage =
-      agent.statusMessage ||
-      `${agent.printerName} is offline or disconnected from USB.`;
+    statusLabel = resolvedDriverMissing ? "Driver Missing" : "Printer Offline";
+    statusMessage = resolvedDriverMissing
+      ? `Windows printer driver is missing for ${resolvedPrinterName}. Please install the manufacturer's Windows driver.`
+      : activePrinterObj?.statusMessage ||
+        agent?.statusMessage ||
+        `${resolvedPrinterName} is offline or disconnected.`;
   }
 
-  const defaultCapabilities = {
+  const detectedCaps = activePrinterObj?.capabilities || agent?.capabilities || {
     supportedPaperSizes: ["A4", "Letter", "Legal", "A5"],
     supportsColor: false,
     supportsDuplex: false
   };
+
+  const useManualOverride = Boolean(tenant?.capabilityOverrides?.useManualOverride);
+  const effectiveCapabilities = useManualOverride
+    ? {
+        supportedPaperSizes:
+          tenant.capabilityOverrides.supportedPaperSizes?.length > 0
+            ? tenant.capabilityOverrides.supportedPaperSizes
+            : ["A4"],
+        supportsColor: Boolean(tenant.capabilityOverrides.supportsColor),
+        supportsDuplex: Boolean(tenant.capabilityOverrides.supportsDuplex),
+        useManualOverride: true,
+        capabilitiesDetected: Boolean(activePrinterObj?.capabilitiesDetected ?? true)
+      }
+    : {
+        supportedPaperSizes:
+          detectedCaps.supportedPaperSizes?.length > 0
+            ? detectedCaps.supportedPaperSizes
+            : ["A4", "Letter", "Legal", "A5"],
+        supportsColor: Boolean(detectedCaps.supportsColor),
+        supportsDuplex: Boolean(detectedCaps.supportsDuplex),
+        useManualOverride: false,
+        capabilitiesDetected: Boolean(activePrinterObj?.capabilitiesDetected ?? true)
+      };
 
   return {
     online: connectionState === "PRINTER_READY",
@@ -109,42 +195,77 @@ async function getActivePrinterState() {
     statusLabel,
     agentOnline,
     printerAvailable,
-    agentId: agent?.deviceId || null,
+    agentId: agent?.agentId || agent?.deviceId || null,
     agentVersion: agent?.agentVersion || null,
-    printerName: agent?.printerName || configuredPrinterName,
-    portName: agent?.portName || null,
-    driverName: agent?.driverName || null,
     deviceId: agent?.deviceId || null,
+    hostname: agent?.hostname || null,
+    printerName: resolvedPrinterName,
+    selectedPrinterName: preferredPrinterName || (availablePrinters.length === 1 ? availablePrinters[0].name : null),
+    portName: resolvedPortName,
+    driverName: resolvedDriverName,
+    driverMissing: resolvedDriverMissing,
+    availablePrinters,
     lastSeenAt: agent?.lastSeenAt || null,
     heartbeatTimeoutSeconds,
-    status: connectionState === "PRINTER_READY" ? agent.lastStatus || "READY" : "OFFLINE",
+    status: connectionState === "PRINTER_READY" ? resolvedStatus || "READY" : "OFFLINE",
     statusMessage,
-    spoolerJobCount: agent?.spoolerJobCount || 0,
-    capabilities: agent?.capabilities?.supportedPaperSizes?.length
-      ? agent.capabilities
-      : defaultCapabilities,
+    spoolerJobCount: resolvedSpoolerJobs,
+    capabilities: effectiveCapabilities,
+    detectedCapabilities: detectedCaps,
     config: {
-      maxUploadMb,
-      maxCopies: maxCopiesAllowed
+      maxUploadMb: tenant?.config?.maxUploadMb || defaultMaxUploadMb,
+      maxCopies: tenant?.config?.maxCopies || defaultMaxCopiesAllowed,
+      acceptingOrders: tenant?.config?.acceptingOrders !== false
     }
   };
 }
 
 /**
- * GET /api/orders/printer-status
- * Returns live USB HP printer connection state and supported hardware capabilities.
+ * GET /api/shops/:shopSlug
+ * Returns public shop details, printer availability, and verified capabilities for the customer website.
  */
-async function getPrinterStatus(_req, res) {
-  const printer = await getActivePrinterState();
+async function getShopPublicInfo(req, res) {
+  const tenant = req.tenant;
+  const printer = await getActivePrinterState(req.tenantId);
+
   res.json({
     success: true,
+    shop: {
+      id: tenant._id,
+      shopName: tenant.shopName,
+      shopSlug: tenant.shopSlug,
+      logoUrl: tenant.logoUrl || null,
+      phone: tenant.phone || null,
+      address: tenant.address || null,
+      status: tenant.status,
+      publicUrl: buildShopPublicUrl(tenant.shopSlug),
+      config: printer.config
+    },
     printer
   });
 }
 
 /**
- * POST /api/orders/inspect
- * Validates actual binary content (PDF, JPG, JPEG, PNG) and streams it into MongoDB Atlas GridFS.
+ * GET /api/shops/:shopSlug/printer-status
+ * Returns live printer connection state and supported hardware capabilities for the resolved shop.
+ */
+async function getPrinterStatus(req, res) {
+  const printer = await getActivePrinterState(req.tenantId);
+  res.json({
+    success: true,
+    shop: {
+      id: req.tenant._id,
+      shopName: req.tenant.shopName,
+      shopSlug: req.tenant.shopSlug,
+      logoUrl: req.tenant.logoUrl || null
+    },
+    printer
+  });
+}
+
+/**
+ * POST /api/shops/:shopSlug/orders/inspect
+ * Validates binary content (PDF, JPG, JPEG, PNG) and streams it into MongoDB Atlas GridFS bound to tenantId.
  */
 async function inspectDocument(req, res) {
   if (!req.file || !req.file.buffer) {
@@ -154,14 +275,25 @@ async function inspectDocument(req, res) {
     });
   }
 
+  const maxMb = req.tenant?.config?.maxUploadMb || defaultMaxUploadMb;
+  if (req.file.buffer.length > maxMb * 1024 * 1024) {
+    return res.status(413).json({
+      success: false,
+      message: `File exceeds this shop's maximum allowed upload size of ${maxMb} MB.`
+    });
+  }
+
   const inspection = inspectUploadedBuffer(req.file.buffer, req.file.originalname);
 
   const gridFsResult = await uploadBufferToGridFS({
     buffer: req.file.buffer,
     filename: req.file.originalname || `upload.${inspection.extension}`,
     contentType: inspection.mimeType,
+    tenantId: req.tenantId,
     metadata: {
       staged: true,
+      tenantId: String(req.tenantId),
+      shopSlug: req.tenant.shopSlug,
       originalName: req.file.originalname,
       documentType: inspection.documentType,
       mimeType: inspection.mimeType,
@@ -197,7 +329,7 @@ const createJobSchema = z.object({
   pageSelectionMode: z.enum(["all", "custom"]).default("all"),
   customPageRange: z.string().optional(),
   selectedPages: z.array(z.number().int().positive()).max(5000).optional(),
-  copies: z.number().int().min(1).max(maxCopiesAllowed).default(1),
+  copies: z.number().int().min(1).max(1000).default(1),
   colorMode: z.enum(["bw", "color"]).default("bw"),
   sides: z.enum(["single", "duplex"]).default("single"),
   paperSize: z.enum(["A4", "A3", "Legal", "Letter", "A5"]).default("A4"),
@@ -216,6 +348,8 @@ async function generateUniqueJobToken() {
 function formatJobResponse(order) {
   return {
     id: order._id,
+    tenantId: order.tenantId,
+    shopSlug: order.shopSlug,
     token: order.token,
     originalName: order.originalName,
     documentType: order.documentType || "pdf",
@@ -231,6 +365,7 @@ function formatJobResponse(order) {
     paperSize: order.paperSize || "A4",
     orientation: order.orientation || "auto",
     printablePageCount: order.printablePageCount,
+    targetPrinterName: order.targetPrinterName || null,
     status: order.status,
     spoolerJobId: order.spoolerJobId || null,
     fileDeleted: Boolean(order.fileDeleted),
@@ -242,17 +377,24 @@ function formatJobResponse(order) {
 }
 
 /**
- * POST /api/orders
- * Direct "PRINT NOW" workflow:
- * 1. Validates file & print settings.
- * 2. Stores document in MongoDB Atlas GridFS (or binds staged GridFS upload).
- * 3. Prevents duplicate print jobs via idempotencyKey and recent SHA-256 deduplication.
- * 4. Sets job status directly to QUEUED so the Windows 11 print agent starts printing automatically.
+ * POST /api/shops/:shopSlug/orders
+ * Tenant-scoped customer job submission:
+ * 1. Validates file & print settings against the shop's verified printer capabilities.
+ * 2. Verifies exact GridFS tenant ownership.
+ * 3. Enforces idempotency and 15-second SHA-256 deduplication per tenant.
+ * 4. Queues the print job exclusively for this shop's paired desktop agent.
  */
 async function createOrder(req, res) {
   let newlyUploadedGridFsId = null;
 
   try {
+    if (req.tenant?.config?.acceptingOrders === false) {
+      return res.status(403).json({
+        success: false,
+        message: "This shop is temporarily not accepting new print jobs."
+      });
+    }
+
     let parsedSelectedPages;
     if (req.body.selectedPages !== undefined) {
       parsedSelectedPages =
@@ -284,10 +426,51 @@ async function createOrder(req, res) {
     }
 
     const data = parsed.data;
+    const printerState = await getActivePrinterState(req.tenantId);
+    const maxCopies = printerState.config.maxCopies || defaultMaxCopiesAllowed;
 
-    // 1. Check idempotencyKey first to prevent duplicate jobs on double-click or network retry
-    if (data.idempotencyKey) {
-      const existingByKey = await Order.findOne({ idempotencyKey: data.idempotencyKey });
+    if (data.copies > maxCopies) {
+      return res.status(400).json({
+        success: false,
+        message: `Maximum allowed copies per job at this shop is ${maxCopies}.`
+      });
+    }
+
+    // Validate requested options against shop's verified printer capabilities
+    const caps = printerState.capabilities;
+    if (data.colorMode === "color" && !caps.supportsColor) {
+      return res.status(400).json({
+        success: false,
+        message: "This shop's printer supports Black & White printing only."
+      });
+    }
+    if (data.sides === "duplex" && !caps.supportsDuplex) {
+      return res.status(400).json({
+        success: false,
+        message: "This shop's printer supports Single-sided printing only."
+      });
+    }
+    if (
+      Array.isArray(caps.supportedPaperSizes) &&
+      caps.supportedPaperSizes.length > 0 &&
+      !caps.supportedPaperSizes.includes(data.paperSize)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: `Paper size ${data.paperSize} is not supported by this shop's printer.`
+      });
+    }
+
+    const scopedIdempotencyKey = data.idempotencyKey
+      ? `${req.tenantId}:${data.idempotencyKey}`
+      : undefined;
+
+    // 1. Check idempotencyKey scoped to tenantId
+    if (scopedIdempotencyKey) {
+      const existingByKey = await Order.findOne({
+        tenantId: req.tenantId,
+        idempotencyKey: scopedIdempotencyKey
+      });
       if (existingByKey) {
         return res.status(200).json({
           success: true,
@@ -298,7 +481,7 @@ async function createOrder(req, res) {
       }
     }
 
-    // 2. Resolve document from either staged GridFS uploadId or direct multipart upload
+    // 2. Resolve document from either staged GridFS uploadId (verified for tenantId!) or direct multipart upload
     let fileMeta = null;
 
     if (req.file && req.file.buffer) {
@@ -307,8 +490,11 @@ async function createOrder(req, res) {
         buffer: req.file.buffer,
         filename: req.file.originalname || `upload.${inspection.extension}`,
         contentType: inspection.mimeType,
+        tenantId: req.tenantId,
         metadata: {
           staged: false,
+          tenantId: String(req.tenantId),
+          shopSlug: req.tenant.shopSlug,
           originalName: req.file.originalname,
           documentType: inspection.documentType,
           mimeType: inspection.mimeType,
@@ -332,16 +518,15 @@ async function createOrder(req, res) {
         sha256: inspection.sha256
       };
 
-      // Clean up previous staged upload if replaced
       if (data.uploadId && mongoose.Types.ObjectId.isValid(data.uploadId)) {
-        await deleteGridFSFile(data.uploadId);
+        await deleteGridFSFile(data.uploadId, req.tenantId);
       }
     } else if (data.uploadId && mongoose.Types.ObjectId.isValid(data.uploadId)) {
-      const gridFsDoc = await findGridFSFileById(data.uploadId);
+      const gridFsDoc = await findGridFSFileById(data.uploadId, req.tenantId);
       if (!gridFsDoc) {
         return res.status(400).json({
           success: false,
-          message: "Uploaded document expired or was not found. Please select the file again."
+          message: "Uploaded document expired or does not belong to this shop. Please upload the file again."
         });
       }
 
@@ -375,9 +560,10 @@ async function createOrder(req, res) {
             totalPages: fileMeta.pageCount
           });
 
-    // 4. Prevent accidental duplicate submission within 15 seconds for identical file + settings
+    // 4. Prevent accidental duplicate submission within 15 seconds for identical file + settings in this shop
     const recentWindow = new Date(Date.now() - 15 * 1000);
     const duplicateActiveJob = await Order.findOne({
+      tenantId: req.tenantId,
       fileSha256: fileMeta.sha256,
       copies: data.copies,
       colorMode: data.colorMode,
@@ -390,7 +576,7 @@ async function createOrder(req, res) {
 
     if (duplicateActiveJob) {
       if (newlyUploadedGridFsId) {
-        await deleteGridFSFile(newlyUploadedGridFsId);
+        await deleteGridFSFile(newlyUploadedGridFsId, req.tenantId);
       }
       return res.status(200).json({
         success: true,
@@ -403,8 +589,10 @@ async function createOrder(req, res) {
     const token = await generateUniqueJobToken();
 
     const order = await Order.create({
+      tenantId: req.tenantId,
+      shopSlug: req.tenant.shopSlug,
       token,
-      idempotencyKey: data.idempotencyKey || undefined,
+      idempotencyKey: scopedIdempotencyKey,
       originalName: fileMeta.originalName,
       gridFsFileId: fileMeta.gridFsFileId,
       fileSha256: fileMeta.sha256,
@@ -424,10 +612,13 @@ async function createOrder(req, res) {
       orientation: data.orientation,
       pageCount: fileMeta.pageCount,
       printablePageCount: uniquePages.length * data.copies,
+      targetPrinterName:
+        printerState.selectedPrinterName ||
+        (printerState.printerName !== "No Printer Selected" ? printerState.printerName : null),
       status: "QUEUED"
     });
 
-    await markGridFSFileBoundToJob(fileMeta.gridFsFileId, order._id);
+    await markGridFSFileBoundToJob(fileMeta.gridFsFileId, order._id, req.tenantId);
 
     return res.status(201).json({
       success: true,
@@ -436,60 +627,40 @@ async function createOrder(req, res) {
     });
   } catch (error) {
     if (newlyUploadedGridFsId) {
-      await deleteGridFSFile(newlyUploadedGridFsId);
+      await deleteGridFSFile(newlyUploadedGridFsId, req.tenantId);
     }
     throw error;
   }
 }
 
 /**
- * GET /api/orders
- * Lists recent print jobs for the personal main screen & owner dashboard.
+ * Helper to look up a job by either MongoDB _id or XR-... token, strictly scoped to tenantId.
  */
-async function listRecentOrders(req, res) {
-  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25));
-  const filter = {};
-  if (req.query.status && req.query.status !== "ALL") {
-    filter.status = req.query.status;
-  }
-
-  const orders = await Order.find(filter).sort({ createdAt: -1 }).limit(limit);
-  const printer = await getActivePrinterState();
-
-  res.json({
-    success: true,
-    orders: orders.map(formatJobResponse),
-    printer
-  });
-}
-
-/**
- * Helper to look up a job by either MongoDB _id or XR-... token.
- */
-async function findJobByIdOrToken(idOrToken) {
+async function findJobByIdOrTokenForTenant(idOrToken, tenantId) {
   const raw = String(idOrToken || "").trim();
-  if (!raw) return null;
+  if (!raw || !tenantId) return null;
+
   if (mongoose.Types.ObjectId.isValid(raw)) {
-    const byId = await Order.findById(raw);
+    const byId = await Order.findOne({ _id: raw, tenantId });
     if (byId) return byId;
   }
-  return Order.findOne({ token: raw.toUpperCase() });
+  return Order.findOne({ token: raw.toUpperCase(), tenantId });
 }
 
 /**
- * GET /api/orders/:token
- * Returns live status of a specific print job along with current printer connection status.
+ * GET /api/shops/:shopSlug/orders/:token
+ * Returns live status of a specific print job belonging to this shop tenant.
  */
 async function getOrderByToken(req, res) {
-  const order = await findJobByIdOrToken(req.params.token);
+  const order = await findJobByIdOrTokenForTenant(req.params.token, req.tenantId);
   if (!order) {
     return res.status(404).json({
       success: false,
-      message: "Print job not found."
+      message: "Print job not found for this shop."
     });
   }
 
-  const printer = await getActivePrinterState();
+  const printer = await getActivePrinterState(req.tenantId);
 
   res.json({
     success: true,
@@ -499,11 +670,11 @@ async function getOrderByToken(req, res) {
 }
 
 /**
- * POST /api/orders/:token/cancel
- * Cancels a queued or failed print job and cleans up its GridFS document.
+ * POST /api/shops/:shopSlug/orders/:token/cancel (or vendor cancel)
+ * Cancels a queued or failed print job belonging to req.tenantId and deletes its GridFS file.
  */
 async function cancelOrder(req, res) {
-  const order = await findJobByIdOrToken(req.params.token);
+  const order = await findJobByIdOrTokenForTenant(req.params.token, req.tenantId);
   if (!order) {
     return res.status(404).json({ success: false, message: "Print job not found" });
   }
@@ -518,17 +689,28 @@ async function cancelOrder(req, res) {
   if (order.status === "PRINTING") {
     return res.status(409).json({
       success: false,
-      message: "Document is already actively printing on the USB printer."
+      message: "Document is already actively printing on the printer."
     });
   }
 
   order.status = "CANCELLED";
   order.leaseExpiresAt = null;
   if (order.gridFsFileId && !order.fileDeleted) {
-    await deleteGridFSFile(order.gridFsFileId);
+    await deleteGridFSFile(order.gridFsFileId, req.tenantId);
     order.fileDeleted = true;
   }
   await order.save();
+
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: req.admin ? "VENDOR_ADMIN" : "CUSTOMER",
+    actorId: req.admin?._id || order.token,
+    action: "JOB_CANCELLED",
+    targetType: "Order",
+    targetId: order._id,
+    details: { token: order.token, originalName: order.originalName },
+    req
+  });
 
   res.json({
     success: true,
@@ -538,11 +720,11 @@ async function cancelOrder(req, res) {
 }
 
 /**
- * POST /api/orders/:token/reprint
- * Re-queues a print job after explicit confirmation by the owner, provided the GridFS file still exists.
+ * POST /api/vendor/orders/:token/reprint
+ * Authenticated vendor reprints a job belonging to their own tenant.
  */
 async function reprintOrder(req, res) {
-  const sourceOrder = await findJobByIdOrToken(req.params.token);
+  const sourceOrder = await findJobByIdOrTokenForTenant(req.params.token, req.tenantId);
   if (!sourceOrder) {
     return res.status(404).json({ success: false, message: "Print job not found" });
   }
@@ -554,7 +736,7 @@ async function reprintOrder(req, res) {
     });
   }
 
-  const gridFsDoc = await findGridFSFileById(sourceOrder.gridFsFileId);
+  const gridFsDoc = await findGridFSFileById(sourceOrder.gridFsFileId, req.tenantId);
   if (!gridFsDoc || sourceOrder.fileDeleted) {
     return res.status(410).json({
       success: false,
@@ -563,7 +745,6 @@ async function reprintOrder(req, res) {
     });
   }
 
-  // If the job had FAILED, reset it directly to QUEUED so it doesn't clutter the list
   if (sourceOrder.status === "FAILED") {
     sourceOrder.status = "QUEUED";
     sourceOrder.failureReason = null;
@@ -573,6 +754,17 @@ async function reprintOrder(req, res) {
     sourceOrder.retryCount = 0;
     await sourceOrder.save();
 
+    await recordAuditLog({
+      tenantId: req.tenantId,
+      actorType: "VENDOR_ADMIN",
+      actorId: req.admin?._id,
+      action: "JOB_REPRINTED",
+      targetType: "Order",
+      targetId: sourceOrder._id,
+      details: { token: sourceOrder.token, mode: "reset_failed" },
+      req
+    });
+
     return res.json({
       success: true,
       order: formatJobResponse(sourceOrder),
@@ -580,9 +772,10 @@ async function reprintOrder(req, res) {
     });
   }
 
-  // Otherwise create a new QUEUED job referencing the retained GridFS file
   const token = await generateUniqueJobToken();
   const reprinted = await Order.create({
+    tenantId: req.tenantId,
+    shopSlug: sourceOrder.shopSlug || req.tenant?.shopSlug,
     token,
     originalName: sourceOrder.originalName,
     gridFsFileId: sourceOrder.gridFsFileId,
@@ -600,7 +793,19 @@ async function reprintOrder(req, res) {
     orientation: sourceOrder.orientation,
     pageCount: sourceOrder.pageCount,
     printablePageCount: sourceOrder.printablePageCount,
+    targetPrinterName: req.tenant?.selectedPrinterName || sourceOrder.targetPrinterName,
     status: "QUEUED"
+  });
+
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: "VENDOR_ADMIN",
+    actorId: req.admin?._id,
+    action: "JOB_REPRINTED",
+    targetType: "Order",
+    targetId: reprinted._id,
+    details: { sourceOrderId: sourceOrder._id, token: reprinted.token },
+    req
   });
 
   return res.status(201).json({
@@ -611,22 +816,33 @@ async function reprintOrder(req, res) {
 }
 
 /**
- * DELETE /api/orders/failed
- * Clears failed and cancelled print jobs and deletes any remaining GridFS files for them.
+ * DELETE /api/vendor/orders/failed
+ * Authenticated vendor clears failed/cancelled jobs exclusively for their own tenant.
  */
-async function clearFailedOrders(_req, res) {
+async function clearFailedOrders(req, res) {
   const toClear = await Order.find({
+    tenantId: req.tenantId,
     status: { $in: ["FAILED", "CANCELLED"] }
   }).select("_id gridFsFileId fileDeleted");
 
   for (const job of toClear) {
     if (job.gridFsFileId && !job.fileDeleted) {
-      await deleteGridFSFile(job.gridFsFileId);
+      await deleteGridFSFile(job.gridFsFileId, req.tenantId);
     }
   }
 
   const deletedResult = await Order.deleteMany({
+    tenantId: req.tenantId,
     status: { $in: ["FAILED", "CANCELLED"] }
+  });
+
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: "VENDOR_ADMIN",
+    actorId: req.admin?._id,
+    action: "FAILED_JOBS_CLEARED",
+    details: { deletedCount: deletedResult.deletedCount || 0 },
+    req
   });
 
   res.json({
@@ -639,10 +855,12 @@ async function clearFailedOrders(_req, res) {
 module.exports = {
   uploadDocument: upload.single("document"),
   getActivePrinterState,
+  getShopPublicInfo,
   getPrinterStatus,
   inspectDocument,
   createOrder,
-  listRecentOrders,
+  findJobByIdOrTokenForTenant,
+  formatJobResponse,
   getOrderByToken,
   cancelOrder,
   reprintOrder,

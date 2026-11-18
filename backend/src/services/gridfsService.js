@@ -3,11 +3,20 @@ const { Readable } = require("stream");
 const { getGridFSBucket } = require("../config/db");
 
 /**
- * Streams a validated file Buffer into MongoDB Atlas GridFS.
+ * Streams a validated file Buffer into MongoDB Atlas GridFS with strict tenantId metadata ownership.
  * Never stores large Base64 blobs in standard MongoDB documents.
  */
-function uploadBufferToGridFS({ buffer, filename, contentType, metadata = {} }) {
+function uploadBufferToGridFS({ buffer, filename, contentType, tenantId, metadata = {} }) {
   return new Promise((resolve, reject) => {
+    const resolvedTenantId = tenantId || metadata.tenantId;
+    if (!resolvedTenantId) {
+      return reject(
+        Object.assign(new Error("tenantId is required to store files in GridFS"), {
+          statusCode: 400
+        })
+      );
+    }
+
     let bucket;
     try {
       bucket = getGridFSBucket();
@@ -20,6 +29,7 @@ function uploadBufferToGridFS({ buffer, filename, contentType, metadata = {} }) 
       contentType,
       metadata: {
         ...metadata,
+        tenantId: String(resolvedTenantId),
         uploadedAt: new Date()
       }
     });
@@ -35,7 +45,8 @@ function uploadBufferToGridFS({ buffer, filename, contentType, metadata = {} }) 
         gridFsFileId: uploadStream.id,
         filename: uploadStream.filename,
         size: buffer.length,
-        contentType
+        contentType,
+        tenantId: String(resolvedTenantId)
       });
     });
 
@@ -44,23 +55,29 @@ function uploadBufferToGridFS({ buffer, filename, contentType, metadata = {} }) 
 }
 
 /**
- * Finds a GridFS file document by its ObjectId.
+ * Finds a GridFS file document by its ObjectId and enforces exact tenantId ownership when provided.
  */
-async function findGridFSFileById(fileId) {
+async function findGridFSFileById(fileId, expectedTenantId = null) {
   if (!fileId || !mongoose.Types.ObjectId.isValid(fileId)) {
     return null;
   }
   const bucket = getGridFSBucket();
   const objectId = new mongoose.Types.ObjectId(fileId);
-  const files = await bucket.find({ _id: objectId }).limit(1).toArray();
+  const query = { _id: objectId };
+
+  if (expectedTenantId) {
+    query["metadata.tenantId"] = String(expectedTenantId);
+  }
+
+  const files = await bucket.find(query).limit(1).toArray();
   return files[0] || null;
 }
 
 /**
- * Opens a readable download stream from MongoDB Atlas GridFS.
+ * Opens a readable download stream from MongoDB Atlas GridFS after verifying tenant ownership.
  */
-async function openGridFSDownloadStream(fileId) {
-  const fileDoc = await findGridFSFileById(fileId);
+async function openGridFSDownloadStream(fileId, expectedTenantId = null) {
+  const fileDoc = await findGridFSFileById(fileId, expectedTenantId);
   if (!fileDoc) {
     throw Object.assign(new Error("Document file not found in GridFS storage"), {
       statusCode: 404
@@ -74,30 +91,36 @@ async function openGridFSDownloadStream(fileId) {
 /**
  * Marks a staged GridFS file as bound to a created print job so it is not purged as an orphan.
  */
-async function markGridFSFileBoundToJob(fileId, jobId) {
+async function markGridFSFileBoundToJob(fileId, jobId, expectedTenantId = null) {
   if (!fileId || !mongoose.Types.ObjectId.isValid(fileId)) return;
   if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) return;
 
   const objectId = new mongoose.Types.ObjectId(fileId);
-  await mongoose.connection.db.collection("printDocuments.files").updateOne(
-    { _id: objectId },
-    {
-      $set: {
-        "metadata.staged": false,
-        "metadata.jobId": jobId ? String(jobId) : null,
-        "metadata.boundAt": new Date()
-      }
+  const filter = { _id: objectId };
+  if (expectedTenantId) {
+    filter["metadata.tenantId"] = String(expectedTenantId);
+  }
+
+  await mongoose.connection.db.collection("printDocuments.files").updateOne(filter, {
+    $set: {
+      "metadata.staged": false,
+      "metadata.jobId": jobId ? String(jobId) : null,
+      "metadata.boundAt": new Date()
     }
-  );
+  });
 }
 
 /**
- * Deletes a file and all of its chunks from MongoDB Atlas GridFS.
+ * Deletes a file and all of its chunks from MongoDB Atlas GridFS, enforcing tenant ownership if specified.
  * Safe and idempotent if the file was already deleted.
  */
-async function deleteGridFSFile(fileId) {
+async function deleteGridFSFile(fileId, expectedTenantId = null) {
   if (!fileId || !mongoose.Types.ObjectId.isValid(fileId)) return false;
   try {
+    if (expectedTenantId) {
+      const existing = await findGridFSFileById(fileId, expectedTenantId);
+      if (!existing) return false;
+    }
     const bucket = getGridFSBucket();
     const objectId = new mongoose.Types.ObjectId(fileId);
     await bucket.delete(objectId);
@@ -150,11 +173,11 @@ async function cleanupExpiredGridFSFiles(OrderModel) {
       gridFsFileId: { $ne: null },
       updatedAt: { $lte: retentionCutoff }
     })
-      .select("_id gridFsFileId")
+      .select("_id gridFsFileId tenantId")
       .limit(50);
 
     for (const order of expiredOrders) {
-      await deleteGridFSFile(order.gridFsFileId);
+      await deleteGridFSFile(order.gridFsFileId, order.tenantId);
       order.fileDeleted = true;
       await order.save();
     }
