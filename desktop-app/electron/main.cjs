@@ -78,13 +78,65 @@ function decryptSecret(payload) {
   }
 }
 
+const DEFAULT_PRODUCTION_API_URL = "https://smart-xerox-api.onrender.com/api";
+const DEFAULT_PRODUCTION_WEB_URL = "https://smart-xerox-web-2mwa.onrender.com";
+
+function normalizeStoredApiUrl(value) {
+  const cleaned = String(value || "").trim().replace(/\/+$/, "");
+  if (
+    !cleaned ||
+    cleaned === "http://localhost:5000/api" ||
+    cleaned === "http://localhost:5000" ||
+    cleaned === "http://127.0.0.1:5000/api" ||
+    cleaned === "http://127.0.0.1:5000" ||
+    cleaned === "https://smart-xerox-api" ||
+    cleaned === "https://smart-xerox-api.onrender.com"
+  ) {
+    return DEFAULT_PRODUCTION_API_URL;
+  }
+  let withProtocol = cleaned;
+  if (!/^https?:\/\//i.test(withProtocol)) {
+    const isLocal = /^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(
+      withProtocol
+    );
+    withProtocol = `${isLocal ? "http" : "https"}://${withProtocol}`;
+  }
+  const withoutTrailingApi = withProtocol.replace(/(\/api)+$/i, "");
+  return `${withoutTrailingApi}/api`;
+}
+
+function normalizeStoredCustomerUrl(value) {
+  const cleaned = String(value || "").trim().replace(/\/+$/, "");
+  if (
+    !cleaned ||
+    cleaned.includes("smartxerox.com") ||
+    cleaned === "https://smart-xerox-web" ||
+    cleaned === "https://smart-xerox-web-2mwa" ||
+    cleaned === "https://smart-xerox-web.onrender.com" ||
+    cleaned.includes("localhost") ||
+    cleaned.includes("127.0.0.1")
+  ) {
+    return DEFAULT_PRODUCTION_WEB_URL;
+  }
+  const withProto = /^https?:\/\//i.test(cleaned) ? cleaned : `https://${cleaned}`;
+  try {
+    const parsed = new URL(withProto);
+    if (!parsed.hostname.includes(".")) {
+      return DEFAULT_PRODUCTION_WEB_URL;
+    }
+  } catch (_e) {
+    return DEFAULT_PRODUCTION_WEB_URL;
+  }
+  return withProto;
+}
+
 function readRawStore() {
   const storePath = getStorePath();
   if (!fs.existsSync(storePath)) {
     const initial = {
       deviceId: `win-${os.hostname().toLowerCase().replace(/[^a-z0-9-]/g, "")}-${crypto.randomBytes(4).toString("hex")}`,
-      apiBaseUrl: process.env.SMART_XEROX_API_URL || "http://localhost:5000/api",
-      customerBaseUrl: process.env.SMART_XEROX_WEB_URL || "https://smartxerox.com",
+      apiBaseUrl: normalizeStoredApiUrl(process.env.SMART_XEROX_API_URL),
+      customerBaseUrl: normalizeStoredCustomerUrl(process.env.SMART_XEROX_WEB_URL),
       autoStartWithWindows: true,
       theme: "light",
       admin: null,
@@ -99,12 +151,34 @@ function readRawStore() {
   }
 
   try {
-    return JSON.parse(fs.readFileSync(storePath, "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(storePath, "utf-8"));
+    let migrated = false;
+    const normalizedApi = normalizeStoredApiUrl(parsed.apiBaseUrl);
+    if (parsed.apiBaseUrl !== normalizedApi) {
+      parsed.apiBaseUrl = normalizedApi;
+      migrated = true;
+    }
+    const normalizedWeb = normalizeStoredCustomerUrl(parsed.customerBaseUrl);
+    if (parsed.customerBaseUrl !== normalizedWeb) {
+      parsed.customerBaseUrl = normalizedWeb;
+      migrated = true;
+    }
+    if (parsed.tenant && parsed.tenant.shopSlug) {
+      const expectedPublicUrl = `${DEFAULT_PRODUCTION_WEB_URL}/shop/${parsed.tenant.shopSlug}`;
+      if (parsed.tenant.publicUrl !== expectedPublicUrl) {
+        parsed.tenant.publicUrl = expectedPublicUrl;
+        migrated = true;
+      }
+    }
+    if (migrated) {
+      fs.writeFileSync(storePath, JSON.stringify(parsed, null, 2), "utf-8");
+    }
+    return parsed;
   } catch (_e) {
     return {
       deviceId: `win-${crypto.randomBytes(4).toString("hex")}`,
-      apiBaseUrl: "http://localhost:5000/api",
-      customerBaseUrl: "https://smartxerox.com",
+      apiBaseUrl: DEFAULT_PRODUCTION_API_URL,
+      customerBaseUrl: DEFAULT_PRODUCTION_WEB_URL,
       autoStartWithWindows: true,
       theme: "light"
     };
@@ -124,8 +198,8 @@ function getDecryptedSession() {
 
   return {
     deviceId: raw.deviceId,
-    apiBaseUrl: raw.apiBaseUrl || "http://localhost:5000/api",
-    customerBaseUrl: raw.customerBaseUrl || "https://smartxerox.com",
+    apiBaseUrl: normalizeStoredApiUrl(raw.apiBaseUrl),
+    customerBaseUrl: normalizeStoredCustomerUrl(raw.customerBaseUrl),
     autoStartWithWindows: raw.autoStartWithWindows !== false,
     theme: raw.theme || "light",
     admin: raw.admin || null,
@@ -466,16 +540,19 @@ ipcMain.handle("session:save", async (_event, payload) => {
   const raw = readRawStore();
 
   if (payload.apiBaseUrl) {
-    raw.apiBaseUrl = String(payload.apiBaseUrl).trim().replace(/\/+$/, "");
+    raw.apiBaseUrl = normalizeStoredApiUrl(payload.apiBaseUrl);
   }
   if (payload.customerBaseUrl) {
-    raw.customerBaseUrl = String(payload.customerBaseUrl).trim().replace(/\/+$/, "");
+    raw.customerBaseUrl = normalizeStoredCustomerUrl(payload.customerBaseUrl);
   }
   if (payload.admin !== undefined) {
     raw.admin = payload.admin;
   }
   if (payload.tenant !== undefined) {
     raw.tenant = payload.tenant;
+    if (raw.tenant && raw.tenant.shopSlug) {
+      raw.tenant.publicUrl = `${raw.customerBaseUrl || DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
+    }
   }
   if (payload.vendorToken !== undefined) {
     raw.encryptedVendorToken = payload.vendorToken
@@ -580,10 +657,10 @@ ipcMain.handle("agent:diagnose", async () => {
 ipcMain.handle("settings:update", async (_event, partial) => {
   const raw = readRawStore();
   if (partial.apiBaseUrl !== undefined) {
-    raw.apiBaseUrl = String(partial.apiBaseUrl).trim().replace(/\/+$/, "");
+    raw.apiBaseUrl = normalizeStoredApiUrl(partial.apiBaseUrl);
   }
   if (partial.customerBaseUrl !== undefined) {
-    raw.customerBaseUrl = String(partial.customerBaseUrl).trim().replace(/\/+$/, "");
+    raw.customerBaseUrl = normalizeStoredCustomerUrl(partial.customerBaseUrl);
   }
   if (partial.autoStartWithWindows !== undefined) {
     raw.autoStartWithWindows = Boolean(partial.autoStartWithWindows);
@@ -594,6 +671,9 @@ ipcMain.handle("settings:update", async (_event, partial) => {
   }
   if (partial.tenant !== undefined) {
     raw.tenant = partial.tenant;
+    if (raw.tenant && raw.tenant.shopSlug) {
+      raw.tenant.publicUrl = `${raw.customerBaseUrl || DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
+    }
   }
   writeRawStore(raw);
   syncAgentRuntimeConfigFile();

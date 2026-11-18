@@ -35,6 +35,7 @@ function isLocalOrLanHost(urlStr) {
     const parsed = new URL(urlStr);
     const host = parsed.hostname.toLowerCase();
     if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0") return true;
+    if (!host.includes(".")) return true;
     if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
     if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
     if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
@@ -44,10 +45,36 @@ function isLocalOrLanHost(urlStr) {
   }
 }
 
+const PRODUCTION_SHOP_BASE_URL = "https://smart-xerox-web-2mwa.onrender.com";
+
 function normalizePublicOrigin(value) {
   const trimmed = String(value || "").trim().replace(/\/+$/, "");
   if (!trimmed || trimmed === "*") return "";
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (
+    trimmed === "smart-xerox-web" ||
+    trimmed === "smart-xerox-web-2mwa" ||
+    trimmed === "https://smart-xerox-web-2mwa" ||
+    trimmed === "smart-xerox-web.onrender.com" ||
+    trimmed === "https://smart-xerox-web.onrender.com" ||
+    trimmed.includes("smartxerox.com") ||
+    trimmed.includes("smart-xerox-web.onrender.com")
+  ) {
+    return PRODUCTION_SHOP_BASE_URL;
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      if (!parsed.hostname.includes(".") && parsed.hostname !== "localhost") {
+        return `https://${parsed.hostname}.onrender.com`;
+      }
+    } catch (_e) {
+      return PRODUCTION_SHOP_BASE_URL;
+    }
+    return trimmed;
+  }
+  if (!trimmed.includes(".") && !trimmed.startsWith("localhost")) {
+    return `https://${trimmed}.onrender.com`;
+  }
   return `https://${trimmed}`;
 }
 
@@ -60,8 +87,16 @@ function buildShopPublicUrl(shopSlug, customBaseUrl = null) {
     .map(normalizePublicOrigin)
     .filter(Boolean);
 
-  const publicOrigin = candidates.find((url) => !isLocalOrLanHost(url));
-  const cleanBase = (publicOrigin || "https://smartxerox.com").replace(/\/+$/, "");
+  let publicOrigin = candidates.find(
+    (url) =>
+      !isLocalOrLanHost(url) &&
+      !url.includes("smartxerox.com") &&
+      !url.includes("smart-xerox-web.onrender.com")
+  );
+  if (!publicOrigin) {
+    publicOrigin = PRODUCTION_SHOP_BASE_URL;
+  }
+  const cleanBase = publicOrigin.replace(/\/+$/, "");
   return `${cleanBase}/shop/${encodeURIComponent(shopSlug)}`;
 }
 
@@ -70,5 +105,6 @@ module.exports = {
   hashAgentSecret,
   verifyAgentSecret,
   slugifyShopName,
-  buildShopPublicUrl
+  buildShopPublicUrl,
+  PRODUCTION_SHOP_BASE_URL
 };

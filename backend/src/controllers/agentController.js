@@ -3,6 +3,7 @@ const Order = require("../models/Order");
 const Agent = require("../models/Agent");
 const Tenant = require("../models/Tenant");
 const { recordAuditLog } = require("../utils/auditLogger");
+const { buildShopPublicUrl } = require("../utils/agentCredentials");
 const {
   openGridFSDownloadStream,
   deleteGridFSFile,
@@ -217,6 +218,7 @@ async function heartbeat(req, res) {
       tenantId: req.tenantId,
       shopName: req.tenant.shopName,
       shopSlug: req.tenant.shopSlug,
+      publicUrl: buildShopPublicUrl(req.tenant.shopSlug),
       selectedPrinterName: selectedPrinterName || resolvedPrinterName
     },
     agent: {

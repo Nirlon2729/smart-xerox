@@ -82,8 +82,8 @@ export default function App() {
   // Session & Config State (kept in memory & Electron DPAPI secure store; never in localStorage)
   const [session, setSession] = useState({
     deviceId: "",
-    apiBaseUrl: "http://localhost:5000/api",
-    customerBaseUrl: "https://smartxerox.com",
+    apiBaseUrl: "https://smart-xerox-api.onrender.com/api",
+    customerBaseUrl: "https://smart-xerox-web-2mwa.onrender.com",
     autoStartWithWindows: true,
     vendorToken: "",
     admin: null,
@@ -97,7 +97,7 @@ export default function App() {
   // Login Form State
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
-  const [loginApiUrl, setLoginApiUrl] = useState("http://localhost:5000/api");
+  const [loginApiUrl, setLoginApiUrl] = useState("https://smart-xerox-api.onrender.com/api");
   const [showServerConfig, setShowServerConfig] = useState(false);
   const [loggingIn, setLoggingIn] = useState(false);
 
@@ -154,8 +154,8 @@ export default function App() {
     maxCopies: 100,
     maxUploadMb: 20,
     acceptingOrders: true,
-    apiBaseUrl: "http://localhost:5000/api",
-    customerBaseUrl: "https://smartxerox.com",
+    apiBaseUrl: "https://smart-xerox-api.onrender.com/api",
+    customerBaseUrl: "https://smart-xerox-web-2mwa.onrender.com",
     autoStartWithWindows: true
   });
   const [savingSettings, setSavingSettings] = useState(false);
@@ -168,11 +168,37 @@ export default function App() {
       try {
         if (window.electronAPI) {
           const stored = await window.electronAPI.getSession();
-          setSession(stored);
+          const safeCustomerBaseUrl =
+            stored.customerBaseUrl &&
+            !stored.customerBaseUrl.includes("smartxerox.com") &&
+            !stored.customerBaseUrl.includes("localhost")
+              ? stored.customerBaseUrl
+              : "https://smart-xerox-web-2mwa.onrender.com";
+
+          const safeApiBaseUrl =
+            stored.apiBaseUrl &&
+            !stored.apiBaseUrl.includes("localhost") &&
+            !stored.apiBaseUrl.includes("127.0.0.1")
+              ? stored.apiBaseUrl
+              : "https://smart-xerox-api.onrender.com/api";
+
+          const safeTenant = stored.tenant
+            ? {
+                ...stored.tenant,
+                publicUrl: `https://smart-xerox-web-2mwa.onrender.com/shop/${stored.tenant.shopSlug}`
+              }
+            : null;
+
+          setSession({
+            ...stored,
+            customerBaseUrl: safeCustomerBaseUrl,
+            apiBaseUrl: safeApiBaseUrl,
+            tenant: safeTenant
+          });
           setTheme(stored.theme || "light");
-          setLoginApiUrl(stored.apiBaseUrl || "http://localhost:5000/api");
+          setLoginApiUrl(safeApiBaseUrl);
           configureDesktopApi({
-            apiBaseUrl: stored.apiBaseUrl,
+            apiBaseUrl: safeApiBaseUrl,
             vendorToken: stored.vendorToken
           });
         }
@@ -227,7 +253,22 @@ export default function App() {
           if (dashRes.printer) setPrinterState(dashRes.printer);
           if (dashRes.stats) setStats(dashRes.stats);
           if (dashRes.tenant) {
-            setSession((prev) => ({ ...prev, tenant: dashRes.tenant }));
+            const rawPub = dashRes.tenant.publicUrl || "";
+            const isValidPub =
+              rawPub.startsWith("https://smart-xerox-web-2mwa.onrender.com/shop/") ||
+              (rawPub &&
+                !rawPub.includes("smartxerox.com") &&
+                !rawPub.includes("smart-xerox-web.onrender.com") &&
+                !rawPub.includes("https://smart-xerox-web-2mwa/") &&
+                !rawPub.includes("localhost") &&
+                !rawPub.includes("127.0.0.1"));
+            const cleanTenant = {
+              ...dashRes.tenant,
+              publicUrl: isValidPub
+                ? rawPub
+                : `https://smart-xerox-web-2mwa.onrender.com/shop/${dashRes.tenant.shopSlug}`
+            };
+            setSession((prev) => ({ ...prev, tenant: cleanTenant }));
           }
         }
         if (ordersRes?.success && Array.isArray(ordersRes.orders)) {
@@ -270,8 +311,8 @@ export default function App() {
       maxCopies: t.config?.maxCopies || 100,
       maxUploadMb: t.config?.maxUploadMb || 20,
       acceptingOrders: t.config?.acceptingOrders !== false,
-      apiBaseUrl: session.apiBaseUrl || "http://localhost:5000/api",
-      customerBaseUrl: session.customerBaseUrl || "https://smartxerox.com",
+      apiBaseUrl: session.apiBaseUrl || "https://smart-xerox-api.onrender.com/api",
+      customerBaseUrl: session.customerBaseUrl || "https://smart-xerox-web-2mwa.onrender.com",
       autoStartWithWindows: session.autoStartWithWindows !== false
     });
   }, [
@@ -316,14 +357,28 @@ export default function App() {
     const customBase = (session.customerBaseUrl || "").trim().replace(/\/+$/, "");
     const isCustomPublic =
       customBase &&
+      customBase.includes(".") &&
       !customBase.includes("localhost") &&
       !customBase.includes("127.0.0.1") &&
+      !customBase.includes("smartxerox.com") &&
+      !customBase.includes("smart-xerox-web.onrender.com") &&
       !/^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(customBase);
 
     if (isCustomPublic) {
       return `${customBase}/shop/${slug}`;
     }
-    return session.tenant?.publicUrl || `https://smartxerox.com/shop/${slug}`;
+    const tenantPublic = session.tenant?.publicUrl || "";
+    if (
+      tenantPublic &&
+      tenantPublic.includes(".onrender.com") &&
+      !tenantPublic.includes("localhost") &&
+      !tenantPublic.includes("127.0.0.1") &&
+      !tenantPublic.includes("smartxerox.com") &&
+      !tenantPublic.includes("smart-xerox-web.onrender.com")
+    ) {
+      return tenantPublic;
+    }
+    return `https://smart-xerox-web-2mwa.onrender.com/shop/${slug}`;
   }, [session.tenant, session.customerBaseUrl]);
 
   // Generate QR code image whenever resolvedShopUrl changes
@@ -412,12 +467,17 @@ export default function App() {
         pairedAgentSecret = pairRes.credentials.agentSecret;
       }
 
+      const sanitizedTenant = {
+        ...res.tenant,
+        publicUrl: `https://smart-xerox-web-2mwa.onrender.com/shop/${res.tenant.shopSlug}`
+      };
+
       if (window.electronAPI) {
         await window.electronAPI.saveSession({
           apiBaseUrl: cleanApiUrl,
           vendorToken: res.token,
           admin: res.admin,
-          tenant: res.tenant,
+          tenant: sanitizedTenant,
           agentId: pairedAgentId,
           agentSecret: pairedAgentSecret
         });
@@ -428,7 +488,7 @@ export default function App() {
         apiBaseUrl: cleanApiUrl,
         vendorToken: res.token,
         admin: res.admin,
-        tenant: res.tenant,
+        tenant: sanitizedTenant,
         agentId: pairedAgentId,
         hasAgentCredentials: true
       }));
@@ -1997,7 +2057,7 @@ export default function App() {
                           customerBaseUrl: e.target.value
                         })
                       }
-                      placeholder="https://smartxerox.com"
+                      placeholder="https://smart-xerox-web-2mwa.onrender.com"
                       className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-xs font-mono-code"
                     />
                   </div>

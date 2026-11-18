@@ -1,11 +1,13 @@
 import axios from "axios";
 
-let activeApiBaseUrl = "http://localhost:5000/api";
+export const DEFAULT_PRODUCTION_API_URL = "https://smart-xerox-api.onrender.com/api";
+
+let activeApiBaseUrl = DEFAULT_PRODUCTION_API_URL;
 let activeVendorToken = "";
 
-function normalizeDesktopApiUrl(url) {
+export function normalizeDesktopApiUrl(url) {
   const cleaned = String(url || "").trim().replace(/\/+$/, "");
-  if (!cleaned) return "http://localhost:5000/api";
+  if (!cleaned) return DEFAULT_PRODUCTION_API_URL;
   let withProtocol = cleaned;
   if (!/^https?:\/\//i.test(withProtocol)) {
     const isLocal = /^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(
@@ -13,7 +15,8 @@ function normalizeDesktopApiUrl(url) {
     );
     withProtocol = `${isLocal ? "http" : "https"}://${withProtocol}`;
   }
-  return withProtocol.endsWith("/api") ? withProtocol : `${withProtocol}/api`;
+  const withoutTrailingApi = withProtocol.replace(/(\/api)+$/i, "");
+  return `${withoutTrailingApi}/api`;
 }
 
 export function configureDesktopApi({ apiBaseUrl, vendorToken }) {

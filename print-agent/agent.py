@@ -825,7 +825,9 @@ def load_runtime_config(config_path: str = None) -> dict:
     load_dotenv(BASE_DIR.parent / "backend" / ".env")
 
     cfg = {
-        "backendApiUrl": (os.getenv("BACKEND_API_URL") or "http://localhost:5000/api").rstrip("/"),
+        "backendApiUrl": (
+            os.getenv("BACKEND_API_URL") or "https://smart-xerox-api.onrender.com/api"
+        ).rstrip("/"),
         "agentId": os.getenv("AGENT_ID", "").strip(),
         "agentSecret": os.getenv("AGENT_SECRET", "").strip(),
         "deviceId": os.getenv("AGENT_DEVICE_ID", f"win-{socket.gethostname()}").strip(),

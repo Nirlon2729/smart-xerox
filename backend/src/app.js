@@ -19,17 +19,31 @@ app.use(
   })
 );
 
+const PRODUCTION_CUSTOMER_ORIGIN = "https://smart-xerox-web-2mwa.onrender.com";
+
 const normalizeOriginValue = (val) => {
   const trimmed = String(val || "").trim().replace(/\/+$/, "");
   if (!trimmed || trimmed === "*") return trimmed;
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (trimmed === "smart-xerox-web" || trimmed === "smart-xerox-web.onrender.com") {
+    return PRODUCTION_CUSTOMER_ORIGIN;
+  }
+  if (!trimmed.includes(".") && !trimmed.startsWith("localhost")) {
+    return `https://${trimmed}.onrender.com`;
+  }
   return `https://${trimmed}`;
 };
 
-const configuredOrigins = (process.env.CUSTOMER_ORIGIN || "http://localhost:5173,http://localhost:5174")
-  .split(",")
-  .map(normalizeOriginValue)
-  .filter(Boolean);
+const configuredOrigins = Array.from(
+  new Set(
+    [
+      PRODUCTION_CUSTOMER_ORIGIN,
+      ...(process.env.CUSTOMER_ORIGIN || "http://localhost:5173,http://localhost:5174").split(",")
+    ]
+      .map(normalizeOriginValue)
+      .filter(Boolean)
+  )
+);
 
 const isPrivateLanOrigin = (origin) => {
   try {
@@ -45,46 +59,48 @@ const isPrivateLanOrigin = (origin) => {
   }
 };
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow same-origin, server-to-server, print-agent, or Electron desktop file:// / null origins
-      if (
-        !origin ||
-        origin === "null" ||
-        origin.startsWith("file://") ||
-        origin.startsWith("app://")
-      ) {
-        return callback(null, true);
-      }
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow same-origin, server-to-server, print-agent, or Electron desktop file:// / null origins
+    if (
+      !origin ||
+      origin === "null" ||
+      origin.startsWith("file://") ||
+      origin.startsWith("app://")
+    ) {
+      return callback(null, true);
+    }
 
-      const normalized = origin.replace(/\/+$/, "");
-      if (configuredOrigins.includes(normalized) || configuredOrigins.includes("*")) {
-        return callback(null, true);
-      }
+    const normalized = origin.replace(/\/+$/, "");
+    if (configuredOrigins.includes(normalized) || configuredOrigins.includes("*")) {
+      return callback(null, true);
+    }
 
-      // Allow local/LAN origins in development or local Electron dev server
-      if (process.env.NODE_ENV !== "production" && isPrivateLanOrigin(normalized)) {
-        return callback(null, true);
-      }
+    // Allow local/LAN origins in development or local Electron dev server
+    if (process.env.NODE_ENV !== "production" && isPrivateLanOrigin(normalized)) {
+      return callback(null, true);
+    }
 
-      const corsError = new Error(`Origin ${origin} not allowed by CORS`);
-      corsError.statusCode = 403;
-      return callback(corsError);
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "Accept",
-      "x-agent-id",
-      "x-agent-secret",
-      "x-agent-token",
-      "x-agent-job-id"
-    ]
-  })
-);
+    const corsError = new Error(`Origin ${origin} not allowed by CORS`);
+    corsError.statusCode = 403;
+    return callback(corsError);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Accept",
+    "x-agent-id",
+    "x-agent-secret",
+    "x-agent-token",
+    "x-agent-job-id"
+  ],
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));

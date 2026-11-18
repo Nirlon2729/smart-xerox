@@ -1,19 +1,26 @@
 import axios from "axios";
 
+export const PRODUCTION_API_BASE_URL = "https://smart-xerox-api.onrender.com/api";
+
 function normalizeConfiguredApiUrl(value) {
   const cleaned = String(value || "").trim().replace(/\/+$/, "");
   if (!cleaned) return "";
+  if (cleaned === "smart-xerox-api" || cleaned === "smart-xerox-api.onrender.com") {
+    return PRODUCTION_API_BASE_URL;
+  }
   let withProtocol = cleaned;
   if (!/^https?:\/\//i.test(withProtocol) && !withProtocol.startsWith("/")) {
     const isLocal = /^(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(
       withProtocol
     );
-    withProtocol = `${isLocal ? "http" : "https"}://${withProtocol}`;
+    if (!isLocal && !withProtocol.includes(".")) {
+      withProtocol = `https://${withProtocol}.onrender.com`;
+    } else {
+      withProtocol = `${isLocal ? "http" : "https"}://${withProtocol}`;
+    }
   }
-  if (!withProtocol.endsWith("/api")) {
-    withProtocol = `${withProtocol}/api`;
-  }
-  return withProtocol;
+  const withoutTrailingApi = withProtocol.replace(/(\/api)+$/i, "");
+  return `${withoutTrailingApi}/api`;
 }
 
 /**
@@ -23,28 +30,23 @@ export function resolveApiBaseUrl() {
   const rawEnvUrl = normalizeConfiguredApiUrl(import.meta.env.VITE_API_BASE_URL);
 
   if (typeof window !== "undefined" && window.location?.hostname) {
-    const currentHost = window.location.hostname;
-    const isBrowserOnLanIp =
-      currentHost !== "localhost" &&
-      currentHost !== "127.0.0.1" &&
-      /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(currentHost);
+    const currentHost = window.location.hostname.toLowerCase();
+    const isBrowserOnProductionHost =
+      currentHost.endsWith(".onrender.com") ||
+      (currentHost !== "localhost" &&
+        currentHost !== "127.0.0.1" &&
+        !/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(currentHost));
 
-    if (isBrowserOnLanIp) {
-      if (!rawEnvUrl || rawEnvUrl.includes("localhost") || rawEnvUrl.includes("127.0.0.1")) {
-        return `http://${currentHost}:5000/api`;
+    if (isBrowserOnProductionHost) {
+      if (
+        !rawEnvUrl ||
+        rawEnvUrl.includes("localhost") ||
+        rawEnvUrl.includes("127.0.0.1") ||
+        /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/i.test(rawEnvUrl)
+      ) {
+        return PRODUCTION_API_BASE_URL;
       }
-      try {
-        const parsed = new URL(rawEnvUrl);
-        if (
-          /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(parsed.hostname) &&
-          parsed.hostname !== currentHost
-        ) {
-          parsed.hostname = currentHost;
-          return parsed.toString().replace(/\/+$/, "");
-        }
-      } catch (_err) {
-        // Fall through
-      }
+      return rawEnvUrl;
     }
   }
 
@@ -52,11 +54,7 @@ export function resolveApiBaseUrl() {
     return rawEnvUrl;
   }
 
-  if (typeof window !== "undefined" && window.location?.hostname) {
-    return `${window.location.protocol}//${window.location.hostname}:5000/api`;
-  }
-
-  return "/api";
+  return PRODUCTION_API_BASE_URL;
 }
 
 export const API_BASE_URL = resolveApiBaseUrl();

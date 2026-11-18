@@ -1,6 +1,6 @@
 
 services:
-  # 1. Node.js + Express Multi-Vendor Cloud Backend
+  # 1. Node.js + Express Multi-Vendor Cloud Backend (MongoDB Atlas + GridFS)
   - type: web
     name: smart-xerox-api
     runtime: node
@@ -21,21 +21,15 @@ services:
       - key: ADMIN_PASSWORD
         sync: false
       - key: CUSTOMER_ORIGIN
-        fromService:
-          type: web
-          name: smart-xerox-web
-          property: host
+        value: https://smart-xerox-web-2mwa.onrender.com
       - key: PUBLIC_SHOP_BASE_URL
-        fromService:
-          type: web
-          name: smart-xerox-web
-          property: host
+        value: https://smart-xerox-web-2mwa.onrender.com
       - key: MAX_UPLOAD_MB
         value: "20"
       - key: FILE_RETENTION_MINUTES
         value: "60"
 
-  # 2. React + Vite Customer Mobile Website
+  # 2. React + Vite Customer Mobile Website (QR-based shop routes /shop/:shopSlug)
   - type: web
     name: smart-xerox-web
     runtime: static
@@ -48,10 +42,7 @@ services:
         destination: /index.html
     envVars:
       - key: VITE_API_BASE_URL
-        fromService:
-          type: web
-          name: smart-xerox-api
-          property: host
+        value: https://smart-xerox-api.onrender.com/api
       - key: VITE_MAX_UPLOAD_MB
         value: "20"
       - key: VITE_MAX_COPIES
