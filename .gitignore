@@ -18,6 +18,7 @@ dist/
 release/
 out/
 build/
+!desktop-app/build/
 desktop-app/agent-runtime/
 desktop-app/release/
 desktop-app/dist/
