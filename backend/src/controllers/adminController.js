@@ -81,14 +81,14 @@ async function computeTenantStats(tenantId) {
 
 /**
  * POST /api/vendor/login & POST /api/admin/login
- * Authenticates a vendor shopkeeper (or super admin) and returns tenant & session details.
+ * Authenticates a vendor shopkeeper and returns tenant & session details.
  */
 async function login(req, res) {
   const email = String(req.body.email || "").toLowerCase().trim();
   const password = String(req.body.password || "");
 
   const admin = await Admin.findOne({ email });
-  if (!admin || !admin.active || !(await bcrypt.compare(password, admin.passwordHash))) {
+  if (!admin || !(await bcrypt.compare(password, admin.passwordHash))) {
     await recordAuditLog({
       tenantId: admin?.tenantId || null,
       actorType: "VENDOR_ADMIN",
@@ -98,29 +98,124 @@ async function login(req, res) {
     });
     return res.status(401).json({
       success: false,
-      message: "Invalid email or password"
+      message: "Invalid vendor email or password"
+    });
+  }
+
+  const allowedVendorRoles = ["VENDOR", "VENDOR_ADMIN", "OWNER", "SUPER_ADMIN"];
+  if (!allowedVendorRoles.includes(admin.role)) {
+    return res.status(403).json({
+      success: false,
+      message: "This account does not have Vendor access privileges."
     });
   }
 
   let tenant = null;
   if (admin.tenantId) {
     tenant = await Tenant.findById(admin.tenantId);
-    if (!tenant) {
-      return res.status(403).json({
-        success: false,
-        message: "Vendor shop account is not linked to a valid tenant."
-      });
-    }
-    if (tenant.status !== "ACTIVE" && admin.role !== "SUPER_ADMIN") {
-      return res.status(403).json({
-        success: false,
-        message: "Your shop account has been suspended by the platform administrator."
-      });
-    }
+  }
+
+  if (!tenant) {
+    return res.status(403).json({
+      success: false,
+      message: "Vendor shop account is not linked to a valid shop tenant."
+    });
+  }
+
+  if ((tenant.status !== "ACTIVE" || !admin.active) && admin.role !== "SUPER_ADMIN") {
+    await recordAuditLog({
+      tenantId: tenant._id,
+      actorType: "VENDOR_ADMIN",
+      actorId: admin._id,
+      action: "SUSPENDED_VENDOR_LOGIN_BLOCKED",
+      req
+    });
+    return res.status(403).json({
+      success: false,
+      message: "Your vendor shop account has been suspended by the platform administrator."
+    });
   }
 
   admin.lastLoginAt = new Date();
   await admin.save();
+
+  const token = jwt.sign(
+    {
+      sub: admin._id.toString(),
+      role: admin.role,
+      tenantId: tenant._id.toString()
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+
+  await recordAuditLog({
+    tenantId: tenant._id,
+    actorType: admin.role === "SUPER_ADMIN" ? "SUPER_ADMIN" : "VENDOR_ADMIN",
+    actorId: admin._id,
+    action: "LOGIN_SUCCESS",
+    req
+  });
+
+  const userSummary = {
+    id: admin._id,
+    name: admin.name || "Shop Owner",
+    email: admin.email,
+    role: admin.role,
+    isVendor: true,
+    tenantId: tenant._id
+  };
+
+  res.json({
+    success: true,
+    token,
+    vendor: userSummary,
+    admin: userSummary,
+    tenant: formatTenantSummary(tenant)
+  });
+}
+
+/**
+ * POST /api/super-admin/login
+ * Authenticates the Platform Super Admin strictly verifying role === "SUPER_ADMIN".
+ */
+async function superAdminLogin(req, res) {
+  const email = String(req.body.email || "").toLowerCase().trim();
+  const password = String(req.body.password || "");
+
+  const admin = await Admin.findOne({ email });
+  if (!admin || !admin.active || !(await bcrypt.compare(password, admin.passwordHash))) {
+    await recordAuditLog({
+      tenantId: admin?.tenantId || null,
+      actorType: "SUPER_ADMIN",
+      actorId: email,
+      action: "SUPER_ADMIN_LOGIN_FAILED",
+      req
+    });
+    return res.status(401).json({
+      success: false,
+      message: "Invalid Super Admin email or password"
+    });
+  }
+
+  if (admin.role !== "SUPER_ADMIN") {
+    await recordAuditLog({
+      tenantId: admin.tenantId || null,
+      actorType: "VENDOR_ADMIN",
+      actorId: admin._id,
+      action: "UNAUTHORIZED_SUPER_ADMIN_LOGIN_BLOCKED",
+      req
+    });
+    return res.status(403).json({
+      success: false,
+      message: "Super Admin privileges required. Vendor accounts must sign in using the Smart Xerox Windows Desktop App."
+    });
+  }
+
+  admin.lastLoginAt = new Date();
+  await admin.save();
+
+  const tenant = admin.tenantId ? await Tenant.findById(admin.tenantId) : null;
 
   const token = jwt.sign(
     {
@@ -134,9 +229,9 @@ async function login(req, res) {
 
   await recordAuditLog({
     tenantId: tenant?._id || null,
-    actorType: admin.role === "SUPER_ADMIN" ? "SUPER_ADMIN" : "VENDOR_ADMIN",
+    actorType: "SUPER_ADMIN",
     actorId: admin._id,
-    action: "LOGIN_SUCCESS",
+    action: "SUPER_ADMIN_LOGIN_SUCCESS",
     req
   });
 
@@ -145,12 +240,83 @@ async function login(req, res) {
     token,
     admin: {
       id: admin._id,
-      name: admin.name || "Shop Owner",
+      name: admin.name || "Platform Super Admin",
       email: admin.email,
       role: admin.role,
       tenantId: tenant ? tenant._id : null
     },
     tenant: formatTenantSummary(tenant)
+  });
+}
+
+/**
+ * PUT /api/vendor/password
+ * Allows an authenticated vendor to change their own password (e.g. after logging in with a temporary password).
+ */
+async function changeVendorPassword(req, res) {
+  const currentPassword = String(req.body.currentPassword || "");
+  const newPassword = String(req.body.newPassword || "");
+  const confirmPassword =
+    req.body.confirmPassword !== undefined ? String(req.body.confirmPassword || "") : newPassword;
+
+  if (!currentPassword || !newPassword || newPassword.length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: "Current password and a new password of at least 6 characters are required."
+    });
+  }
+
+  if (newPassword !== confirmPassword) {
+    return res.status(400).json({
+      success: false,
+      message: "New password and confirm password do not match."
+    });
+  }
+
+  const adminDoc = await Admin.findById(req.admin._id);
+  if (!adminDoc || !(await bcrypt.compare(currentPassword, adminDoc.passwordHash))) {
+    return res.status(401).json({
+      success: false,
+      message: "Current password is incorrect."
+    });
+  }
+
+  const isSameAsCurrent = await bcrypt.compare(newPassword, adminDoc.passwordHash);
+  if (isSameAsCurrent) {
+    return res.status(400).json({
+      success: false,
+      message: "New password must be different from your current password."
+    });
+  }
+
+  adminDoc.passwordHash = await bcrypt.hash(newPassword, 12);
+  adminDoc.passwordChangedAt = new Date();
+  await adminDoc.save();
+
+  const freshToken = jwt.sign(
+    {
+      sub: adminDoc._id.toString(),
+      role: adminDoc.role,
+      tenantId: req.tenantId ? req.tenantId.toString() : null
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: "VENDOR_ADMIN",
+    actorId: req.admin._id,
+    action: "VENDOR_PASSWORD_CHANGED",
+    targetType: "Admin",
+    targetId: req.admin._id,
+    req
+  });
+
+  res.json({
+    success: true,
+    message: "Your vendor password has been updated.",
+    token: freshToken
   });
 }
 
@@ -706,7 +872,7 @@ async function getSuperAdminOverview(_req, res) {
  */
 async function createVendor(req, res) {
   const shopName = String(req.body.shopName || "").trim();
-  const desiredSlug = String(req.body.shopSlug || shopName).trim();
+  const explicitRawSlug = String(req.body.shopSlug || "").trim();
   const ownerName = String(req.body.ownerName || req.body.name || shopName).trim();
   const email = String(req.body.email || "").toLowerCase().trim();
   const password = String(req.body.password || "");
@@ -729,7 +895,19 @@ async function createVendor(req, res) {
     });
   }
 
-  const shopSlug = await generateUniqueShopSlug(desiredSlug);
+  let shopSlug;
+  if (explicitRawSlug) {
+    shopSlug = slugifyShopName(explicitRawSlug);
+    const existingSlugTenant = await Tenant.findOne({ shopSlug });
+    if (existingSlugTenant) {
+      return res.status(409).json({
+        success: false,
+        message: `A vendor shop with slug "${shopSlug}" already exists. Please enter a unique shop slug.`
+      });
+    }
+  } else {
+    shopSlug = await generateUniqueShopSlug(shopName);
+  }
   const tenant = await Tenant.create({
     shopName,
     shopSlug,
@@ -925,9 +1103,10 @@ async function bootstrapOwner() {
 
   let defaultTenant = await Tenant.findOne().sort({ createdAt: 1 });
   if (!defaultTenant) {
-    const defaultPrinter = process.env.PRINTER_NAME && process.env.PRINTER_NAME !== "Exact Windows printer name"
-      ? process.env.PRINTER_NAME
-      : "HP LaserJet MFP M129-M134";
+    const defaultPrinter =
+      process.env.PRINTER_NAME && process.env.PRINTER_NAME !== "Exact Windows printer name"
+        ? process.env.PRINTER_NAME
+        : null;
 
     defaultTenant = await Tenant.create({
       shopName: process.env.DEFAULT_SHOP_NAME || "Smart Xerox Main Shop",
@@ -1006,6 +1185,8 @@ async function bootstrapOwner() {
 
 module.exports = {
   login,
+  superAdminLogin,
+  changeVendorPassword,
   getAdminProfile,
   pairDesktopAgent,
   listVendorAgents,

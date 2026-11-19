@@ -22,12 +22,15 @@ import re
 import sys
 import time
 import json
+import ctypes
+import winreg
 import socket
 import platform
 import argparse
 import hashlib
 import logging
 import tempfile
+from ctypes import wintypes
 from pathlib import Path
 from dotenv import load_dotenv
 import requests
@@ -391,6 +394,115 @@ def classify_connection_type(
     return "UNKNOWN"
 
 
+def get_usb_port_hardware_presence() -> tuple[set, set]:
+    """
+    Uses Windows SetupAPI (GUID_DEVINTERFACE_USBPRINT) and the Windows USBPRINT DeviceClasses
+    registry to determine which USB printer ports (e.g. USB001, USB002) are registered in
+    Windows (`known_ports`) and which ones have a USB printer physically connected and powered
+    on right now (`connected_ports`).
+    """
+    known_ports = set()
+    connected_ports = set()
+    if os.name != "nt":
+        return known_ports, connected_ports
+
+    try:
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class _SP_DEVINFO_DATA(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("ClassGuid", _GUID),
+                ("DevInst", wintypes.DWORD),
+                ("Reserved", ctypes.c_void_p),
+            ]
+
+        usbprint_guid = _GUID(
+            0x28D78FAD,
+            0x5A12,
+            0x11D1,
+            (ctypes.c_ubyte * 8)(0xAE, 0x5B, 0x00, 0x00, 0xF8, 0x03, 0xA8, 0xC2),
+        )
+        setupapi = ctypes.windll.setupapi
+        setupapi.SetupDiGetClassDevsW.argtypes = [
+            ctypes.POINTER(_GUID),
+            wintypes.LPCWSTR,
+            wintypes.HWND,
+            wintypes.DWORD,
+        ]
+        setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+        setupapi.SetupDiEnumDeviceInfo.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(_SP_DEVINFO_DATA),
+        ]
+        setupapi.SetupDiEnumDeviceInfo.restype = wintypes.BOOL
+        setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_SP_DEVINFO_DATA),
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        setupapi.SetupDiGetDeviceInstanceIdW.restype = wintypes.BOOL
+        setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+
+        present_instances = set()
+        # DIGCF_PRESENT (0x02) | DIGCF_DEVICEINTERFACE (0x10)
+        hdev = setupapi.SetupDiGetClassDevsW(
+            ctypes.byref(usbprint_guid), None, None, 0x02 | 0x10
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if hdev and hdev != invalid_handle:
+            try:
+                devinfo = _SP_DEVINFO_DATA()
+                devinfo.cbSize = ctypes.sizeof(_SP_DEVINFO_DATA)
+                idx = 0
+                while setupapi.SetupDiEnumDeviceInfo(hdev, idx, ctypes.byref(devinfo)):
+                    buf = ctypes.create_unicode_buffer(512)
+                    if setupapi.SetupDiGetDeviceInstanceIdW(
+                        hdev, ctypes.byref(devinfo), buf, 512, None
+                    ):
+                        norm_inst = buf.value.strip().upper().replace("\\", "#")
+                        if norm_inst:
+                            present_instances.add(norm_inst)
+                    idx += 1
+            finally:
+                setupapi.SetupDiDestroyDeviceInfoList(hdev)
+
+        key_path = r"SYSTEM\CurrentControlSet\Control\DeviceClasses\{28d78fad-5a12-11d1-ae5b-0000f803a8c2}"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as k:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(k, i)
+                    i += 1
+                    try:
+                        with winreg.OpenKey(k, sub + r"\#\Device Parameters") as dp:
+                            port_num, _ = winreg.QueryValueEx(dp, "Port Number")
+                            port_label = f"USB{int(port_num):03d}"
+                            known_ports.add(port_label)
+                            sub_upper = sub.upper()
+                            for inst in present_instances:
+                                if inst in sub_upper:
+                                    connected_ports.add(port_label)
+                                    break
+                    except FileNotFoundError:
+                        continue
+                except OSError:
+                    break
+    except Exception:
+        pass
+
+    return known_ports, connected_ports
+
+
 def get_default_windows_printer() -> str:
     try:
         return str(win32print.GetDefaultPrinter() or "").strip()
@@ -677,6 +789,16 @@ def inspect_printer_state_and_capabilities(
         work_offline = bool(attributes & PRINTER_ATTRIBUTE_WORK_OFFLINE)
         driver_missing = not bool(driver_name)
 
+        # Verify physical USB hardware presence when running against the real Windows spooler
+        usb_hardware_disconnected = False
+        is_mocked_handle = str(handle).startswith("HANDLE::")
+        if conn_type == "USB" and port_name and not is_mocked_handle:
+            known_usb_ports, connected_usb_ports = get_usb_port_hardware_presence()
+            port_upper = port_name.upper()
+            if port_upper in known_usb_ports and port_upper not in connected_usb_ports:
+                usb_hardware_disconnected = True
+                work_offline = True
+
         result["manufacturer"] = brand
         result["model"] = model
         result["portName"] = port_name or None
@@ -692,6 +814,7 @@ def inspect_printer_state_and_capabilities(
         result["connectionType"] = conn_type
         result["printerStatusCode"] = status_flags
         result["workOffline"] = work_offline
+        result["usbHardwareDisconnected"] = usb_hardware_disconnected
         result["spoolerJobCount"] = c_jobs
 
         if is_virtual and not allow_virtual:
@@ -715,12 +838,17 @@ def inspect_printer_state_and_capabilities(
                 f"Windows printer driver is missing for {matched_installed_name}. "
                 f"Please install the official {brand} Windows driver."
             )
-        elif work_offline or (status_flags & (PRINTER_STATUS_OFFLINE | PRINTER_STATUS_NOT_AVAILABLE | PRINTER_STATUS_SERVER_UNKNOWN)):
+        elif usb_hardware_disconnected or work_offline or (status_flags & (PRINTER_STATUS_OFFLINE | PRINTER_STATUS_NOT_AVAILABLE | PRINTER_STATUS_SERVER_UNKNOWN)):
             result["printerAvailable"] = False
             result["status"] = "OFFLINE"
-            result["statusMessage"] = (
-                f"{matched_installed_name} is offline or disconnected ({port_name or conn_type})"
-            )
+            if usb_hardware_disconnected:
+                result["statusMessage"] = (
+                    f"{matched_installed_name} is installed in Windows ({port_name}), but the printer is powered off or the USB cable is disconnected."
+                )
+            else:
+                result["statusMessage"] = (
+                    f"{matched_installed_name} is offline or disconnected ({port_name or conn_type})"
+                )
         elif status_flags & PRINTER_STATUS_PAPER_OUT:
             result["printerAvailable"] = False
             result["status"] = "ERROR"
@@ -869,8 +997,14 @@ def resolve_target_printer(
         # keep it as the target so status reports OFFLINE until reconnected.
         return clean_pref
 
-    if auto_select_single and len(usable_printers) == 1:
-        return usable_printers[0]["name"]
+    if auto_select_single:
+        online_usable = [p for p in usable_printers if p.get("printerAvailable")]
+        if len(online_usable) == 1 and len(usable_printers) == 1:
+            return online_usable[0]["name"]
+        if len(online_usable) == 1 and all(
+            not p.get("printerAvailable") for p in usable_printers if p["name"] != online_usable[0]["name"]
+        ):
+            return online_usable[0]["name"]
 
     return ""
 

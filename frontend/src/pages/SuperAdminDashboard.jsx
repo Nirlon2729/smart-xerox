@@ -377,14 +377,16 @@ export default function SuperAdminDashboard() {
                       vendor.agentOnline ? "text-emerald-600" : "text-zinc-400"
                     }`}
                   />
-                  <div>
+                  <div className="min-w-0">
                     <span className="text-zinc-400 block text-[10px] uppercase">
-                      Desktop Agent
+                      Connected Computer / Agent
                     </span>
-                    <span className="font-semibold text-zinc-800">
+                    <span className="font-semibold text-zinc-800 truncate block">
                       {vendor.agentOnline
-                        ? `Online (${vendor.agents?.length || 1} paired)`
-                        : `Offline (${vendor.agents?.length || 0} paired)`}
+                        ? `Online • ${vendor.agents?.[0]?.hostname || "Windows PC"}`
+                        : vendor.agents?.length > 0
+                          ? `Offline • ${vendor.agents?.[0]?.hostname || "Paired PC"}`
+                          : "Not paired yet"}
                     </span>
                   </div>
                 </div>
@@ -400,7 +402,9 @@ export default function SuperAdminDashboard() {
                       Connected Printer
                     </span>
                     <span className="font-semibold text-zinc-800 truncate block">
-                      {vendor.activePrinterName || "None selected"}
+                      {vendor.activePrinterName
+                        ? `${vendor.activePrinterName} (${vendor.printerAvailable ? "Ready" : "Offline"})`
+                        : "None selected"}
                     </span>
                   </div>
                 </div>
@@ -483,7 +487,22 @@ export default function SuperAdminDashboard() {
 
               <div>
                 <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                  Custom Shop Slug (optional)
+                  Shop Owner Name
+                </label>
+                <input
+                  type="text"
+                  value={newVendor.ownerName}
+                  onChange={(e) =>
+                    setNewVendor({ ...newVendor, ownerName: e.target.value })
+                  }
+                  placeholder="e.g. Rahul Patel"
+                  className="w-full px-3 py-2 rounded-lg border border-zinc-300 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                  Unique Shop Slug (optional — auto-generated if blank)
                 </label>
                 <input
                   type="text"
@@ -498,7 +517,7 @@ export default function SuperAdminDashboard() {
 
               <div>
                 <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                  Vendor Login Email *
+                  Vendor Email *
                 </label>
                 <input
                   type="email"
@@ -514,7 +533,7 @@ export default function SuperAdminDashboard() {
 
               <div>
                 <label className="block text-xs font-semibold text-zinc-700 mb-1">
-                  Initial Password * (min 6 chars)
+                  Temporary Password * (min 6 chars)
                 </label>
                 <input
                   type="password"
@@ -524,7 +543,7 @@ export default function SuperAdminDashboard() {
                   onChange={(e) =>
                     setNewVendor({ ...newVendor, password: e.target.value })
                   }
-                  placeholder="Enter vendor password"
+                  placeholder="Enter vendor temporary password"
                   className="w-full px-3 py-2 rounded-lg border border-zinc-300 text-sm"
                 />
               </div>

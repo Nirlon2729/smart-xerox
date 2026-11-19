@@ -1,7 +1,14 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import toast from "react-hot-toast";
-import { Printer } from "lucide-react";
+import {
+  Printer,
+  Plus,
+  FileText,
+  Image as ImageIcon,
+  Trash2,
+  CheckCircle2
+} from "lucide-react";
 import FileCard from "../components/FileCard";
 import DocumentPreview from "../components/DocumentPreview";
 import PrintOptions from "../components/PrintOptions";
@@ -26,6 +33,13 @@ export default function PrintSettings() {
     shopSlug,
     setShopSlug,
     shopInfo,
+    uploadedDocuments,
+    activeDocIndex,
+    setActiveDocIndex,
+    addUploadedDocument,
+    replaceActiveDocument,
+    removeUploadedDocument,
+    totalBatchPages,
     selectedFile,
     previewObjectUrl,
     documentMeta,
@@ -33,8 +47,8 @@ export default function PrintSettings() {
     updateSettings,
     printerState,
     shopConfig,
-    setUploadedDocument,
     setActiveOrder,
+    setSubmittedBatchOrders,
     clearDocument
   } = usePrintSession();
 
@@ -43,6 +57,7 @@ export default function PrintSettings() {
   const [customRangeError, setCustomRangeError] = useState(null);
   const [replacing, setReplacing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const addMoreInputRef = useRef(null);
 
   const idempotencyKeyRef = useRef(
     `job-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
@@ -99,6 +114,7 @@ export default function PrintSettings() {
   useEffect(() => {
     idempotencyKeyRef.current = `job-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }, [
+    uploadedDocuments.length,
     documentMeta?.uploadId,
     settings.paperSize,
     settings.colorMode,
@@ -118,7 +134,7 @@ export default function PrintSettings() {
       setReplacing(true);
       const res = await inspectAndStagePdf(activeSlug, newFile);
       if (res?.success && res.document) {
-        setUploadedDocument(newFile, res.document);
+        replaceActiveDocument(newFile, res.document);
         toast.success(`Replaced with ${res.document.originalName}`);
       }
     } catch (err) {
@@ -128,9 +144,81 @@ export default function PrintSettings() {
     }
   };
 
+  const handleAddMoreFiles = async (e) => {
+    const files = Array.from(e.target.files || []).filter(Boolean);
+    e.target.value = "";
+    if (files.length === 0 || replacing || submitting || !activeSlug) return;
+
+    try {
+      setReplacing(true);
+      let added = 0;
+      for (const f of files) {
+        const res = await inspectAndStagePdf(activeSlug, f);
+        if (res?.success && res.document) {
+          addUploadedDocument(f, res.document);
+          added++;
+        }
+      }
+      if (added > 0) {
+        toast.success(
+          added === 1 ? `Added ${files[0].name}` : `Added ${added} documents`
+        );
+      }
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, "Could not add document."));
+    } finally {
+      setReplacing(false);
+    }
+  };
+
   const handleRemoveFile = () => {
-    clearDocument();
-    navigate(activeSlug ? `/shop/${activeSlug}` : "/");
+    if (uploadedDocuments.length > 1) {
+      removeUploadedDocument(activeDocIndex);
+      toast.success("Removed document from list");
+    } else {
+      clearDocument();
+      navigate(activeSlug ? `/shop/${activeSlug}` : "/");
+    }
+  };
+
+  const handleToggleSinglePageFromPreview = (pageNum) => {
+    if (isImage) return;
+    const currentPages =
+      settings.pageSelectionMode === "all"
+        ? Array.from({ length: totalPages }, (_, i) => i + 1)
+        : settings.selectedPages || [1];
+
+    const currentSet = new Set(currentPages);
+    if (currentSet.has(pageNum)) {
+      if (currentSet.size <= 1) {
+        toast.error("At least 1 page must remain selected for printing.");
+        return;
+      }
+      currentSet.delete(pageNum);
+    } else {
+      currentSet.add(pageNum);
+    }
+    const sorted = [...currentSet].sort((a, b) => a - b);
+    updateSettings({
+      pageSelectionMode: sorted.length === totalPages ? "all" : "selected",
+      selectedPages: sorted,
+      customPageRange: sorted.join(",")
+    });
+  };
+
+  const resolveDocSelectedPages = (docEntry) => {
+    const docTotal = docEntry.meta?.pageCount || 1;
+    const docIsImg = docEntry.meta?.documentType === "image";
+    const s = docEntry.settings || settings;
+
+    if (docIsImg || s.pageSelectionMode === "all") {
+      return Array.from({ length: docTotal }, (_, i) => i + 1);
+    }
+    if (s.pageSelectionMode === "selected") {
+      return s.selectedPages && s.selectedPages.length > 0 ? s.selectedPages : [1];
+    }
+    const validation = validateCustomPageRangeInput(s.customPageRange, docTotal);
+    return validation.valid ? validation.pages : s.selectedPages || [1];
   };
 
   const handlePrintNow = async () => {
@@ -140,53 +228,63 @@ export default function PrintSettings() {
       return;
     }
 
-    let finalSelectedPages = Array.from({ length: totalPages }, (_, i) => i + 1);
-    if (!isImage && settings.pageSelectionMode === "selected") {
-      finalSelectedPages =
-        settings.selectedPages && settings.selectedPages.length > 0
-          ? settings.selectedPages
-          : [1];
-    } else if (!isImage && settings.pageSelectionMode === "custom") {
-      const validation = validateCustomPageRangeInput(
-        settings.customPageRange,
-        totalPages
-      );
-      if (!validation.valid) {
-        setCustomRangeError(validation.error);
-        toast.error(validation.error);
-        return;
-      }
-      finalSelectedPages = validation.pages;
-    }
+    const docsToSubmit =
+      uploadedDocuments.length > 0
+        ? uploadedDocuments
+        : [
+            {
+              file: selectedFile,
+              meta: documentMeta,
+              settings
+            }
+          ];
 
     try {
       setSubmitting(true);
-      const response = await createPrintOrder(activeSlug, {
-        file: selectedFile,
-        uploadId: documentMeta.uploadId,
-        idempotencyKey: idempotencyKeyRef.current,
-        pageSelectionMode: isImage ? "all" : settings.pageSelectionMode,
-        customPageRange:
-          !isImage && settings.pageSelectionMode === "custom"
-            ? settings.customPageRange
-            : undefined,
-        selectedPages: finalSelectedPages,
-        copies: settings.copies,
-        colorMode: settings.colorMode,
-        sides: isImage ? "single" : settings.sides,
-        paperSize: settings.paperSize,
-        orientation: settings.orientation
-      });
+      const createdOrders = [];
 
-      if (response?.success && response.order) {
-        saveCustomerOrderToken(activeSlug, response.order.token);
-        setActiveOrder(response.order);
-        toast.success("Sending to printer...");
-        navigate(`/shop/${activeSlug}/job/${response.order.token}`, {
+      for (let i = 0; i < docsToSubmit.length; i++) {
+        const docItem = docsToSubmit[i];
+        const docIsImg = docItem.meta?.documentType === "image";
+        const s = docItem.settings || settings;
+        const finalPages = resolveDocSelectedPages(docItem);
+
+        const response = await createPrintOrder(activeSlug, {
+          file: docItem.file,
+          uploadId: docItem.meta?.uploadId,
+          idempotencyKey: `${idempotencyKeyRef.current}-${i}`,
+          pageSelectionMode: docIsImg ? "all" : s.pageSelectionMode,
+          customPageRange:
+            !docIsImg && s.pageSelectionMode === "custom"
+              ? s.customPageRange
+              : undefined,
+          selectedPages: finalPages,
+          copies: s.copies,
+          colorMode: s.colorMode,
+          sides: docIsImg ? "single" : s.sides,
+          paperSize: s.paperSize,
+          orientation: s.orientation
+        });
+
+        if (response?.success && response.order) {
+          saveCustomerOrderToken(activeSlug, response.order.token);
+          createdOrders.push(response.order);
+        } else {
+          throw new Error(`Could not submit "${docItem.meta?.originalName}".`);
+        }
+      }
+
+      if (createdOrders.length > 0) {
+        setActiveOrder(createdOrders[0]);
+        setSubmittedBatchOrders(createdOrders);
+        toast.success(
+          createdOrders.length === 1
+            ? "Print request sent to shop!"
+            : `Sent ${createdOrders.length} documents to shop print queue!`
+        );
+        navigate(`/shop/${activeSlug}/job/${createdOrders[0].token}`, {
           replace: true
         });
-      } else {
-        throw new Error("Could not submit print job.");
       }
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Failed to submit print job."));
@@ -201,24 +299,148 @@ export default function PrintSettings() {
       : settings.selectedPages || [1];
 
   const totalImpressions = activeSelectedPages.length * settings.copies;
+  const activePhysicalSheets =
+    Math.ceil(activeSelectedPages.length / (!isImage && settings.sides === "duplex" ? 2 : 1)) *
+    (Number(settings.copies) || 1);
+
+  const batchSummary = uploadedDocuments.reduce(
+    (acc, docItem) => {
+      const pages = resolveDocSelectedPages(docItem);
+      const s = docItem.settings || settings;
+      const docIsImg = docItem.meta?.documentType === "image";
+      const copiesCount = Number(s.copies) || 1;
+      const sheets =
+        Math.ceil(pages.length / (!docIsImg && s.sides === "duplex" ? 2 : 1)) *
+        copiesCount;
+      acc.impressions += pages.length * copiesCount;
+      acc.sheets += sheets;
+      return acc;
+    },
+    { impressions: 0, sheets: 0 }
+  );
 
   return (
     <div className="space-y-4 pb-28">
-      <div>
-        <h1 className="text-xl sm:text-2xl font-bold text-zinc-900">
-          Printing Options
-        </h1>
-        <p className="text-xs sm:text-sm text-zinc-600 mt-0.5">
-          Shop:{" "}
-          <strong className="text-zinc-900">
-            {shopInfo?.shopName || activeSlug}
-          </strong>{" "}
-          • Printer:{" "}
-          <strong className="text-zinc-900">
-            {printerState?.printerName || "Shop Printer"}
-          </strong>
-        </p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h1 className="text-xl sm:text-2xl font-bold text-zinc-900">
+            Preview &amp; Print Settings
+          </h1>
+          <p className="text-xs sm:text-sm text-zinc-600 mt-0.5">
+            Shop:{" "}
+            <strong className="text-zinc-900">
+              {shopInfo?.shopName || activeSlug}
+            </strong>{" "}
+            • Printer:{" "}
+            <strong className="text-zinc-900">
+              {printerState?.printerName || "Shop Printer"}
+            </strong>
+          </p>
+        </div>
+
+        {/* Add Another Document Button */}
+        <div>
+          <input
+            ref={addMoreInputRef}
+            type="file"
+            multiple
+            accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"
+            onChange={handleAddMoreFiles}
+            className="hidden"
+            disabled={replacing || submitting}
+          />
+          <button
+            type="button"
+            disabled={replacing || submitting}
+            onClick={() => addMoreInputRef.current?.click()}
+            className="px-3.5 py-2 rounded-xl border border-[#8D0100]/30 bg-white hover:bg-[#8D0100]/5 text-[#8D0100] text-xs font-semibold inline-flex items-center gap-1.5 transition shadow-2xs disabled:opacity-50"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>Add Another Document</span>
+          </button>
+        </div>
       </div>
+
+      {/* Multiple Uploaded Documents List & Switcher */}
+      {uploadedDocuments.length > 1 && (
+        <div className="bg-white rounded-2xl border border-zinc-200 p-4 space-y-3 shadow-2xs">
+          <div className="flex items-center justify-between text-xs pb-2 border-b border-zinc-100">
+            <span className="font-bold uppercase tracking-wider text-zinc-500">
+              Uploaded Documents ({uploadedDocuments.length} files)
+            </span>
+            <span className="font-mono-code font-semibold text-zinc-800">
+              Total Pages: {totalBatchPages} • Est. Sheets: {batchSummary.sheets}
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            {uploadedDocuments.map((doc, idx) => {
+              const isCurrent = idx === activeDocIndex;
+              const docIsImg = doc.meta?.documentType === "image";
+              const docPages = doc.meta?.pageCount || 1;
+              return (
+                <div
+                  key={doc.id}
+                  onClick={() => setActiveDocIndex(idx)}
+                  className={`p-3 rounded-xl border flex items-center justify-between gap-3 cursor-pointer transition ${
+                    isCurrent
+                      ? "border-[#8D0100] bg-[#8D0100]/5 ring-1 ring-[#8D0100]"
+                      : "border-zinc-200 bg-zinc-50/70 hover:bg-zinc-100"
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div
+                      className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                        isCurrent
+                          ? "bg-[#8D0100] text-white"
+                          : "bg-white border border-zinc-200 text-zinc-700"
+                      }`}
+                    >
+                      {docIsImg ? (
+                        <ImageIcon className="w-4 h-4" />
+                      ) : (
+                        <FileText className="w-4 h-4" />
+                      )}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs sm:text-sm font-semibold text-zinc-900 truncate">
+                        {idx + 1}. {doc.meta?.originalName}
+                      </p>
+                      <p className="text-[11px] font-mono-code text-zinc-500">
+                        {formatFileSize(doc.meta?.fileSize)} •{" "}
+                        {docIsImg
+                          ? "1 image page"
+                          : `${docPages} ${docPages === 1 ? "page" : "pages"} PDF`}{" "}
+                        • {doc.settings?.copies || 1}x •{" "}
+                        {doc.settings?.colorMode === "color" ? "Colour" : "B&W"}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {isCurrent && (
+                      <span className="px-2 py-0.5 rounded bg-[#8D0100] text-white text-[10px] font-bold uppercase">
+                        Previewing
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        removeUploadedDocument(idx);
+                      }}
+                      title="Remove this file"
+                      className="p-1.5 rounded-lg text-zinc-400 hover:text-red-600 hover:bg-red-50 transition"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <FileCard
         originalName={documentMeta.originalName}
@@ -233,10 +455,15 @@ export default function PrintSettings() {
       />
 
       <DocumentPreview
+        file={selectedFile}
         originalName={documentMeta.originalName}
+        fileSize={documentMeta.fileSize}
         documentType={documentMeta.documentType}
         pageCount={totalPages}
+        width={documentMeta.width}
+        height={documentMeta.height}
         selectedPages={activeSelectedPages}
+        onTogglePage={handleToggleSinglePageFromPreview}
         colorMode={settings.colorMode}
         sides={settings.sides}
         paperSize={settings.paperSize}
@@ -255,54 +482,109 @@ export default function PrintSettings() {
         customRangeError={customRangeError}
       />
 
-      {/* Document Summary Card Before Printing */}
-      <div className="bg-white rounded-2xl border border-zinc-200 p-4 text-xs sm:text-sm space-y-2">
-        <div className="pb-2 border-b border-zinc-100 font-bold uppercase tracking-wider text-xs text-zinc-500">
-          Document Summary
-        </div>
-        <div className="flex items-center justify-between text-zinc-600">
-          <span>Document</span>
-          <span className="font-semibold text-zinc-900 truncate max-w-[200px]">
-            {documentMeta.originalName} ({formatFileSize(documentMeta.fileSize)})
+      {/* Final Print Summary Card */}
+      <div className="bg-white rounded-2xl border border-zinc-200 p-4 space-y-3 shadow-2xs">
+        <div className="flex items-center justify-between pb-2.5 border-b border-zinc-100">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-[#8D0100]" />
+            <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-700">
+              Final Print Summary
+            </h3>
+          </div>
+          <span className="px-2 py-0.5 rounded-md bg-zinc-100 text-zinc-800 text-[11px] font-mono-code font-semibold">
+            {uploadedDocuments.length > 1
+              ? `${uploadedDocuments.length} Documents (${totalBatchPages} total pgs)`
+              : isImage
+                ? "1 Image Document"
+                : `${totalPages} Page PDF`}
           </span>
         </div>
-        <div className="flex items-center justify-between text-zinc-600">
-          <span>Print Mode</span>
-          <span className="font-mono-code font-semibold text-zinc-900">
-            {settings.paperSize} •{" "}
-            {settings.colorMode === "color" ? "Colour" : "Black & White"} •{" "}
-            {isImage || settings.sides === "single"
-              ? "Single-sided"
-              : "Double-sided"}
-          </span>
-        </div>
-        <div className="flex items-center justify-between text-zinc-600">
-          <span>Orientation</span>
-          <span className="font-mono-code font-semibold text-zinc-900 capitalize">
-            {settings.orientation || "Portrait"}
-          </span>
-        </div>
-        <div className="flex items-center justify-between text-zinc-600">
-          <span>Pages & Copies</span>
-          <span className="font-mono-code font-semibold text-zinc-900">
-            {summarizeSelectedPages(activeSelectedPages, totalPages)} ×{" "}
-            {settings.copies} ({totalImpressions} total{" "}
-            {totalImpressions === 1 ? "page" : "pages"})
-          </span>
-        </div>
+
+        <dl className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-xs">
+          <div>
+            <dt className="text-zinc-500">Target Shop &amp; Printer</dt>
+            <dd className="font-semibold text-zinc-900 truncate mt-0.5">
+              {shopInfo?.shopName || activeSlug} •{" "}
+              {printerState?.printerName || "Shop Printer"}
+            </dd>
+          </div>
+
+          <div>
+            <dt className="text-zinc-500">Paper Size &amp; Orientation</dt>
+            <dd className="font-mono-code font-semibold text-zinc-900 capitalize mt-0.5">
+              {settings.paperSize} •{" "}
+              {settings.orientation === "auto"
+                ? documentMeta.detectedOrientation || "portrait"
+                : settings.orientation}
+            </dd>
+          </div>
+
+          <div>
+            <dt className="text-zinc-500">Colour &amp; Sides</dt>
+            <dd className="font-semibold text-zinc-900 mt-0.5">
+              {settings.colorMode === "color" ? "Full Colour" : "Black & White"} •{" "}
+              {!isImage && settings.sides === "duplex"
+                ? "Double-sided (Duplex)"
+                : "Single-sided"}
+            </dd>
+          </div>
+
+          <div>
+            <dt className="text-zinc-500">Selected Page Range</dt>
+            <dd className="font-mono-code font-semibold text-zinc-900 mt-0.5">
+              {isImage
+                ? "Page 1 of 1"
+                : summarizeSelectedPages(activeSelectedPages, totalPages)}
+            </dd>
+          </div>
+
+          <div>
+            <dt className="text-zinc-500">Copies</dt>
+            <dd className="font-mono-code font-semibold text-zinc-900 mt-0.5">
+              {settings.copies} {settings.copies === 1 ? "copy" : "copies"} (
+              {uploadedDocuments.length > 1 ? batchSummary.impressions : totalImpressions}{" "}
+              printed sides)
+            </dd>
+          </div>
+
+          <div>
+            <dt className="text-zinc-500">Total Physical Sheets Estimate</dt>
+            <dd className="font-mono-code font-bold text-[#8D0100] mt-0.5">
+              {uploadedDocuments.length > 1
+                ? `${batchSummary.sheets} ${batchSummary.sheets === 1 ? "sheet" : "sheets"}`
+                : `${activePhysicalSheets} ${activePhysicalSheets === 1 ? "sheet" : "sheets"}`}{" "}
+              of {settings.paperSize} paper
+            </dd>
+          </div>
+        </dl>
       </div>
 
       <BottomActionBar
-        summaryLabel={printerState?.online ? "Ready to print" : "Queued for shop printer"}
-        summaryValue={`${totalImpressions} ${totalImpressions === 1 ? "page" : "pages"}`}
-        summarySubtext={`${settings.paperSize} • ${
-          settings.colorMode === "color" ? "Colour" : "B&W"
-        }`}
-        primaryLabel="PRINT"
+        primaryLabel={
+          submitting
+            ? "Sending to Shop Printer..."
+            : uploadedDocuments.length > 1
+              ? `Print All ${uploadedDocuments.length} Documents`
+              : "Print Now"
+        }
         onPrimaryClick={handlePrintNow}
-        primaryDisabled={Boolean(customRangeError) || submitting || replacing}
+        primaryDisabled={submitting || replacing || Boolean(customRangeError)}
         primaryLoading={submitting}
         primaryIcon={Printer}
+        summaryLeft={
+          uploadedDocuments.length > 1
+            ? `${uploadedDocuments.length} files • ${totalBatchPages} pgs`
+            : isImage
+              ? `Image (${formatFileSize(documentMeta.fileSize)})`
+              : summarizeSelectedPages(activeSelectedPages, totalPages)
+        }
+        summaryRight={`${settings.copies}x • ${
+          uploadedDocuments.length > 1 ? batchSummary.sheets : activePhysicalSheets
+        } ${
+          (uploadedDocuments.length > 1 ? batchSummary.sheets : activePhysicalSheets) === 1
+            ? "sheet"
+            : "sheets"
+        } • ${settings.paperSize}`}
       />
     </div>
   );

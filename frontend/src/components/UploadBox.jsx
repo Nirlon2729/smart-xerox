@@ -3,6 +3,7 @@ import { FileUp, AlertCircle, FileText, Image as ImageIcon } from "lucide-react"
 
 export default function UploadBox({
   onSelectFile,
+  onSelectFiles,
   maxUploadMb = 20,
   uploading = false,
   uploadProgress = 0,
@@ -16,11 +17,18 @@ export default function UploadBox({
     fileInputRef.current?.click();
   };
 
-  const handleFileChange = (e) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      onSelectFile(file);
+  const dispatchFiles = (fileList) => {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (files.length === 0) return;
+    if (typeof onSelectFiles === "function") {
+      onSelectFiles(files);
+    } else if (typeof onSelectFile === "function") {
+      onSelectFile(files[0]);
     }
+  };
+
+  const handleFileChange = (e) => {
+    dispatchFiles(e.target.files);
     e.target.value = "";
   };
 
@@ -41,11 +49,7 @@ export default function UploadBox({
     e.stopPropagation();
     setIsDragging(false);
     if (uploading) return;
-
-    const file = e.dataTransfer?.files?.[0];
-    if (file) {
-      onSelectFile(file);
-    }
+    dispatchFiles(e.dataTransfer?.files);
   };
 
   return (
@@ -63,17 +67,18 @@ export default function UploadBox({
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        className={`rounded-2xl border p-6 sm:p-7 text-center transition select-none cursor-pointer focus:outline-none focus:ring-2 focus:ring-[#8D0100] focus:ring-offset-2 ${
+        className={`rounded-2xl border-2 border-dashed p-6 sm:p-7 text-center transition select-none cursor-pointer focus:outline-none focus:ring-2 focus:ring-[#8D0100] focus:ring-offset-2 ${
           isDragging
             ? "border-[#8D0100] bg-[#8D0100]/5"
             : error
               ? "border-red-300 bg-white"
-              : "border-zinc-200 bg-white hover:border-zinc-300"
+              : "border-zinc-300 bg-white hover:border-[#8D0100]/60 shadow-2xs"
         }`}
       >
         <input
           ref={fileInputRef}
           type="file"
+          multiple
           accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"
           onChange={handleFileChange}
           className="hidden"
@@ -89,23 +94,23 @@ export default function UploadBox({
           </div>
         </div>
 
-        <h2 className="text-base sm:text-lg font-semibold text-zinc-900">
-          {uploading ? "Uploading to MongoDB GridFS..." : "Upload Document or Image"}
+        <h2 className="text-base sm:text-lg font-bold text-zinc-900">
+          {uploading ? "Uploading & Inspecting Document..." : "Upload PDF or Image Documents"}
         </h2>
 
         <p className="text-xs sm:text-sm text-zinc-500 mt-1 max-w-xs mx-auto">
           {uploading
-            ? "Validating file contents and preparing print preview."
-            : `Supports PDF, JPG, JPEG, PNG • Max ${maxUploadMb} MB`}
+            ? "Verifying pages and preparing live print preview."
+            : `Select one or multiple PDF, JPG, JPEG, or PNG files • Max ${maxUploadMb} MB per file`}
         </p>
 
         {uploading ? (
           <div className="mt-5 max-w-xs mx-auto">
             <div className="flex items-center justify-between text-xs font-semibold text-zinc-700 mb-1.5">
-              <span>Uploading</span>
+              <span>Uploading Document</span>
               <span className="font-mono-code text-[#8D0100]">{uploadProgress}%</span>
             </div>
-            <div className="w-full h-2 bg-zinc-100 rounded-full overflow-hidden border border-zinc-200">
+            <div className="w-full h-2.5 bg-zinc-100 rounded-full overflow-hidden border border-zinc-200">
               <div
                 className="h-full bg-[#8D0100] transition-all duration-200"
                 style={{ width: `${Math.max(8, uploadProgress)}%` }}
@@ -114,9 +119,9 @@ export default function UploadBox({
           </div>
         ) : (
           <div className="mt-5">
-            <span className="inline-flex items-center justify-center gap-2 w-full sm:w-auto min-h-[50px] px-7 py-3 rounded-xl bg-[#8D0100] text-white font-semibold text-sm sm:text-base hover:bg-[#730100] active:bg-[#5e0100] transition">
+            <span className="inline-flex items-center justify-center gap-2 w-full sm:w-auto min-h-[50px] px-7 py-3 rounded-xl bg-[#8D0100] text-white font-semibold text-sm sm:text-base hover:bg-[#730100] active:bg-[#5e0100] transition shadow-xs">
               <FileUp className="w-4.5 h-4.5" />
-              <span>Upload Document</span>
+              <span>Select Document(s) to Print</span>
             </span>
           </div>
         )}

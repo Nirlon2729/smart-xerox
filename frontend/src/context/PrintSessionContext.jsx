@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from "react";
 import { fetchShopInfo, getApiErrorMessage } from "../services/api";
 
 const PrintSessionContext = createContext(null);
@@ -20,11 +20,11 @@ export function PrintSessionProvider({ children }) {
   const [shopLoading, setShopLoading] = useState(false);
   const [shopError, setShopError] = useState(null);
 
-  const [selectedFile, setSelectedFile] = useState(null);
-  const [previewObjectUrl, setPreviewObjectUrl] = useState(null);
-  const [documentMeta, setDocumentMeta] = useState(null);
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  // Multi-file staged documents list: [{ id, file, previewObjectUrl, meta, settings }]
+  const [uploadedDocuments, setUploadedDocuments] = useState([]);
+  const [activeDocIndex, setActiveDocIndex] = useState(0);
   const [activeOrder, setActiveOrder] = useState(null);
+  const [submittedBatchOrders, setSubmittedBatchOrders] = useState([]);
 
   const [printerState, setPrinterState] = useState({
     online: false,
@@ -86,21 +86,36 @@ export function PrintSessionProvider({ children }) {
     [shopSlug]
   );
 
+  const clearAllDocumentsInternal = useCallback(() => {
+    setUploadedDocuments((prev) => {
+      prev.forEach((doc) => {
+        if (doc.previewObjectUrl) {
+          try {
+            URL.revokeObjectURL(doc.previewObjectUrl);
+          } catch (_e) {
+            // Ignore revoke error
+          }
+        }
+      });
+      return [];
+    });
+    setActiveDocIndex(0);
+  }, []);
+
   const setShopSlug = useCallback(
     (newSlug) => {
       const normalized = newSlug ? String(newSlug).trim().toLowerCase() : null;
       setShopSlugState((prev) => {
         if (prev !== normalized) {
-          setSelectedFile(null);
-          setDocumentMeta(null);
-          setSettings(DEFAULT_SETTINGS);
+          clearAllDocumentsInternal();
           setActiveOrder(null);
+          setSubmittedBatchOrders([]);
           setShopError(null);
         }
         return normalized;
       });
     },
-    []
+    [clearAllDocumentsInternal]
   );
 
   useEffect(() => {
@@ -110,76 +125,201 @@ export function PrintSessionProvider({ children }) {
     return () => clearInterval(interval);
   }, [shopSlug, refreshPrinterStatus]);
 
-  useEffect(() => {
-    if (!selectedFile) {
-      setPreviewObjectUrl(null);
-      return;
-    }
-    const url = URL.createObjectURL(selectedFile);
-    setPreviewObjectUrl(url);
-    return () => {
-      URL.revokeObjectURL(url);
-    };
-  }, [selectedFile]);
-
+  // Clamp settings across all staged documents when printer capabilities change
   useEffect(() => {
     const caps = printerState?.capabilities;
     if (!caps) return;
-    setSettings((prev) => {
-      const next = { ...prev };
-      let changed = false;
-      if (!caps.supportsColor && prev.colorMode === "color") {
-        next.colorMode = "bw";
-        changed = true;
-      }
-      if (!caps.supportsDuplex && prev.sides === "duplex") {
-        next.sides = "single";
-        changed = true;
-      }
-      const allowedSizes =
-        Array.isArray(caps.supportedPaperSizes) && caps.supportedPaperSizes.length > 0
-          ? caps.supportedPaperSizes
-          : ["A4"];
-      if (!allowedSizes.includes(prev.paperSize)) {
-        next.paperSize = allowedSizes.includes("A4") ? "A4" : allowedSizes[0];
-        changed = true;
-      }
-      return changed ? next : prev;
+    const allowedSizes =
+      Array.isArray(caps.supportedPaperSizes) && caps.supportedPaperSizes.length > 0
+        ? caps.supportedPaperSizes
+        : ["A4"];
+
+    setUploadedDocuments((prev) => {
+      if (prev.length === 0) return prev;
+      let anyChanged = false;
+      const updated = prev.map((item) => {
+        const nextSettings = { ...item.settings };
+        let changed = false;
+        if (!caps.supportsColor && nextSettings.colorMode === "color") {
+          nextSettings.colorMode = "bw";
+          changed = true;
+        }
+        if (!caps.supportsDuplex && nextSettings.sides === "duplex") {
+          nextSettings.sides = "single";
+          changed = true;
+        }
+        if (!allowedSizes.includes(nextSettings.paperSize)) {
+          nextSettings.paperSize = allowedSizes.includes("A4") ? "A4" : allowedSizes[0];
+          changed = true;
+        }
+        if (changed) {
+          anyChanged = true;
+          return { ...item, settings: nextSettings };
+        }
+        return item;
+      });
+      return anyChanged ? updated : prev;
     });
   }, [printerState?.capabilities]);
 
-  const setUploadedDocument = useCallback(
+  const buildDocumentEntry = useCallback(
     (file, serverMeta) => {
-      setSelectedFile(file);
-      setDocumentMeta(serverMeta);
       const total = serverMeta?.pageCount || 1;
       const allPages = Array.from({ length: total }, (_, i) => i + 1);
       const supportedSizes = printerState?.capabilities?.supportedPaperSizes || ["A4"];
       const defaultPaper = supportedSizes.includes("A4") ? "A4" : supportedSizes[0] || "A4";
+      const previewUrl = file ? URL.createObjectURL(file) : null;
 
-      setSettings({
-        ...DEFAULT_SETTINGS,
-        paperSize: defaultPaper,
-        orientation:
-          serverMeta?.detectedOrientation === "landscape" ? "landscape" : "portrait",
-        selectedPages: allPages,
-        customPageRange: total === 1 ? "1" : `1-${total}`
-      });
-      setActiveOrder(null);
+      return {
+        id: serverMeta?.uploadId || `doc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        file,
+        previewObjectUrl: previewUrl,
+        meta: serverMeta,
+        settings: {
+          ...DEFAULT_SETTINGS,
+          paperSize: defaultPaper,
+          orientation:
+            serverMeta?.detectedOrientation === "landscape" ? "landscape" : "portrait",
+          selectedPages: allPages,
+          customPageRange: total === 1 ? "1" : `1-${total}`
+        }
+      };
     },
     [printerState]
   );
 
-  const clearDocument = useCallback(() => {
-    setSelectedFile(null);
-    setDocumentMeta(null);
-    setSettings(DEFAULT_SETTINGS);
-    setActiveOrder(null);
+  // Replaces entire list with a single document (backward compatible)
+  const setUploadedDocument = useCallback(
+    (file, serverMeta) => {
+      const entry = buildDocumentEntry(file, serverMeta);
+      setUploadedDocuments((prev) => {
+        prev.forEach((d) => {
+          if (d.previewObjectUrl) {
+            try {
+              URL.revokeObjectURL(d.previewObjectUrl);
+            } catch (_e) {
+              // Ignore
+            }
+          }
+        });
+        return [entry];
+      });
+      setActiveDocIndex(0);
+      setActiveOrder(null);
+      setSubmittedBatchOrders([]);
+    },
+    [buildDocumentEntry]
+  );
+
+  // Appends one or more documents to the uploaded list
+  const addUploadedDocument = useCallback(
+    (file, serverMeta) => {
+      const entry = buildDocumentEntry(file, serverMeta);
+      setUploadedDocuments((prev) => {
+        const next = [...prev, entry];
+        setActiveDocIndex(next.length - 1);
+        return next;
+      });
+      setActiveOrder(null);
+    },
+    [buildDocumentEntry]
+  );
+
+  // Replaces the currently active document in-place
+  const replaceActiveDocument = useCallback(
+    (file, serverMeta) => {
+      const entry = buildDocumentEntry(file, serverMeta);
+      setUploadedDocuments((prev) => {
+        if (prev.length === 0) return [entry];
+        const safeIdx = Math.min(activeDocIndex, prev.length - 1);
+        const old = prev[safeIdx];
+        if (old?.previewObjectUrl) {
+          try {
+            URL.revokeObjectURL(old.previewObjectUrl);
+          } catch (_e) {
+            // Ignore
+          }
+        }
+        const next = [...prev];
+        next[safeIdx] = entry;
+        return next;
+      });
+    },
+    [activeDocIndex, buildDocumentEntry]
+  );
+
+  // Removes a specific document by index or id
+  const removeUploadedDocument = useCallback((indexOrId) => {
+    setUploadedDocuments((prev) => {
+      const targetIdx =
+        typeof indexOrId === "number"
+          ? indexOrId
+          : prev.findIndex((d) => d.id === indexOrId);
+      if (targetIdx < 0 || targetIdx >= prev.length) return prev;
+      const target = prev[targetIdx];
+      if (target?.previewObjectUrl) {
+        try {
+          URL.revokeObjectURL(target.previewObjectUrl);
+        } catch (_e) {
+          // Ignore
+        }
+      }
+      const next = prev.filter((_, i) => i !== targetIdx);
+      setActiveDocIndex((curr) => Math.max(0, Math.min(curr, next.length - 1)));
+      return next;
+    });
   }, []);
 
-  const updateSettings = useCallback((partial) => {
-    setSettings((prev) => ({ ...prev, ...partial }));
-  }, []);
+  const clearDocument = useCallback(() => {
+    clearAllDocumentsInternal();
+    setActiveOrder(null);
+    setSubmittedBatchOrders([]);
+  }, [clearAllDocumentsInternal]);
+
+  const safeActiveIndex =
+    uploadedDocuments.length > 0
+      ? Math.min(activeDocIndex, uploadedDocuments.length - 1)
+      : 0;
+  const activeDoc = uploadedDocuments[safeActiveIndex] || null;
+
+  const updateSettings = useCallback(
+    (partial) => {
+      setUploadedDocuments((prev) => {
+        if (prev.length === 0) return prev;
+        const idx = Math.min(activeDocIndex, prev.length - 1);
+        const current = prev[idx];
+        const next = [...prev];
+        next[idx] = {
+          ...current,
+          settings: {
+            ...current.settings,
+            ...partial
+          }
+        };
+        return next;
+      });
+    },
+    [activeDocIndex]
+  );
+
+  const totalBatchPages = useMemo(() => {
+    return uploadedDocuments.reduce(
+      (sum, doc) => sum + (Number(doc.meta?.pageCount) || 1),
+      0
+    );
+  }, [uploadedDocuments]);
+
+  const totalBatchSelectedPages = useMemo(() => {
+    return uploadedDocuments.reduce((sum, doc) => {
+      const isImg = doc.meta?.documentType === "image";
+      const total = Number(doc.meta?.pageCount) || 1;
+      const selCount =
+        isImg || doc.settings?.pageSelectionMode === "all"
+          ? total
+          : doc.settings?.selectedPages?.length || 1;
+      return sum + selCount * (Number(doc.settings?.copies) || 1);
+    }, 0);
+  }, [uploadedDocuments]);
 
   return (
     <PrintSessionContext.Provider
@@ -189,17 +329,27 @@ export function PrintSessionProvider({ children }) {
         shopInfo,
         shopLoading,
         shopError,
-        pdfFile: selectedFile,
-        selectedFile,
-        previewObjectUrl,
-        documentMeta,
-        settings,
+        uploadedDocuments,
+        activeDocIndex: safeActiveIndex,
+        setActiveDocIndex,
+        addUploadedDocument,
+        replaceActiveDocument,
+        removeUploadedDocument,
+        totalBatchPages,
+        totalBatchSelectedPages,
+        pdfFile: activeDoc?.file || null,
+        selectedFile: activeDoc?.file || null,
+        previewObjectUrl: activeDoc?.previewObjectUrl || null,
+        documentMeta: activeDoc?.meta || null,
+        settings: activeDoc?.settings || DEFAULT_SETTINGS,
         updateSettings,
         printerState,
         refreshPrinterStatus: () => refreshPrinterStatus(shopSlug, false),
         shopConfig: shopInfo?.config || printerState.config,
         activeOrder,
         setActiveOrder,
+        submittedBatchOrders,
+        setSubmittedBatchOrders,
         setUploadedDocument,
         clearDocument
       }}

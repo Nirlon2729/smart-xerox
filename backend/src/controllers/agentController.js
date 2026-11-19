@@ -171,14 +171,15 @@ async function heartbeat(req, res) {
     : [];
 
   let selectedPrinterName = req.tenant.selectedPrinterName;
+  const onlinePhysicalPrinters = sanitizedPrinters.filter((p) => p.printerAvailable);
 
-  // Auto-select ONLY if no printer is selected yet and exactly one usable physical printer is detected
+  // Auto-select ONLY if no printer is selected yet and exactly one connected/online usable physical printer is detected
   if (
     !selectedPrinterName &&
     req.tenant.autoSelectSinglePrinter !== false &&
-    sanitizedPrinters.length === 1
+    onlinePhysicalPrinters.length === 1
   ) {
-    selectedPrinterName = sanitizedPrinters[0].name;
+    selectedPrinterName = onlinePhysicalPrinters[0].name;
     await Tenant.updateOne(
       { _id: req.tenantId },
       { $set: { selectedPrinterName } }

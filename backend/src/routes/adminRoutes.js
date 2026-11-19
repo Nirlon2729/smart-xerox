@@ -3,6 +3,7 @@ const asyncHandler = require("../utils/asyncHandler");
 const { requireVendorAdmin } = require("../middleware/authMiddleware");
 const {
   login,
+  changeVendorPassword,
   getAdminProfile,
   pairDesktopAgent,
   listVendorAgents,
@@ -32,8 +33,9 @@ router.get("/printers", requireVendorAdmin, asyncHandler(getVendorPrinters));
 router.put("/printers/select", requireVendorAdmin, asyncHandler(selectVendorPrinter));
 router.put("/printers/capabilities", requireVendorAdmin, asyncHandler(updateVendorPrinterCapabilities));
 
-// Vendor Shop Settings
+// Vendor Shop Settings & Password Management
 router.put("/settings", requireVendorAdmin, asyncHandler(updateVendorSettings));
+router.put("/password", requireVendorAdmin, asyncHandler(changeVendorPassword));
 
 // Tenant-Scoped Print Jobs & GridFS Document Inspection
 router.get("/orders", requireVendorAdmin, asyncHandler(listOrders));

@@ -110,6 +110,19 @@ export async function updateVendorSettings(payload) {
   return data;
 }
 
+export async function changeVendorPassword(
+  currentPassword,
+  newPassword,
+  confirmPassword = newPassword
+) {
+  const { data } = await getClient().put("/vendor/password", {
+    currentPassword,
+    newPassword,
+    confirmPassword
+  });
+  return data;
+}
+
 export async function fetchVendorOrders({ status = "ALL", search = "" } = {}) {
   const params = {};
   if (status && status !== "ALL") params.status = status;

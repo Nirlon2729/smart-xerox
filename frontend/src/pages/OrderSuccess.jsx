@@ -21,8 +21,14 @@ import { usePrintSession } from "../context/PrintSessionContext";
 export default function OrderSuccess() {
   const { shopSlug: routeShopSlug, token } = useParams();
   const navigate = useNavigate();
-  const { shopSlug, setShopSlug, shopInfo, clearDocument, printerState } =
-    usePrintSession();
+  const {
+    shopSlug,
+    setShopSlug,
+    shopInfo,
+    clearDocument,
+    printerState,
+    submittedBatchOrders
+  } = usePrintSession();
 
   const activeSlug = routeShopSlug || shopSlug;
 
@@ -109,8 +115,40 @@ export default function OrderSuccess() {
         </button>
       </div>
 
+      {/* Multi-file Batch Switcher if multiple documents were submitted together */}
+      {Array.isArray(submittedBatchOrders) && submittedBatchOrders.length > 1 && (
+        <div className="bg-white rounded-2xl border border-zinc-200 p-3.5 space-y-2">
+          <span className="block text-[11px] font-bold uppercase tracking-wider text-zinc-500">
+            Submitted Batch Jobs ({submittedBatchOrders.length} documents)
+          </span>
+          <div className="flex flex-wrap gap-2">
+            {submittedBatchOrders.map((bOrder, idx) => {
+              const isCurrent = bOrder.token === order.token;
+              return (
+                <button
+                  key={bOrder.token}
+                  type="button"
+                  onClick={() => navigate(`/shop/${activeSlug}/job/${bOrder.token}`)}
+                  className={`px-3 py-1.5 rounded-xl border text-xs font-semibold transition ${
+                    isCurrent
+                      ? "border-[#8D0100] bg-[#8D0100] text-white"
+                      : "border-zinc-200 bg-zinc-50 text-zinc-700 hover:bg-zinc-100"
+                  }`}
+                >
+                  {idx + 1}. {bOrder.originalName} ({bOrder.token})
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Live Status Card */}
-      <OrderStatus status={order.status} failureReason={order.failureReason} />
+      <OrderStatus
+        status={order.status}
+        failureReason={order.failureReason}
+        printerState={printerState}
+      />
 
       {/* Job Details Card */}
       <div className="bg-white rounded-2xl border border-zinc-200 p-4 space-y-3">

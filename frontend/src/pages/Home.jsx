@@ -47,12 +47,19 @@ export default function Home() {
     shopInfo,
     shopLoading,
     shopError,
+    uploadedDocuments,
+    activeDocIndex,
+    setActiveDocIndex,
+    addUploadedDocument,
+    replaceActiveDocument,
+    removeUploadedDocument,
+    totalBatchPages,
+    selectedFile,
     documentMeta,
     previewObjectUrl,
     printerState,
     refreshPrinterStatus,
     shopConfig,
-    setUploadedDocument,
     clearDocument
   } = usePrintSession();
 
@@ -126,57 +133,71 @@ export default function Home() {
     );
   }
 
-  const validateAndUploadFile = async (file) => {
-    if (uploading || !activeSlug) return;
-    setUploadError(null);
-
-    if (!file) return;
-
+  const validateSingleFile = (file) => {
+    if (!file) return "No file selected.";
     const lowerName = String(file.name || "").toLowerCase();
     const hasValidExt = ALLOWED_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
     const hasValidMime = ALLOWED_MIMES.includes(String(file.type || "").toLowerCase());
 
     if (!hasValidExt && !hasValidMime) {
-      const msg = "Please select a PDF, JPG, JPEG, or PNG file.";
-      setUploadError(msg);
-      toast.error(msg);
-      return;
+      return `"${file.name}": Please select a PDF, JPG, JPEG, or PNG file.`;
     }
-
     if (file.size <= 0) {
-      const msg = "The selected file is empty.";
-      setUploadError(msg);
-      toast.error(msg);
-      return;
+      return `"${file.name}" is empty.`;
     }
-
     if (file.size > maxBytes) {
-      const msg = `File exceeds the ${maxUploadMb} MB limit.`;
-      setUploadError(msg);
-      toast.error(msg);
-      return;
+      return `"${file.name}" exceeds the ${maxUploadMb} MB limit.`;
+    }
+    return null;
+  };
+
+  const validateAndUploadFiles = async (filesInput, replaceCurrent = false) => {
+    if (uploading || !activeSlug) return;
+    setUploadError(null);
+
+    const files = Array.isArray(filesInput) ? filesInput : [filesInput].filter(Boolean);
+    if (files.length === 0) return;
+
+    for (const f of files) {
+      const errMsg = validateSingleFile(f);
+      if (errMsg) {
+        setUploadError(errMsg);
+        toast.error(errMsg);
+        return;
+      }
     }
 
     try {
       setUploading(true);
       setUploadProgress(5);
 
-      const response = await inspectAndStagePdf(activeSlug, file, (percent) => {
-        setUploadProgress(percent);
-      });
+      let uploadedCount = 0;
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const response = await inspectAndStagePdf(activeSlug, f, (percent) => {
+          const overall = Math.round(((i + percent / 100) / files.length) * 100);
+          setUploadProgress(Math.max(5, Math.min(100, overall)));
+        });
 
-      if (response?.success && response.document) {
-        setUploadedDocument(file, response.document);
+        if (response?.success && response.document) {
+          if (replaceCurrent && i === 0) {
+            replaceActiveDocument(f, response.document);
+          } else {
+            addUploadedDocument(f, response.document);
+          }
+          uploadedCount++;
+        } else {
+          throw new Error(`Could not verify "${f.name}".`);
+        }
+      }
+
+      if (uploadedCount > 0) {
         toast.success(
-          response.document.documentType === "image"
-            ? "Image uploaded"
-            : `PDF uploaded (${response.document.pageCount} ${
-                response.document.pageCount === 1 ? "page" : "pages"
-              })`
+          uploadedCount === 1
+            ? `Uploaded ${files[0].name}`
+            : `Uploaded ${uploadedCount} documents`
         );
         navigate(`/shop/${activeSlug}/settings`);
-      } else {
-        throw new Error("Could not verify document.");
       }
     } catch (err) {
       const message = getApiErrorMessage(
@@ -192,7 +213,11 @@ export default function Home() {
   };
 
   const handleRemoveFile = () => {
-    clearDocument();
+    if (uploadedDocuments.length > 1) {
+      removeUploadedDocument(activeDocIndex);
+    } else {
+      clearDocument();
+    }
     setUploadError(null);
   };
 
@@ -281,10 +306,11 @@ export default function Home() {
         )}
       </div>
 
-      {/* Upload Box or Currently Staged Document */}
+      {/* Upload Box or Currently Staged Document(s) */}
       {!documentMeta ? (
         <UploadBox
-          onSelectFile={validateAndUploadFile}
+          onSelectFile={(f) => validateAndUploadFiles([f], false)}
+          onSelectFiles={(files) => validateAndUploadFiles(files, false)}
           maxUploadMb={maxUploadMb}
           uploading={uploading}
           uploadProgress={uploadProgress}
@@ -292,6 +318,43 @@ export default function Home() {
         />
       ) : (
         <div className="space-y-4">
+          {uploadedDocuments.length > 1 && (
+            <div className="bg-white rounded-2xl border border-zinc-200 p-3.5 space-y-2.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-bold uppercase tracking-wider text-zinc-500">
+                  Uploaded Documents ({uploadedDocuments.length})
+                </span>
+                <span className="font-mono-code font-semibold text-zinc-800">
+                  Total: {totalBatchPages} {totalBatchPages === 1 ? "page" : "pages"}
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {uploadedDocuments.map((doc, idx) => {
+                  const active = idx === activeDocIndex;
+                  return (
+                    <button
+                      key={doc.id}
+                      type="button"
+                      onClick={() => setActiveDocIndex(idx)}
+                      className={`px-3 py-1.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition ${
+                        active
+                          ? "border-[#8D0100] bg-[#8D0100] text-white"
+                          : "border-zinc-200 bg-zinc-50 text-zinc-700 hover:bg-zinc-100"
+                      }`}
+                    >
+                      <span className="truncate max-w-[140px]">
+                        {doc.meta?.originalName}
+                      </span>
+                      <span className="font-mono-code text-[10px] opacity-80">
+                        ({doc.meta?.pageCount || 1}p)
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <FileCard
             originalName={documentMeta.originalName}
             fileSize={documentMeta.fileSize}
@@ -300,14 +363,18 @@ export default function Home() {
             width={documentMeta.width}
             height={documentMeta.height}
             onRemove={handleRemoveFile}
-            onReplace={validateAndUploadFile}
+            onReplace={(f) => validateAndUploadFiles([f], true)}
             disabled={uploading}
           />
 
           <DocumentPreview
+            file={selectedFile}
             originalName={documentMeta.originalName}
+            fileSize={documentMeta.fileSize}
             documentType={documentMeta.documentType}
             pageCount={documentMeta.pageCount}
+            width={documentMeta.width}
+            height={documentMeta.height}
             selectedPages={Array.from({ length: documentMeta.pageCount || 1 }, (_, i) => i + 1)}
             previewObjectUrl={previewObjectUrl}
           />

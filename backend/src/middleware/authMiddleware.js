@@ -18,9 +18,23 @@ async function requireAuth(req, res, next) {
     }
 
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const admin = await Admin.findById(payload.sub).select("_id name email role tenantId active");
+    const admin = await Admin.findById(payload.sub).select(
+      "_id name email role tenantId active passwordChangedAt"
+    );
     if (!admin || !admin.active) {
       return res.status(401).json({ success: false, message: "Invalid or inactive account session" });
+    }
+
+    if (admin.passwordChangedAt && payload.iat) {
+      const changedTimestampSec = Math.floor(
+        new Date(admin.passwordChangedAt).getTime() / 1000
+      );
+      if (payload.iat < changedTimestampSec - 1) {
+        return res.status(401).json({
+          success: false,
+          message: "Session expired after password change. Please sign in again."
+        });
+      }
     }
 
     req.admin = admin;

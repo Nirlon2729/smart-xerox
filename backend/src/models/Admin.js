@@ -20,7 +20,7 @@ const adminSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["SUPER_ADMIN", "VENDOR_ADMIN", "OWNER", "STAFF"],
+      enum: ["SUPER_ADMIN", "VENDOR", "VENDOR_ADMIN", "OWNER", "STAFF"],
       default: "VENDOR_ADMIN"
     },
     tenantId: {
@@ -34,6 +34,10 @@ const adminSchema = new mongoose.Schema(
       default: true
     },
     lastLoginAt: {
+      type: Date,
+      default: null
+    },
+    passwordChangedAt: {
       type: Date,
       default: null
     }

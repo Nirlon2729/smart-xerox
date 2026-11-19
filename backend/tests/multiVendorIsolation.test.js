@@ -150,23 +150,131 @@ async function runTests() {
       !vendorA.publicUrl.includes("localhost") && !vendorA.publicUrl.includes("192.168."),
       `QR publicUrl must not contain localhost or LAN IP: ${vendorA.publicUrl}`
     );
-    console.log(`  PASS: Created Vendor A (${vendorA.shopSlug}) & Vendor B (${vendorB.shopSlug}).`);
 
-    // 3. Vendor Logins & Desktop Pairing
-    console.log("\n[3/8] Signing in Vendor A & Vendor B and pairing isolated Desktop Agents...");
+    // Prevent duplicate email address (409)
+    const dupEmailRes = await apiRequest(baseUrl, "POST", "/super-admin/vendors", {
+      headers: { Authorization: `Bearer ${superToken}` },
+      body: {
+        shopName: `Duplicate Email Shop`,
+        email: `alpha.${runSuffix}@smartxerox.test`,
+        password: "AlphaPassword123!"
+      }
+    });
+    assert.strictEqual(dupEmailRes.status, 409, "Duplicate vendor email must be rejected with 409");
+
+    // Prevent duplicate explicit shopSlug (409)
+    const dupSlugRes = await apiRequest(baseUrl, "POST", "/super-admin/vendors", {
+      headers: { Authorization: `Bearer ${superToken}` },
+      body: {
+        shopName: `Duplicate Slug Shop`,
+        shopSlug: `alpha-xerox-${runSuffix}`,
+        email: `unique.${runSuffix}@smartxerox.test`,
+        password: "AlphaPassword123!"
+      }
+    });
+    assert.strictEqual(dupSlugRes.status, 409, "Duplicate explicit shopSlug must be rejected with 409");
+    console.log(`  PASS: Created Vendor A (${vendorA.shopSlug}) & Vendor B (${vendorB.shopSlug}); duplicate email & slug blocked.`);
+
+    // 3. Vendor Logins, Role Verification, Suspension & Desktop Pairing
+    console.log("\n[3/8] Signing in Vendor A & Vendor B, testing invalid/suspended login, and pairing Desktop Agents...");
+    const invalidLogin = await apiRequest(baseUrl, "POST", "/vendor/login", {
+      body: { email: `alpha.${runSuffix}@smartxerox.test`, password: "WrongPassword!" }
+    });
+    assert.strictEqual(invalidLogin.status, 401, "Invalid vendor credentials must return 401");
+
+    // Vendor A must be blocked from logging into /api/super-admin/login (403)
+    const vendorTrySuperLogin = await apiRequest(baseUrl, "POST", "/super-admin/login", {
+      body: { email: `alpha.${runSuffix}@smartxerox.test`, password: "AlphaPassword123!" }
+    });
+    assert.strictEqual(vendorTrySuperLogin.status, 403, "Vendor account must be denied Super Admin login (403)");
+
+    // Suspend Vendor A -> login must fail with 403
+    const suspendARes = await apiRequest(
+      baseUrl,
+      "PATCH",
+      `/super-admin/vendors/${vendorA.id}/status`,
+      {
+        headers: { Authorization: `Bearer ${superToken}` },
+        body: { status: "SUSPENDED" }
+      }
+    );
+    assert.strictEqual(suspendARes.status, 200);
+    const suspendedLogin = await apiRequest(baseUrl, "POST", "/vendor/login", {
+      body: { email: `alpha.${runSuffix}@smartxerox.test`, password: "AlphaPassword123!" }
+    });
+    assert.strictEqual(suspendedLogin.status, 403, "Suspended vendor login must be rejected with 403");
+
+    // Reactivate Vendor A -> login succeeds
+    const activateARes = await apiRequest(
+      baseUrl,
+      "PATCH",
+      `/super-admin/vendors/${vendorA.id}/status`,
+      {
+        headers: { Authorization: `Bearer ${superToken}` },
+        body: { status: "ACTIVE" }
+      }
+    );
+    assert.strictEqual(activateARes.status, 200);
+
     const loginA1 = await apiRequest(baseUrl, "POST", "/vendor/login", {
       body: { email: `alpha.${runSuffix}@smartxerox.test`, password: "AlphaPassword123!" }
     });
-    const loginA2 = await apiRequest(baseUrl, "POST", "/vendor/login", {
-      body: { email: `alpha.${runSuffix}@smartxerox.test`, password: "AlphaPassword123!" }
-    });
     assert.strictEqual(loginA1.status, 200);
+    assert.strictEqual(loginA1.data.vendor.role, "VENDOR_ADMIN");
+
+    // Test password change validations: wrong current password (401), mismatched confirm (400), reusing current password (400)
+    const wrongCurrentPw = await apiRequest(baseUrl, "PUT", "/vendor/password", {
+      headers: { Authorization: `Bearer ${loginA1.data.token}` },
+      body: {
+        currentPassword: "WrongCurrentPassword!",
+        newPassword: "AlphaNewPassword456!",
+        confirmPassword: "AlphaNewPassword456!"
+      }
+    });
+    assert.strictEqual(wrongCurrentPw.status, 401, "Wrong current password must return 401");
+
+    const mismatchConfirmPw = await apiRequest(baseUrl, "PUT", "/vendor/password", {
+      headers: { Authorization: `Bearer ${loginA1.data.token}` },
+      body: {
+        currentPassword: "AlphaPassword123!",
+        newPassword: "AlphaNewPassword456!",
+        confirmPassword: "DifferentConfirmPassword!"
+      }
+    });
+    assert.strictEqual(mismatchConfirmPw.status, 400, "Mismatched confirm password must return 400");
+
+    const reuseCurrentPw = await apiRequest(baseUrl, "PUT", "/vendor/password", {
+      headers: { Authorization: `Bearer ${loginA1.data.token}` },
+      body: {
+        currentPassword: "AlphaPassword123!",
+        newPassword: "AlphaPassword123!",
+        confirmPassword: "AlphaPassword123!"
+      }
+    });
+    assert.strictEqual(reuseCurrentPw.status, 400, "Reusing current password must return 400");
+
+    // Vendor A changes their own password via PUT /api/vendor/password
+    const changePwRes = await apiRequest(baseUrl, "PUT", "/vendor/password", {
+      headers: { Authorization: `Bearer ${loginA1.data.token}` },
+      body: {
+        currentPassword: "AlphaPassword123!",
+        newPassword: "AlphaNewPassword456!",
+        confirmPassword: "AlphaNewPassword456!"
+      }
+    });
+    assert.strictEqual(changePwRes.status, 200, "Vendor password change must succeed");
+    assert.ok(changePwRes.data.token, "Fresh JWT must be returned after password change");
+
+    const loginA2 = await apiRequest(baseUrl, "POST", "/vendor/login", {
+      body: { email: `alpha.${runSuffix}@smartxerox.test`, password: "AlphaNewPassword456!" }
+    });
+    assert.strictEqual(loginA2.status, 200);
     assert.strictEqual(
       loginA1.data.tenant.publicUrl,
       loginA2.data.tenant.publicUrl,
       "Shop QR URL must remain permanent across multiple logins"
     );
-    const tokenA = loginA1.data.token;
+    const tokenA = loginA2.data.token;
 
     const loginB = await apiRequest(baseUrl, "POST", "/vendor/login", {
       body: { email: `beta.${runSuffix}@smartxerox.test`, password: "BetaPassword123!" }

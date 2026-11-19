@@ -1,0 +1,35 @@
+SMART XEROX — VENDOR DESKTOP CONSOLE & PRINT AGENT (v3.1)
+"Smart Printing. Simplified."
+========================================================================
+
+1. PRODUCT OVERVIEW
+Smart Xerox is a commercial Multi-Vendor Instant QR Printing Platform for
+Windows 10 and Windows 11. This installation package includes:
+  • Smart Xerox Vendor Desktop Console (Electron Desktop Application)
+  • Self-Contained Python 3.13 Print Agent Runtime (PyMuPDF, Pillow, pywin32)
+  • Universal Windows Print Spooler & USB Hardware Detection Engine
+  • Windows DPAPI Encrypted Vendor Credential Store
+
+No separate Node.js or Python installation is required on this computer.
+
+2. LICENSE & AUTHORIZED USE
+Copyright (c) 2026 Smart Xerox Platform. All rights reserved.
+
+Permission is hereby granted to authorized Xerox and print shop vendors to
+install and operate this software on Windows computers connected to their
+shop printers for receiving and processing customer print jobs through the
+Smart Xerox Cloud Platform.
+
+3. DATA PRIVACY & MULTI-VENDOR SECURITY
+  • Every vendor account operates in an isolated tenant environment.
+  • Vendor login tokens and print agent credentials are encrypted locally
+    using Windows Data Protection API (DPAPI / Electron safeStorage).
+  • Customer documents are streamed over HTTPS strictly to the authorized
+    shop's paired print agent, verified by SHA-256 checksum, and cleaned up
+    automatically after printing.
+
+4. PRINTER DRIVER REQUIREMENT
+Smart Xerox supports USB, Wi-Fi, Network, and Shared printers from HP, Canon,
+Epson, Brother, Xerox, Ricoh, Kyocera, Samsung, Pantum, Lexmark, and other
+Windows-compatible manufacturers, provided the official Windows printer
+driver is installed and recognized by the Windows Print Spooler.

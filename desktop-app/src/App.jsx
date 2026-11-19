@@ -27,7 +27,10 @@ import {
   Sun,
   Moon,
   Lock,
-  Server
+  Server,
+  Eye,
+  EyeOff,
+  UserCheck
 } from "lucide-react";
 import {
   configureDesktopApi,
@@ -38,6 +41,7 @@ import {
   selectVendorPrinter,
   updatePrinterCapabilities,
   updateVendorSettings,
+  changeVendorPassword,
   fetchVendorOrders,
   cancelVendorOrder,
   reprintVendorOrder,
@@ -162,6 +166,17 @@ export default function App() {
     autoStartWithWindows: true
   });
   const [savingSettings, setSavingSettings] = useState(false);
+  const [passwordForm, setPasswordForm] = useState({
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: ""
+  });
+  const [showPasswords, setShowPasswords] = useState({
+    current: false,
+    next: false,
+    confirm: false
+  });
+  const [changingPassword, setChangingPassword] = useState(false);
 
   const isDark = theme === "dark";
 
@@ -432,15 +447,18 @@ export default function App() {
       .catch(() => {});
   }, [resolvedShopUrl]);
 
-  // Automatic single-printer selection if only 1 compatible physical printer is detected
+  // Automatic single-printer selection ONLY if 1 connected & ready physical printer is detected
   useEffect(() => {
+    const connectedPhysical = localPrinters.filter(
+      (p) => p.printerAvailable && !p.isVirtual && p.printerCategory !== "VIRTUAL"
+    );
     if (
       session.vendorToken &&
       session.tenant &&
       !session.tenant.selectedPrinterName &&
-      localPrinters.length === 1
+      connectedPhysical.length === 1
     ) {
-      const singlePrinterName = localPrinters[0].name;
+      const singlePrinterName = connectedPhysical[0].name;
       selectVendorPrinter(singlePrinterName, true)
         .then((res) => {
           if (res?.tenant) {
@@ -469,6 +487,13 @@ export default function App() {
 
       if (!res?.success || !res.token) {
         throw new Error("Login failed");
+      }
+
+      const vendorUser = res.vendor || res.admin;
+      const validVendorRoles = ["VENDOR", "VENDOR_ADMIN", "OWNER", "SUPER_ADMIN"];
+      if (!vendorUser || !validVendorRoles.includes(vendorUser.role)) {
+        toast.error("This account does not have a valid Vendor role.");
+        return;
       }
 
       if (!res.tenant) {
@@ -661,6 +686,67 @@ export default function App() {
     }
   };
 
+  const handleChangeVendorPassword = async (e) => {
+    e.preventDefault();
+    if (
+      changingPassword ||
+      !passwordForm.currentPassword ||
+      !passwordForm.newPassword ||
+      !passwordForm.confirmPassword
+    ) {
+      return;
+    }
+
+    if (passwordForm.newPassword.length < 6) {
+      toast.error("New password must be at least 6 characters long.");
+      return;
+    }
+
+    if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+      toast.error("New password and confirm password do not match.");
+      return;
+    }
+
+    if (passwordForm.newPassword === passwordForm.currentPassword) {
+      toast.error("New password must be different from your current password.");
+      return;
+    }
+
+    try {
+      setChangingPassword(true);
+      const res = await changeVendorPassword(
+        passwordForm.currentPassword,
+        passwordForm.newPassword,
+        passwordForm.confirmPassword
+      );
+      if (res?.success) {
+        if (res.token) {
+          configureDesktopApi({
+            apiBaseUrl: session.apiBaseUrl,
+            vendorToken: res.token
+          });
+          setSession((prev) => ({ ...prev, vendorToken: res.token }));
+          if (window.electronAPI) {
+            await window.electronAPI.saveSession({
+              apiBaseUrl: session.apiBaseUrl,
+              vendorToken: res.token
+            });
+          }
+        }
+        toast.success(res.message || "Vendor password updated successfully.");
+        setPasswordForm({
+          currentPassword: "",
+          newPassword: "",
+          confirmPassword: ""
+        });
+      }
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, "Failed to update password"));
+    } finally {
+      setChangingPassword(false);
+    }
+  };
+
   const handleToggleTheme = async () => {
     const nextTheme = theme === "dark" ? "light" : "dark";
     setTheme(nextTheme);
@@ -788,60 +874,50 @@ export default function App() {
           </div>
 
           <div className="p-3.5 rounded-xl bg-zinc-50 border border-zinc-200/80 text-xs text-zinc-600 leading-relaxed">
-            Sign in with your Xerox Shop vendor account to pair this Windows computer, automatically detect connected printers, and receive customer print jobs.
+            Sign in with your unique Xerox Shop vendor email and password to pair this Windows computer, automatically detect connected printers, and receive customer print jobs for your shop.
           </div>
 
           <form onSubmit={handleVendorLogin} className="space-y-4">
             <div>
               <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-                Vendor Email Address
+                Vendor Email
               </label>
               <input
                 type="email"
                 required
                 value={loginEmail}
                 onChange={(e) => setLoginEmail(e.target.value)}
-                placeholder="shopkeeper@smartxerox.com"
+                placeholder="vendor@yourxeroxshop.com"
                 className="w-full h-11 px-3.5 rounded-xl border border-zinc-300 text-sm focus:border-[#8D0100] focus:outline-none"
               />
             </div>
 
             <div>
               <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-                Password
+                Vendor Password
               </label>
               <input
                 type="password"
                 required
                 value={loginPassword}
                 onChange={(e) => setLoginPassword(e.target.value)}
-                placeholder="Enter your password"
+                placeholder="Enter your vendor password"
                 className="w-full h-11 px-3.5 rounded-xl border border-zinc-300 text-sm focus:border-[#8D0100] focus:outline-none"
               />
             </div>
 
             <div>
-              <button
-                type="button"
-                onClick={() => setShowServerConfig((v) => !v)}
-                className="text-xs font-semibold text-zinc-500 hover:text-zinc-800 inline-flex items-center gap-1.5"
-              >
-                <Server className="w-3.5 h-3.5" />
-                <span>{showServerConfig ? "Hide Cloud Server URL" : "Cloud Server Connection"}</span>
-              </button>
-
-              {showServerConfig && (
-                <div className="mt-2">
-                  <input
-                    type="url"
-                    required
-                    value={loginApiUrl}
-                    onChange={(e) => setLoginApiUrl(e.target.value)}
-                    placeholder="https://smart-xerox-api.onrender.com/api"
-                    className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-xs font-mono-code focus:border-[#8D0100] focus:outline-none"
-                  />
-                </div>
-              )}
+              <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
+                Cloud Server URL
+              </label>
+              <input
+                type="url"
+                required
+                value={loginApiUrl}
+                onChange={(e) => setLoginApiUrl(e.target.value)}
+                placeholder="https://smart-xerox-api.onrender.com/api"
+                className="w-full h-10 px-3.5 rounded-xl border border-zinc-300 text-xs font-mono-code focus:border-[#8D0100] focus:outline-none"
+              />
             </div>
 
             <button
@@ -850,7 +926,7 @@ export default function App() {
               className="w-full h-11 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-sm font-semibold transition flex items-center justify-center gap-2 disabled:opacity-50"
             >
               <Lock className="w-4 h-4" />
-              <span>{loggingIn ? "Signing In & Pairing Agent..." : "Sign In & Connect Printer"}</span>
+              <span>{loggingIn ? "Signing In & Pairing Agent..." : "Vendor Sign In & Connect Printer"}</span>
             </button>
           </form>
 
@@ -918,28 +994,31 @@ export default function App() {
     ? [...mergedPhysicalPrinters, ...localVirtualPrinters]
     : mergedPhysicalPrinters;
 
+  const connectedPhysicalPrinters = mergedPhysicalPrinters.filter(
+    (p) => p.printerAvailable
+  );
+
   const requiresManualPrinterSelection =
-    !selectedPrinterPref && basePhysicalPrinters.length > 1;
+    !selectedPrinterPref && connectedPhysicalPrinters.length > 1;
 
   const activePrinterName =
     selectedPrinterPref ||
-    (basePhysicalPrinters.length === 1
-      ? basePhysicalPrinters[0].name
+    (connectedPhysicalPrinters.length === 1
+      ? connectedPhysicalPrinters[0].name
       : requiresManualPrinterSelection
         ? "Multiple Printers Detected — Select One"
-        : "No Printer Detected");
+        : "NO PRINTER DETECTED");
 
   const activeLocalPrinterObj =
     mergedPhysicalPrinters.find(
       (p) => p.name.toLowerCase() === String(activePrinterName).toLowerCase()
     ) ||
-    (basePhysicalPrinters.length === 1 ? basePhysicalPrinters[0] : null);
+    (connectedPhysicalPrinters.length === 1 ? connectedPhysicalPrinters[0] : null);
 
   const isPrinterOnline = Boolean(
     !requiresManualPrinterSelection &&
-      (activeLocalPrinterObj
-        ? activeLocalPrinterObj.printerAvailable
-        : printerState?.printerAvailable)
+      activeLocalPrinterObj &&
+      activeLocalPrinterObj.printerAvailable
   );
   const isAgentOnline = Boolean(localAgentStatus.running || printerState?.agentOnline);
 
@@ -1202,26 +1281,57 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold uppercase tracking-wider text-zinc-500">
-                      Selected Printer
+                      {isPrinterOnline
+                        ? "Printer Detected"
+                        : activeLocalPrinterObj
+                          ? "Selected Printer"
+                          : "Printer Status"}
                     </span>
                     <span
                       className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
                         isPrinterOnline
                           ? "bg-emerald-50 text-emerald-800 border-emerald-200"
-                          : "bg-amber-50 text-amber-800 border-amber-200"
+                          : activeLocalPrinterObj
+                            ? "bg-amber-50 text-amber-800 border-amber-200"
+                            : "bg-zinc-100 text-zinc-700 border-zinc-200"
                       }`}
                     >
-                      {isPrinterOnline ? "Online & Ready" : "Offline"}
+                      {isPrinterOnline
+                        ? "Status: Ready"
+                        : activeLocalPrinterObj
+                          ? "Offline"
+                          : "No Printer Detected"}
                     </span>
                   </div>
                   <h3 className="text-base font-bold mt-2 truncate">
-                    {activePrinterName}
+                    {activeLocalPrinterObj ? activeLocalPrinterObj.name : "NO PRINTER DETECTED"}
                   </h3>
-                  <p className="text-xs text-zinc-500 mt-1 truncate">
-                    {activeLocalPrinterObj?.statusMessage ||
-                      printerState?.statusMessage ||
-                      "Connect USB or network printer"}
+                  <p className="text-xs text-zinc-500 mt-1 line-clamp-2">
+                    {isPrinterOnline
+                      ? `Connection: ${activeLocalPrinterObj?.connectionType || "USB"} • Status: Ready (${activeLocalPrinterObj?.portName || "Connected"})`
+                      : activeLocalPrinterObj?.statusMessage ||
+                        "Connect your printer to this computer using USB or configure a supported network printer."}
                   </p>
+                  <div className="mt-3 pt-2.5 border-t border-zinc-100 flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      onClick={() => refreshLocalPrinters(true)}
+                      disabled={discoveringPrinters}
+                      className="text-xs font-semibold text-[#8D0100] hover:underline inline-flex items-center gap-1"
+                    >
+                      <RefreshCw
+                        className={`w-3 h-3 ${discoveringPrinters ? "animate-spin" : ""}`}
+                      />
+                      <span>Scan Printers</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("printers")}
+                      className="text-xs font-semibold text-zinc-600 hover:text-zinc-900"
+                    >
+                      Manage Printers →
+                    </button>
+                  </div>
                 </div>
 
                 <div
@@ -1459,17 +1569,39 @@ export default function App() {
                   </div>
                 </div>
 
-                {mergedPrinters.length === 0 ? (
-                  <div className="py-10 text-center space-y-3">
-                    <AlertTriangle className="w-8 h-8 text-amber-500 mx-auto" />
-                    <p className="text-sm font-bold">
-                      No Physical Windows Printers Detected
-                    </p>
-                    <p className="text-xs text-zinc-500 max-w-lg mx-auto leading-relaxed">
-                      Connect your printer via USB cable, Wi-Fi, or Ethernet network and ensure the manufacturer&apos;s official Windows printer driver (HP, Canon, Epson, Brother, Xerox, Ricoh, Kyocera, etc.) is installed in Windows Settings → Bluetooth &amp; devices → Printers &amp; scanners. Smart Xerox will detect it automatically without restarting.
-                    </p>
+                {connectedPhysicalPrinters.length === 0 && (
+                  <div className="mt-4 rounded-2xl border-2 border-dashed border-zinc-300 bg-zinc-50/80 p-8 text-center space-y-3">
+                    <div className="w-14 h-14 rounded-2xl bg-[#8D0100]/10 text-[#8D0100] flex items-center justify-center mx-auto">
+                      <Printer className="w-7 h-7" />
+                    </div>
+                    <div>
+                      <span className="inline-block px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[11px] font-bold uppercase tracking-wider mb-1.5">
+                        NO PRINTER DETECTED
+                      </span>
+                      <h4 className="text-base font-bold text-zinc-900">
+                        NO PRINTER DETECTED
+                      </h4>
+                      <p className="text-xs text-zinc-600 max-w-md mx-auto mt-1 leading-relaxed">
+                        Connect your printer to this computer using USB or configure a supported network printer. Once connected and powered on, click Scan Printers below.
+                      </p>
+                    </div>
+                    <div className="pt-1">
+                      <button
+                        type="button"
+                        onClick={() => refreshLocalPrinters(true)}
+                        disabled={discoveringPrinters}
+                        className="px-4 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold inline-flex items-center gap-2 shadow-2xs"
+                      >
+                        <RefreshCw
+                          className={`w-3.5 h-3.5 ${discoveringPrinters ? "animate-spin" : ""}`}
+                        />
+                        <span>{discoveringPrinters ? "Scanning Windows Printers..." : "Scan Printers"}</span>
+                      </button>
+                    </div>
                   </div>
-                ) : (
+                )}
+
+                {mergedPrinters.length > 0 && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
                     {mergedPrinters.map((p) => {
                       const isVirtual = Boolean(
@@ -2180,20 +2312,273 @@ export default function App() {
           )}
 
           {/* ================================================================
-              SECTION 7: SETTINGS
+              SECTION 7: SETTINGS & VENDOR ACCOUNT MANAGEMENT
               ================================================================ */}
           {activeTab === "settings" && (
-            <div
-              className={`rounded-2xl border p-6 max-w-2xl space-y-5 ${
-                isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
-              }`}
-            >
-              <div>
-                <h3 className="text-base font-bold">Shop & Desktop Settings</h3>
-                <p className="text-xs text-zinc-500 mt-0.5">
-                  Configure your Xerox shop profile, customer limits, and Windows startup preferences.
-                </p>
+            <div className="max-w-3xl space-y-6">
+              {/* 1. VENDOR ACCOUNT INFORMATION CARD */}
+              <div
+                className={`rounded-2xl border p-6 space-y-4 ${
+                  isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-zinc-100">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-[#8D0100]/10 text-[#8D0100] flex items-center justify-center shrink-0">
+                      <UserCheck className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-base font-bold">Vendor Account Information</h3>
+                      <p className="text-xs text-zinc-500">
+                        Authenticated multi-vendor shop profile and tenant credentials.
+                      </p>
+                    </div>
+                  </div>
+                  <span
+                    className={`px-2.5 py-1 rounded-md text-xs font-semibold border ${
+                      session.tenant?.status === "ACTIVE"
+                        ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                        : "bg-red-50 text-red-700 border-red-200"
+                    }`}
+                  >
+                    Account {session.tenant?.status || "ACTIVE"}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                  <div className="p-3 rounded-xl bg-zinc-50 border border-zinc-200/80 text-zinc-800">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 block">
+                      Shop Name
+                    </span>
+                    <span className="text-sm font-bold text-zinc-900 mt-0.5 block">
+                      {session.tenant?.shopName || "N/A"}
+                    </span>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-zinc-50 border border-zinc-200/80 text-zinc-800">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 block">
+                      Vendor Name &amp; Login Email
+                    </span>
+                    <span className="text-sm font-bold text-zinc-900 mt-0.5 block truncate">
+                      {session.admin?.name || "Shop Owner"} ({session.admin?.email || "N/A"})
+                    </span>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-zinc-50 border border-zinc-200/80 text-zinc-800">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 block">
+                      Unique Shop Slug &amp; Customer URL
+                    </span>
+                    <span className="font-mono-code font-semibold text-zinc-900 mt-0.5 block truncate">
+                      /shop/{session.tenant?.shopSlug}
+                    </span>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-zinc-50 border border-zinc-200/80 text-zinc-800">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 block">
+                      Account Role &amp; Tenant ID
+                    </span>
+                    <span className="font-mono-code font-semibold text-zinc-900 mt-0.5 block truncate">
+                      {session.admin?.role || "VENDOR_ADMIN"} • {session.tenant?.id || session.tenant?.tenantId}
+                    </span>
+                  </div>
+                </div>
               </div>
+
+              {/* 2. DEDICATED CHANGE PASSWORD SECTION */}
+              <div
+                className={`rounded-2xl border p-6 space-y-4 ${
+                  isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
+                }`}
+              >
+                <div className="flex items-center gap-3 pb-3 border-b border-zinc-100">
+                  <div className="w-10 h-10 rounded-xl bg-[#8D0100]/10 text-[#8D0100] flex items-center justify-center shrink-0">
+                    <Lock className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold">Change Vendor Password</h3>
+                    <p className="text-xs text-zinc-500">
+                      Update the password for <strong>{session.admin?.email}</strong>. Your current password is verified on the server and existing sessions are rotated securely.
+                    </p>
+                  </div>
+                </div>
+
+                <form onSubmit={handleChangeVendorPassword} className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                        1. Current Password *
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={showPasswords.current ? "text" : "password"}
+                          required
+                          value={passwordForm.currentPassword}
+                          onChange={(e) =>
+                            setPasswordForm({
+                              ...passwordForm,
+                              currentPassword: e.target.value
+                            })
+                          }
+                          placeholder="Enter current password"
+                          className="w-full h-10 pl-3 pr-9 rounded-lg border border-zinc-300 text-xs focus:border-[#8D0100] focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setShowPasswords((prev) => ({
+                              ...prev,
+                              current: !prev.current
+                            }))
+                          }
+                          aria-label="Toggle current password visibility"
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-700"
+                        >
+                          {showPasswords.current ? (
+                            <EyeOff className="w-4 h-4" />
+                          ) : (
+                            <Eye className="w-4 h-4" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                        2. New Password * (min 6 chars)
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={showPasswords.next ? "text" : "password"}
+                          required
+                          minLength={6}
+                          value={passwordForm.newPassword}
+                          onChange={(e) =>
+                            setPasswordForm({
+                              ...passwordForm,
+                              newPassword: e.target.value
+                            })
+                          }
+                          placeholder="Enter new password"
+                          className="w-full h-10 pl-3 pr-9 rounded-lg border border-zinc-300 text-xs focus:border-[#8D0100] focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setShowPasswords((prev) => ({
+                              ...prev,
+                              next: !prev.next
+                            }))
+                          }
+                          aria-label="Toggle new password visibility"
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-700"
+                        >
+                          {showPasswords.next ? (
+                            <EyeOff className="w-4 h-4" />
+                          ) : (
+                            <Eye className="w-4 h-4" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                        3. Confirm New Password *
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={showPasswords.confirm ? "text" : "password"}
+                          required
+                          minLength={6}
+                          value={passwordForm.confirmPassword}
+                          onChange={(e) =>
+                            setPasswordForm({
+                              ...passwordForm,
+                              confirmPassword: e.target.value
+                            })
+                          }
+                          placeholder="Confirm new password"
+                          className="w-full h-10 pl-3 pr-9 rounded-lg border border-zinc-300 text-xs focus:border-[#8D0100] focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setShowPasswords((prev) => ({
+                              ...prev,
+                              confirm: !prev.confirm
+                            }))
+                          }
+                          aria-label="Toggle confirm password visibility"
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-700"
+                        >
+                          {showPasswords.confirm ? (
+                            <EyeOff className="w-4 h-4" />
+                          ) : (
+                            <Eye className="w-4 h-4" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {passwordForm.newPassword && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span
+                        className={
+                          passwordForm.newPassword.length >= 8
+                            ? "text-emerald-700 font-semibold"
+                            : passwordForm.newPassword.length >= 6
+                              ? "text-amber-700 font-semibold"
+                              : "text-red-600 font-semibold"
+                        }
+                      >
+                        Password Strength:{" "}
+                        {passwordForm.newPassword.length >= 8
+                          ? "Strong"
+                          : passwordForm.newPassword.length >= 6
+                            ? "Good"
+                            : "Too short (minimum 6 characters)"}
+                      </span>
+                      {passwordForm.confirmPassword && (
+                        <span
+                          className={
+                            passwordForm.newPassword === passwordForm.confirmPassword
+                              ? "text-emerald-700 font-semibold"
+                              : "text-red-600 font-semibold"
+                          }
+                        >
+                          {passwordForm.newPassword === passwordForm.confirmPassword
+                            ? "✓ Passwords match"
+                            : "✕ Passwords do not match"}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="pt-1">
+                    <button
+                      type="submit"
+                      disabled={changingPassword}
+                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                    >
+                      {changingPassword ? "Saving Changes..." : "Save Changes"}
+                    </button>
+                  </div>
+                </form>
+              </div>
+
+              {/* 3. SHOP & DESKTOP OPERATIONAL SETTINGS */}
+              <div
+                className={`rounded-2xl border p-6 space-y-5 ${
+                  isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
+                }`}
+              >
+                <div>
+                  <h3 className="text-base font-bold">Shop &amp; Desktop Settings</h3>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    Configure your Xerox shop profile, customer limits, and Windows startup preferences.
+                  </p>
+                </div>
 
               <form onSubmit={handleSaveSettings} className="space-y-4">
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -2361,6 +2746,7 @@ export default function App() {
                   </button>
                 </div>
               </form>
+              </div>
             </div>
           )}
         </main>
