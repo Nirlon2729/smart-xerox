@@ -112,6 +112,50 @@ const orderSchema = new mongoose.Schema(
       type: String,
       default: "INR"
     },
+    totalPrice: {
+      type: Number,
+      default: 0
+    },
+    pricingSnapshot: {
+      currency: { type: String, default: "INR" },
+      currencySymbol: { type: String, default: "₹" },
+      colorMode: { type: String, default: "bw" },
+      modeTitle: { type: String, default: "Black & White" },
+      sides: { type: String, default: "single" },
+      paperSize: { type: String, default: "A4" },
+      logicalPagesPerCopy: { type: Number, default: 1 },
+      printedSidesTotal: { type: Number, default: 1 },
+      physicalSheetsPerCopy: { type: Number, default: 1 },
+      totalPhysicalSheets: { type: Number, default: 1 },
+      duplexSheetsPerCopy: { type: Number, default: 0 },
+      singlePagesPerCopy: { type: Number, default: 1 },
+      copies: { type: Number, default: 1 },
+      appliedSingleRate: { type: Number, default: 2 },
+      appliedDuplexRate: { type: Number, default: 3 },
+      paperSizeSurcharge: { type: Number, default: 0 },
+      unitRateLabel: { type: String, default: null },
+      breakdownText: { type: String, default: null },
+      costPerCopy: { type: Number, default: 0 },
+      totalPrice: { type: Number, default: 0 },
+      amountPaise: { type: Number, default: 0 },
+      calculatedAt: { type: Date, default: Date.now }
+    },
+    printConfigSnapshot: {
+      tenantId: { type: String, default: null },
+      shopId: { type: String, default: null },
+      shopSlug: { type: String, default: null },
+      documentId: { type: String, default: null },
+      printerId: { type: String, default: null },
+      printerName: { type: String, default: null },
+      colorMode: { type: String, default: "bw" },
+      paperSize: { type: String, default: "A4" },
+      orientation: { type: String, default: "portrait" },
+      sides: { type: String, default: "single" },
+      copies: { type: Number, default: 1 },
+      selectedPages: [{ type: Number }],
+      pageSelectionMode: { type: String, default: "all" },
+      customPageRange: { type: String, default: null }
+    },
     status: {
       type: String,
       enum: [

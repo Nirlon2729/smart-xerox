@@ -194,10 +194,21 @@ export default function OrderSuccess() {
           </div>
 
           <div className="flex items-center justify-between gap-4">
-            <dt className="text-zinc-500">Copies</dt>
+            <dt className="text-zinc-500">Copies &amp; Sheets</dt>
             <dd className="font-mono-code font-medium text-zinc-900">
-              {order.copies || 1} ({order.printablePageCount} total{" "}
-              {order.printablePageCount === 1 ? "page" : "pages"})
+              {order.copies || 1}x ({order.printablePageCount} printed{" "}
+              {order.printablePageCount === 1 ? "side" : "sides"}
+              {order.pricingSnapshot?.totalPhysicalSheets
+                ? ` • ${order.pricingSnapshot.totalPhysicalSheets} physical sheet(s)`
+                : ""}
+              )
+            </dd>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 pt-2 border-t border-zinc-100">
+            <dt className="text-zinc-700 font-bold">Total Print Amount</dt>
+            <dd className="font-mono-code font-bold text-base text-[#8D0100]">
+              ₹{order.totalPrice ?? order.pricingSnapshot?.totalPrice ?? 0}
             </dd>
           </div>
         </dl>

@@ -7,7 +7,10 @@ import {
   FileText,
   Image as ImageIcon,
   Trash2,
-  CheckCircle2
+  CheckCircle2,
+  AlertCircle,
+  RefreshCw,
+  IndianRupee
 } from "lucide-react";
 import FileCard from "../components/FileCard";
 import DocumentPreview from "../components/DocumentPreview";
@@ -25,6 +28,7 @@ import {
   summarizeSelectedPages,
   formatFileSize
 } from "../utils/formatters";
+import { calculateOrderPriceQuote } from "../utils/pricingCalculator";
 
 export default function PrintSettings() {
   const { shopSlug: routeShopSlug } = useParams();
@@ -46,7 +50,9 @@ export default function PrintSettings() {
     settings,
     updateSettings,
     printerState,
+    refreshPrinterStatus,
     shopConfig,
+    shopPricing,
     setActiveOrder,
     setSubmittedBatchOrders,
     clearDocument
@@ -221,8 +227,18 @@ export default function PrintSettings() {
     return validation.valid ? validation.pages : s.selectedPages || [1];
   };
 
+  const isShopAvailable = Boolean(printerState?.shopAvailable || printerState?.online);
+
   const handlePrintNow = async () => {
     if (submitting || !activeSlug) return;
+    if (!isShopAvailable) {
+      toast.error(
+        printerState?.unavailableReason ||
+          "Sorry, this shop is currently unavailable and cannot accept print orders right now."
+      );
+      refreshPrinterStatus();
+      return;
+    }
     if (customRangeError) {
       toast.error(customRangeError);
       return;
@@ -298,26 +314,41 @@ export default function PrintSettings() {
       ? Array.from({ length: totalPages }, (_, i) => i + 1)
       : settings.selectedPages || [1];
 
-  const totalImpressions = activeSelectedPages.length * settings.copies;
-  const activePhysicalSheets =
-    Math.ceil(activeSelectedPages.length / (!isImage && settings.sides === "duplex" ? 2 : 1)) *
-    (Number(settings.copies) || 1);
+  const activePriceQuote = calculateOrderPriceQuote({
+    pricing: shopPricing,
+    logicalPagesPerCopy: activeSelectedPages.length,
+    copies: settings.copies,
+    colorMode: settings.colorMode,
+    sides: isImage ? "single" : settings.sides,
+    paperSize: settings.paperSize
+  });
+
+  const totalImpressions = activePriceQuote.printedSidesTotal;
+  const activePhysicalSheets = activePriceQuote.totalPhysicalSheets;
 
   const batchSummary = uploadedDocuments.reduce(
     (acc, docItem) => {
       const pages = resolveDocSelectedPages(docItem);
       const s = docItem.settings || settings;
       const docIsImg = docItem.meta?.documentType === "image";
-      const copiesCount = Number(s.copies) || 1;
-      const sheets =
-        Math.ceil(pages.length / (!docIsImg && s.sides === "duplex" ? 2 : 1)) *
-        copiesCount;
-      acc.impressions += pages.length * copiesCount;
-      acc.sheets += sheets;
+      const docQuote = calculateOrderPriceQuote({
+        pricing: shopPricing,
+        logicalPagesPerCopy: pages.length,
+        copies: s.copies,
+        colorMode: s.colorMode,
+        sides: docIsImg ? "single" : s.sides,
+        paperSize: s.paperSize
+      });
+      acc.impressions += docQuote.printedSidesTotal;
+      acc.sheets += docQuote.totalPhysicalSheets;
+      acc.totalPrice = Math.round((acc.totalPrice + docQuote.totalPrice) * 100) / 100;
       return acc;
     },
-    { impressions: 0, sheets: 0 }
+    { impressions: 0, sheets: 0, totalPrice: 0 }
   );
+
+  const displayedTotalPrice =
+    uploadedDocuments.length > 1 ? batchSummary.totalPrice : activePriceQuote.totalPrice;
 
   return (
     <div className="space-y-4 pb-28">
@@ -361,6 +392,31 @@ export default function PrintSettings() {
         </div>
       </div>
 
+      {/* Shop Availability Banner on Settings Page */}
+      {!isShopAvailable && printerState?.connectionState !== "CONNECTING" && (
+        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 flex flex-wrap items-center justify-between gap-2.5 text-xs shadow-2xs">
+          <div className="flex items-start gap-2.5 min-w-0 flex-1">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold">Shop Temporarily Unavailable</p>
+              <p className="text-amber-800 mt-0.5 leading-relaxed">
+                {printerState?.unavailableReason ||
+                  printerState?.statusMessage ||
+                  "Sorry, this shop is currently offline or its printer is disconnected. You can preview and configure your document, and Print Now will automatically unlock when the shop comes online."}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => refreshPrinterStatus()}
+            className="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold text-xs inline-flex items-center gap-1 shrink-0"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Check Availability</span>
+          </button>
+        </div>
+      )}
+
       {/* Multiple Uploaded Documents List & Switcher */}
       {uploadedDocuments.length > 1 && (
         <div className="bg-white rounded-2xl border border-zinc-200 p-4 space-y-3 shadow-2xs">
@@ -369,7 +425,8 @@ export default function PrintSettings() {
               Uploaded Documents ({uploadedDocuments.length} files)
             </span>
             <span className="font-mono-code font-semibold text-zinc-800">
-              Total Pages: {totalBatchPages} • Est. Sheets: {batchSummary.sheets}
+              Total Pages: {totalBatchPages} • Est. Sheets: {batchSummary.sheets} • ₹
+              {batchSummary.totalPrice}
             </span>
           </div>
 
@@ -464,6 +521,7 @@ export default function PrintSettings() {
         height={documentMeta.height}
         selectedPages={activeSelectedPages}
         onTogglePage={handleToggleSinglePageFromPreview}
+        onOrientationChange={(orient) => updateSettings({ orientation: orient })}
         colorMode={settings.colorMode}
         sides={settings.sides}
         paperSize={settings.paperSize}
@@ -479,6 +537,8 @@ export default function PrintSettings() {
         documentType={documentMeta.documentType}
         maxCopies={shopConfig?.maxCopies || 100}
         capabilities={printerState?.capabilities}
+        pricing={shopPricing}
+        priceQuote={activePriceQuote}
         customRangeError={customRangeError}
       />
 
@@ -488,15 +548,11 @@ export default function PrintSettings() {
           <div className="flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 text-[#8D0100]" />
             <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-700">
-              Final Print Summary
+              Final Print Summary &amp; Estimated Price
             </h3>
           </div>
-          <span className="px-2 py-0.5 rounded-md bg-zinc-100 text-zinc-800 text-[11px] font-mono-code font-semibold">
-            {uploadedDocuments.length > 1
-              ? `${uploadedDocuments.length} Documents (${totalBatchPages} total pgs)`
-              : isImage
-                ? "1 Image Document"
-                : `${totalPages} Page PDF`}
+          <span className="px-2.5 py-0.5 rounded-md bg-[#8D0100]/10 text-[#8D0100] text-xs font-mono-code font-bold">
+            Estimated Total: ₹{displayedTotalPrice}
           </span>
         </div>
 
@@ -524,8 +580,8 @@ export default function PrintSettings() {
             <dd className="font-semibold text-zinc-900 mt-0.5">
               {settings.colorMode === "color" ? "Full Colour" : "Black & White"} •{" "}
               {!isImage && settings.sides === "duplex"
-                ? "Double-sided (Duplex)"
-                : "Single-sided"}
+                ? `Double-sided (₹${activePriceQuote.appliedDuplexRate}/sheet)`
+                : `Single-sided (₹${activePriceQuote.appliedSingleRate}/page)`}
             </dd>
           </div>
 
@@ -539,7 +595,7 @@ export default function PrintSettings() {
           </div>
 
           <div>
-            <dt className="text-zinc-500">Copies</dt>
+            <dt className="text-zinc-500">Copies &amp; Printed Sides</dt>
             <dd className="font-mono-code font-semibold text-zinc-900 mt-0.5">
               {settings.copies} {settings.copies === 1 ? "copy" : "copies"} (
               {uploadedDocuments.length > 1 ? batchSummary.impressions : totalImpressions}{" "}
@@ -548,12 +604,12 @@ export default function PrintSettings() {
           </div>
 
           <div>
-            <dt className="text-zinc-500">Total Physical Sheets Estimate</dt>
+            <dt className="text-zinc-500">Physical Sheets &amp; Total Price</dt>
             <dd className="font-mono-code font-bold text-[#8D0100] mt-0.5">
               {uploadedDocuments.length > 1
                 ? `${batchSummary.sheets} ${batchSummary.sheets === 1 ? "sheet" : "sheets"}`
                 : `${activePhysicalSheets} ${activePhysicalSheets === 1 ? "sheet" : "sheets"}`}{" "}
-              of {settings.paperSize} paper
+              • ₹{displayedTotalPrice}
             </dd>
           </div>
         </dl>
@@ -563,12 +619,19 @@ export default function PrintSettings() {
         primaryLabel={
           submitting
             ? "Sending to Shop Printer..."
-            : uploadedDocuments.length > 1
-              ? `Print All ${uploadedDocuments.length} Documents`
-              : "Print Now"
+            : !isShopAvailable
+              ? "Shop Temporarily Unavailable"
+              : uploadedDocuments.length > 1
+                ? `Print All ${uploadedDocuments.length} Documents • ₹${displayedTotalPrice}`
+                : `Print Now • ₹${displayedTotalPrice}`
         }
         onPrimaryClick={handlePrintNow}
-        primaryDisabled={submitting || replacing || Boolean(customRangeError)}
+        primaryDisabled={
+          submitting ||
+          replacing ||
+          Boolean(customRangeError) ||
+          !isShopAvailable
+        }
         primaryLoading={submitting}
         primaryIcon={Printer}
         summaryLeft={
@@ -584,7 +647,7 @@ export default function PrintSettings() {
           (uploadedDocuments.length > 1 ? batchSummary.sheets : activePhysicalSheets) === 1
             ? "sheet"
             : "sheets"
-        } • ${settings.paperSize}`}
+        } • ₹${displayedTotalPrice}`}
       />
     </div>
   );

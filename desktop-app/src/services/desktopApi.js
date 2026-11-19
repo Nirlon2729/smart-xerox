@@ -110,6 +110,31 @@ export async function updateVendorSettings(payload) {
   return data;
 }
 
+export async function fetchVendorPricing() {
+  const { data } = await getClient().get("/vendor/pricing");
+  return data;
+}
+
+export async function updateVendorPricing(payload) {
+  const { data } = await getClient().put("/vendor/pricing", payload);
+  return data;
+}
+
+export async function updateVendorShopAvailability(acceptingOrders) {
+  const { data } = await getClient().put("/vendor/availability", {
+    acceptingOrders: Boolean(acceptingOrders)
+  });
+  return data;
+}
+
+export async function notifyVendorAgentOffline(deviceId = "", reason = "Desktop application closed.") {
+  const { data } = await getClient().post("/vendor/agents/offline", {
+    deviceId,
+    reason
+  });
+  return data;
+}
+
 export async function changeVendorPassword(
   currentPassword,
   newPassword,

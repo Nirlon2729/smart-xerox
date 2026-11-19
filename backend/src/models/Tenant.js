@@ -85,6 +85,43 @@ const tenantSchema = new mongoose.Schema(
       maxUploadMb: { type: Number, default: 20, min: 1, max: 100 },
       maxCopies: { type: Number, default: 100, min: 1, max: 1000 },
       acceptingOrders: { type: Boolean, default: true }
+    },
+    pricing: {
+      currency: { type: String, default: "INR" },
+      currencySymbol: { type: String, default: "₹" },
+      bwSingleRate: { type: Number, default: 2, min: 0 },
+      colorSingleRate: { type: Number, default: 5, min: 0 },
+      bwDuplexRate: { type: Number, default: 3, min: 0 },
+      colorDuplexRate: { type: Number, default: 8, min: 0 },
+      paperSizeAdjustments: {
+        A4: { type: Number, default: 0, min: 0 },
+        A3: { type: Number, default: 0, min: 0 },
+        A5: { type: Number, default: 0, min: 0 },
+        Letter: { type: Number, default: 0, min: 0 },
+        Legal: { type: Number, default: 0, min: 0 },
+        B5: { type: Number, default: 0, min: 0 },
+        Executive: { type: Number, default: 0, min: 0 }
+      },
+      enabledOptions: {
+        bwSingle: { type: Boolean, default: true },
+        colorSingle: { type: Boolean, default: true },
+        bwDuplex: { type: Boolean, default: true },
+        colorDuplex: { type: Boolean, default: true },
+        enabledPaperSizes: {
+          type: [String],
+          default: ["A4", "A3", "A5", "Letter", "Legal", "B5", "Executive"]
+        }
+      },
+      updatedAt: { type: Date, default: Date.now }
+    },
+    availability: {
+      calculatedStatus: {
+        type: String,
+        enum: ["AVAILABLE", "UNAVAILABLE"],
+        default: "UNAVAILABLE"
+      },
+      unavailableReason: { type: String, default: null },
+      lastStatusUpdateAt: { type: Date, default: Date.now }
     }
   },
   { timestamps: true }

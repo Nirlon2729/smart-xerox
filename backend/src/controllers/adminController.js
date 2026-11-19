@@ -19,6 +19,10 @@ const {
   buildShopPublicUrl
 } = require("../utils/agentCredentials");
 const { recordAuditLog } = require("../utils/auditLogger");
+const {
+  VALID_PAPER_SIZES,
+  normalizeVendorPricing
+} = require("../utils/pricingCalculator");
 
 function formatTenantSummary(tenant) {
   if (!tenant) return null;
@@ -40,10 +44,16 @@ function formatTenantSummary(tenant) {
       supportsColor: false,
       supportsDuplex: false
     },
+    pricing: normalizeVendorPricing(tenant.pricing),
     config: {
       maxUploadMb: tenant.config?.maxUploadMb || 20,
       maxCopies: tenant.config?.maxCopies || 100,
       acceptingOrders: tenant.config?.acceptingOrders !== false
+    },
+    availability: tenant.availability || {
+      calculatedStatus: "UNAVAILABLE",
+      unavailableReason: null,
+      lastStatusUpdateAt: tenant.updatedAt || tenant.createdAt
     },
     createdAt: tenant.createdAt
   };
@@ -679,6 +689,207 @@ async function updateVendorSettings(req, res) {
 }
 
 /**
+ * GET /api/vendor/pricing
+ * Returns the authenticated vendor's current printing prices & enabled options.
+ */
+async function getVendorPricing(req, res) {
+  const pricing = normalizeVendorPricing(req.tenant.pricing);
+  res.json({
+    success: true,
+    tenantId: req.tenantId,
+    shopSlug: req.tenant.shopSlug,
+    pricing
+  });
+}
+
+/**
+ * PUT /api/vendor/pricing
+ * Updates the authenticated vendor's independent printing prices and enabled options.
+ * Validates non-negative numeric values in INR (₹).
+ */
+async function updateVendorPricing(req, res) {
+  const {
+    bwSingleRate,
+    colorSingleRate,
+    bwDuplexRate,
+    colorDuplexRate,
+    paperSizeAdjustments,
+    enabledOptions
+  } = req.body;
+
+  const rateFields = [
+    ["Black & White Single-sided rate", bwSingleRate],
+    ["Colour Single-sided rate", colorSingleRate],
+    ["Black & White Duplex rate", bwDuplexRate],
+    ["Colour Duplex rate", colorDuplexRate]
+  ];
+
+  for (const [label, val] of rateFields) {
+    if (val !== undefined) {
+      const num = Number(val);
+      if (!Number.isFinite(num) || num < 0 || num > 10000) {
+        return res.status(400).json({
+          success: false,
+          message: `${label} must be a valid non-negative price in ₹ (0 to 10000).`
+        });
+      }
+    }
+  }
+
+  if (paperSizeAdjustments && typeof paperSizeAdjustments === "object") {
+    for (const [sz, adj] of Object.entries(paperSizeAdjustments)) {
+      if (VALID_PAPER_SIZES.includes(sz) && adj !== undefined) {
+        const num = Number(adj);
+        if (!Number.isFinite(num) || num < 0 || num > 10000) {
+          return res.status(400).json({
+            success: false,
+            message: `Paper size adjustment for ${sz} must be a valid non-negative price in ₹.`
+          });
+        }
+      }
+    }
+  }
+
+  const currentPricing = normalizeVendorPricing(req.tenant.pricing);
+  const nextPricing = normalizeVendorPricing({
+    ...currentPricing,
+    ...(bwSingleRate !== undefined ? { bwSingleRate: Number(bwSingleRate) } : {}),
+    ...(colorSingleRate !== undefined ? { colorSingleRate: Number(colorSingleRate) } : {}),
+    ...(bwDuplexRate !== undefined ? { bwDuplexRate: Number(bwDuplexRate) } : {}),
+    ...(colorDuplexRate !== undefined ? { colorDuplexRate: Number(colorDuplexRate) } : {}),
+    paperSizeAdjustments: {
+      ...currentPricing.paperSizeAdjustments,
+      ...(paperSizeAdjustments && typeof paperSizeAdjustments === "object"
+        ? paperSizeAdjustments
+        : {})
+    },
+    enabledOptions: {
+      ...currentPricing.enabledOptions,
+      ...(enabledOptions && typeof enabledOptions === "object" ? enabledOptions : {})
+    },
+    updatedAt: new Date()
+  });
+
+  if (
+    !nextPricing.enabledOptions.bwSingle &&
+    !nextPricing.enabledOptions.colorSingle &&
+    !nextPricing.enabledOptions.bwDuplex &&
+    !nextPricing.enabledOptions.colorDuplex
+  ) {
+    return res.status(400).json({
+      success: false,
+      message: "At least one printing mode (B&W or Colour) must remain enabled."
+    });
+  }
+
+  req.tenant.pricing = nextPricing;
+  await req.tenant.save();
+
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: "VENDOR_ADMIN",
+    actorId: req.admin._id,
+    action: "VENDOR_PRICING_UPDATED",
+    details: nextPricing,
+    req
+  });
+
+  const printer = await getActivePrinterState(req.tenantId);
+
+  res.json({
+    success: true,
+    message: "Printing prices and rates updated for your shop.",
+    pricing: normalizeVendorPricing(req.tenant.pricing),
+    tenant: formatTenantSummary(req.tenant),
+    printer
+  });
+}
+
+/**
+ * PUT /api/vendor/availability
+ * Toggles manual shop availability: Open Shop / Accept Orders vs Close Shop / Stop Accepting Orders.
+ */
+async function updateVendorShopAvailability(req, res) {
+  const acceptingOrders = Boolean(req.body.acceptingOrders);
+  if (!req.tenant.config) {
+    req.tenant.config = { maxUploadMb: 20, maxCopies: 100, acceptingOrders };
+  } else {
+    req.tenant.config.acceptingOrders = acceptingOrders;
+  }
+
+  const now = new Date();
+  if (!acceptingOrders) {
+    req.tenant.availability = {
+      calculatedStatus: "UNAVAILABLE",
+      unavailableReason:
+        "Sorry, this shop is currently closed by the shopkeeper and not accepting new orders.",
+      lastStatusUpdateAt: now
+    };
+  }
+  await req.tenant.save();
+
+  await recordAuditLog({
+    tenantId: req.tenantId,
+    actorType: "VENDOR_ADMIN",
+    actorId: req.admin._id,
+    action: acceptingOrders ? "SHOP_OPENED" : "SHOP_CLOSED",
+    details: { acceptingOrders },
+    req
+  });
+
+  const printer = await getActivePrinterState(req.tenantId);
+  res.json({
+    success: true,
+    message: acceptingOrders
+      ? "Your shop is now Open and accepting customer print orders."
+      : "Your shop is now Closed and will not accept new print orders.",
+    tenant: formatTenantSummary(req.tenant),
+    printer
+  });
+}
+
+/**
+ * POST /api/vendor/agents/offline
+ * Marks all active desktop agents for the authenticated vendor as offline when the desktop app closes.
+ */
+async function markVendorAgentOffline(req, res) {
+  const now = new Date();
+  const deviceId = req.body?.deviceId ? String(req.body.deviceId).trim() : null;
+  const filter = { tenantId: req.tenantId, active: true, revokedAt: null };
+  if (deviceId) {
+    filter.deviceId = deviceId;
+  }
+
+  await Agent.updateMany(filter, {
+    $set: {
+      connectionStatus: "OFFLINE",
+      applicationStatus: "CLOSED",
+      printerAvailable: false,
+      lastStatus: "OFFLINE",
+      statusMessage: "Vendor desktop application was closed."
+    }
+  });
+
+  await Tenant.updateOne(
+    { _id: req.tenantId },
+    {
+      $set: {
+        "availability.calculatedStatus": "UNAVAILABLE",
+        "availability.unavailableReason":
+          "Sorry, this shop is temporarily unavailable because the shop's computer application is closed.",
+        "availability.lastStatusUpdateAt": now
+      }
+    }
+  );
+
+  res.json({
+    success: true,
+    shopAvailable: false,
+    message: "Shop desktop application marked offline."
+  });
+}
+
+/**
  * GET /api/vendor/orders & GET /api/admin/orders
  * Lists print jobs strictly belonging to req.tenantId.
  */
@@ -1195,6 +1406,10 @@ module.exports = {
   selectVendorPrinter,
   updateVendorPrinterCapabilities,
   updateVendorSettings,
+  getVendorPricing,
+  updateVendorPricing,
+  updateVendorShopAvailability,
+  markVendorAgentOffline,
   listOrders,
   downloadAdminOrderFile,
   cancelOrder,

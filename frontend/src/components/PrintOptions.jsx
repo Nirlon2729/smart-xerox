@@ -1,5 +1,5 @@
 import React from "react";
-import { Minus, Plus, Check, AlertCircle } from "lucide-react";
+import { Minus, Plus, Check, AlertCircle, IndianRupee } from "lucide-react";
 
 const ALL_PAPER_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "B5", "Executive"];
 
@@ -10,6 +10,8 @@ export default function PrintOptions({
   documentType = "pdf",
   maxCopies = 100,
   capabilities = null,
+  pricing = null,
+  priceQuote = null,
   customRangeError = null
 }) {
   const {
@@ -23,15 +25,48 @@ export default function PrintOptions({
     copies
   } = settings;
 
-  const supportedPaperSizes =
+  const vendorEnabledOpts = pricing?.enabledOptions || {};
+  const vendorEnabledSizes = Array.isArray(vendorEnabledOpts.enabledPaperSizes)
+    ? vendorEnabledOpts.enabledPaperSizes
+    : ALL_PAPER_SIZES;
+
+  const rawCapSizes =
     Array.isArray(capabilities?.supportedPaperSizes) &&
     capabilities.supportedPaperSizes.length > 0
       ? capabilities.supportedPaperSizes.filter((s) => ALL_PAPER_SIZES.includes(s))
       : ["A4"];
 
-  const supportsColor = Boolean(capabilities?.supportsColor);
+  const intersectedSizes = rawCapSizes.filter((s) => vendorEnabledSizes.includes(s));
+  const supportedPaperSizes = intersectedSizes.length > 0 ? intersectedSizes : rawCapSizes;
+
+  const supportsBw =
+    sides === "duplex"
+      ? vendorEnabledOpts.bwDuplex !== false
+      : vendorEnabledOpts.bwSingle !== false;
+
+  const supportsColor =
+    Boolean(capabilities?.supportsColor) &&
+    (sides === "duplex"
+      ? vendorEnabledOpts.colorDuplex !== false
+      : vendorEnabledOpts.colorSingle !== false);
+
+  const supportsSingle =
+    colorMode === "color"
+      ? vendorEnabledOpts.colorSingle !== false
+      : vendorEnabledOpts.bwSingle !== false;
+
   const supportsDuplex =
-    Boolean(capabilities?.supportsDuplex) && documentType === "pdf" && totalPages > 1;
+    Boolean(capabilities?.supportsDuplex) &&
+    documentType === "pdf" &&
+    totalPages > 1 &&
+    (colorMode === "color"
+      ? vendorEnabledOpts.colorDuplex !== false
+      : vendorEnabledOpts.bwDuplex !== false);
+
+  const bwSingleRate = Number(pricing?.bwSingleRate ?? 2);
+  const colorSingleRate = Number(pricing?.colorSingleRate ?? 5);
+  const bwDuplexRate = Number(pricing?.bwDuplexRate ?? 3);
+  const colorDuplexRate = Number(pricing?.colorDuplexRate ?? 8);
 
   const handleCopiesStep = (delta) => {
     const next = Math.min(maxCopies, Math.max(1, Number(copies || 1) + delta));
@@ -69,16 +104,54 @@ export default function PrintOptions({
   };
 
   const colorOptions = [
-    { id: "bw", title: "Black & White", desc: "Monochrome grayscale" },
+    ...(supportsBw || !supportsColor
+      ? [
+          {
+            id: "bw",
+            title: "Black & White",
+            desc:
+              sides === "duplex"
+                ? `₹${bwDuplexRate} / duplex sheet`
+                : `₹${bwSingleRate} / page`
+          }
+        ]
+      : []),
     ...(supportsColor
-      ? [{ id: "color", title: "Colour", desc: "Full colour output" }]
+      ? [
+          {
+            id: "color",
+            title: "Colour",
+            desc:
+              sides === "duplex"
+                ? `₹${colorDuplexRate} / duplex sheet`
+                : `₹${colorSingleRate} / page`
+          }
+        ]
       : [])
   ];
 
   const sideOptions = [
-    { id: "single", title: "Single-sided", desc: "One side per sheet" },
+    ...(supportsSingle || !supportsDuplex
+      ? [
+          {
+            id: "single",
+            title: "Single-sided",
+            desc: `One side per sheet • ₹${
+              colorMode === "color" ? colorSingleRate : bwSingleRate
+            } / page`
+          }
+        ]
+      : []),
     ...(supportsDuplex
-      ? [{ id: "duplex", title: "Double-sided", desc: "Both sides (Duplex)" }]
+      ? [
+          {
+            id: "duplex",
+            title: "Double-sided (Duplex)",
+            desc: `Front & back • ₹${
+              colorMode === "color" ? colorDuplexRate : bwDuplexRate
+            } / sheet`
+          }
+        ]
       : [])
   ];
 
@@ -90,7 +163,7 @@ export default function PrintOptions({
       {/* 1. COLOUR MODE */}
       <div className="p-4">
         <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
-          Colour Mode
+          1. Colour Mode
         </label>
         <div className={`grid gap-2.5 ${colorOptions.length > 1 ? "grid-cols-2" : "grid-cols-1"}`}>
           {colorOptions.map((option) => {
@@ -110,7 +183,7 @@ export default function PrintOptions({
                   <span className="block text-sm font-semibold text-zinc-900">
                     {option.title}
                   </span>
-                  <span className="block text-xs text-zinc-500 mt-0.5">
+                  <span className="block text-xs font-mono-code font-semibold text-[#8D0100] mt-0.5">
                     {option.desc}
                   </span>
                 </div>
@@ -125,14 +198,15 @@ export default function PrintOptions({
         </div>
       </div>
 
-      {/* 2. PAPER SIZE (only sizes supported by configured printer) */}
+      {/* 2. PAPER SIZE (only sizes supported by configured printer & enabled by vendor) */}
       <div className="p-4">
         <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
-          Paper Size
+          2. Paper Size
         </label>
         <div className="flex flex-wrap gap-2">
           {supportedPaperSizes.map((size) => {
             const active = paperSize === size;
+            const surcharge = Number(pricing?.paperSizeAdjustments?.[size]) || 0;
             return (
               <button
                 key={size}
@@ -145,6 +219,7 @@ export default function PrintOptions({
                 }`}
               >
                 {size}
+                {surcharge > 0 ? ` (+₹${surcharge})` : ""}
               </button>
             );
           })}
@@ -154,7 +229,7 @@ export default function PrintOptions({
       {/* 3. PRINT SIDES */}
       <div className="p-4">
         <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
-          Printing Sides
+          3. Printing Sides
         </label>
         <div className={`grid gap-2.5 ${sideOptions.length > 1 ? "grid-cols-2" : "grid-cols-1"}`}>
           {sideOptions.map((option) => {
@@ -174,7 +249,7 @@ export default function PrintOptions({
                   <span className="block text-sm font-semibold text-zinc-900">
                     {option.title}
                   </span>
-                  <span className="block text-xs text-zinc-500 mt-0.5">
+                  <span className="block text-xs font-mono-code font-semibold text-[#8D0100] mt-0.5">
                     {option.desc}
                   </span>
                 </div>
@@ -194,7 +269,7 @@ export default function PrintOptions({
         <div className="p-4">
           <div className="flex items-center justify-between mb-2.5">
             <label className="text-xs font-bold uppercase tracking-wider text-zinc-500">
-              Page Selection
+              4. Page Selection
             </label>
             <span className="text-xs text-zinc-500 font-mono-code">
               Total: {totalPages} {totalPages === 1 ? "page" : "pages"}
@@ -365,7 +440,7 @@ export default function PrintOptions({
       <div className="p-4 flex items-center justify-between gap-4">
         <div>
           <span className="block text-xs font-bold uppercase tracking-wider text-zinc-500">
-            Number of Copies
+            5. Number of Copies
           </span>
           <span className="text-xs text-zinc-500 mt-0.5 block">
             1 to {maxCopies} copies
@@ -409,12 +484,12 @@ export default function PrintOptions({
       {/* 6. ORIENTATION */}
       <div className="p-4">
         <label className="block text-xs font-bold uppercase tracking-wider text-zinc-500 mb-2.5">
-          Orientation
+          6. Orientation
         </label>
         <div className="grid grid-cols-2 gap-2.5">
           {[
-            { id: "portrait", label: "Portrait", desc: "Vertical page" },
-            { id: "landscape", label: "Landscape", desc: "Horizontal page" }
+            { id: "portrait", label: "Portrait", desc: "Vertical page sheet" },
+            { id: "landscape", label: "Landscape", desc: "Horizontal page sheet" }
           ].map((item) => {
             const active =
               orientation === item.id ||
@@ -448,6 +523,85 @@ export default function PrintOptions({
           })}
         </div>
       </div>
+
+      {/* 7. LIVE PRICE SUMMARY & BREAKDOWN */}
+      {priceQuote && (
+        <div className="p-4 bg-zinc-50/70 space-y-2.5 rounded-b-2xl">
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-bold uppercase tracking-wider text-zinc-500 flex items-center gap-1.5">
+              <IndianRupee className="w-3.5 h-3.5 text-[#8D0100]" />
+              <span>7. Price Summary</span>
+            </label>
+            <span className="text-xs font-semibold text-zinc-700">
+              {priceQuote.modeLabel}
+            </span>
+          </div>
+
+          <div className="rounded-xl bg-white border border-zinc-200 p-3 space-y-1.5 text-xs">
+            <div className="flex justify-between">
+              <span className="text-zinc-500">Selected Mode Rate:</span>
+              <span className="font-mono-code font-semibold text-zinc-900">
+                {priceQuote.sides === "duplex"
+                  ? `₹${priceQuote.appliedDuplexRate} / duplex sheet (₹${priceQuote.appliedSingleRate} odd page)`
+                  : `₹${priceQuote.appliedSingleRate} / page`}
+              </span>
+            </div>
+
+            {priceQuote.paperSizeSurcharge > 0 && (
+              <div className="flex justify-between">
+                <span className="text-zinc-500">{priceQuote.paperSize} Paper Surcharge:</span>
+                <span className="font-mono-code font-semibold text-zinc-900">
+                  +₹{priceQuote.paperSizeSurcharge} / sheet
+                </span>
+              </div>
+            )}
+
+            <div className="flex justify-between">
+              <span className="text-zinc-500">Pages to Print (Logical):</span>
+              <span className="font-mono-code font-semibold text-zinc-900">
+                {priceQuote.logicalPagesPerCopy}{" "}
+                {priceQuote.logicalPagesPerCopy === 1 ? "page" : "pages"} (
+                {priceQuote.printedSidesTotal} total printed sides)
+              </span>
+            </div>
+
+            <div className="flex justify-between">
+              <span className="text-zinc-500">Physical Paper Sheets:</span>
+              <span className="font-mono-code font-semibold text-zinc-900">
+                {priceQuote.physicalSheetsPerCopy} sheet(s)/copy × {priceQuote.copies} ={" "}
+                {priceQuote.totalPhysicalSheets} sheet(s)
+              </span>
+            </div>
+
+            {priceQuote.sides === "duplex" && (
+              <div className="flex justify-between text-[11px] text-zinc-500">
+                <span>Duplex Sheet Breakdown:</span>
+                <span className="font-mono-code">
+                  {priceQuote.duplexSheetsPerCopy} duplex sheet(s) @ ₹{priceQuote.appliedDuplexRate}
+                  {priceQuote.singlePagesPerCopy > 0
+                    ? ` + ${priceQuote.singlePagesPerCopy} single page @ ₹${priceQuote.appliedSingleRate}`
+                    : ""}
+                </span>
+              </div>
+            )}
+
+            <div className="flex justify-between">
+              <span className="text-zinc-500">Copies:</span>
+              <span className="font-mono-code font-semibold text-zinc-900">
+                {priceQuote.copies} {priceQuote.copies === 1 ? "copy" : "copies"} (₹
+                {priceQuote.costPerCopy} / copy)
+              </span>
+            </div>
+
+            <div className="pt-2 mt-1 border-t border-zinc-100 flex items-center justify-between">
+              <span className="text-sm font-bold text-zinc-900">Estimated Total:</span>
+              <span className="text-lg font-bold font-mono-code text-[#8D0100]">
+                ₹{priceQuote.totalPrice}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

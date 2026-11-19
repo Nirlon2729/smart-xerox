@@ -270,10 +270,57 @@ function syncAgentRuntimeConfigFile() {
   return cfgPath;
 }
 
-function stopBackgroundAgent() {
+async function notifyBackendAgentOffline(reason = "Vendor closed Smart Xerox desktop application.") {
+  try {
+    const session = getDecryptedSession();
+    const apiBase = normalizeStoredApiUrl(session.apiBaseUrl);
+    if (session.agentId && session.agentSecret) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2500);
+      await fetch(`${apiBase}/agent/offline`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-agent-id": session.agentId,
+          "x-agent-secret": session.agentSecret
+        },
+        body: JSON.stringify({
+          deviceId: session.deviceId || "",
+          reason
+        }),
+        signal: controller.signal
+      }).catch(() => {});
+      clearTimeout(timeoutId);
+    } else if (session.vendorToken) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2500);
+      await fetch(`${apiBase}/vendor/agents/offline`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.vendorToken}`
+        },
+        body: JSON.stringify({
+          deviceId: session.deviceId || "",
+          reason
+        }),
+        signal: controller.signal
+      }).catch(() => {});
+      clearTimeout(timeoutId);
+    }
+  } catch (_err) {
+    // Non-fatal on exit
+  }
+}
+
+function stopBackgroundAgent({ notifyOffline = false, reason = "Print agent stopped." } = {}) {
   if (agentRestartTimer) {
     clearTimeout(agentRestartTimer);
     agentRestartTimer = null;
+  }
+
+  if (notifyOffline) {
+    notifyBackendAgentOffline(reason);
   }
 
   if (agentProcess && agentProcess.pid) {
@@ -460,8 +507,9 @@ function createTray() {
       { type: "separator" },
       {
         label: "Quit Smart Xerox",
-        click: () => {
+        click: async () => {
           isQuitting = true;
+          await notifyBackendAgentOffline("Vendor quit Smart Xerox desktop application.");
           stopBackgroundAgent();
           app.quit();
         }
@@ -506,10 +554,14 @@ function createMainWindow() {
     mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
   }
 
-  mainWindow.on("close", (event) => {
-    if (!isQuitting && tray) {
+  mainWindow.on("close", async (event) => {
+    if (!isQuitting) {
       event.preventDefault();
-      mainWindow.hide();
+      isQuitting = true;
+      stopPrinterMonitor();
+      await notifyBackendAgentOffline("Vendor closed Smart Xerox desktop application.");
+      stopBackgroundAgent();
+      app.exit(0);
     }
   });
 }
@@ -595,6 +647,9 @@ ipcMain.handle("session:save", async (_event, payload) => {
 });
 
 ipcMain.handle("session:clear", async (_event, { keepAgentRunning = false } = {}) => {
+  if (!keepAgentRunning) {
+    await notifyBackendAgentOffline("Vendor signed out of Smart Xerox desktop application.");
+  }
   const raw = readRawStore();
   raw.admin = null;
   raw.encryptedVendorToken = null;
@@ -717,6 +772,7 @@ ipcMain.handle("agent:restart", async () => {
 });
 
 ipcMain.handle("agent:stop", async () => {
+  await notifyBackendAgentOffline("Background print agent stopped by vendor.");
   stopBackgroundAgent();
   return {
     success: true,
@@ -815,11 +871,12 @@ if (process.argv.includes("--cli-self-test")) {
     app.on("before-quit", () => {
       isQuitting = true;
       stopPrinterMonitor();
+      notifyBackendAgentOffline("Vendor closed Smart Xerox desktop application.");
       stopBackgroundAgent();
     });
 
     app.on("window-all-closed", () => {
-      if (process.platform !== "darwin" && !tray) {
+      if (process.platform !== "darwin") {
         stopPrinterMonitor();
         stopBackgroundAgent();
         app.quit();

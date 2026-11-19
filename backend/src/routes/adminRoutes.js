@@ -12,6 +12,10 @@ const {
   selectVendorPrinter,
   updateVendorPrinterCapabilities,
   updateVendorSettings,
+  getVendorPricing,
+  updateVendorPricing,
+  updateVendorShopAvailability,
+  markVendorAgentOffline,
   listOrders,
   downloadAdminOrderFile,
   cancelOrder,
@@ -26,12 +30,18 @@ router.get("/dashboard", requireVendorAdmin, asyncHandler(getAdminProfile));
 // Desktop Agent Pairing & Lifecycle
 router.post("/agents/pair", requireVendorAdmin, asyncHandler(pairDesktopAgent));
 router.get("/agents", requireVendorAdmin, asyncHandler(listVendorAgents));
+router.post("/agents/offline", requireVendorAdmin, asyncHandler(markVendorAgentOffline));
 router.post("/agents/:agentId/revoke", requireVendorAdmin, asyncHandler(revokeVendorAgent));
 
 // Printer Management & Capability Configuration
 router.get("/printers", requireVendorAdmin, asyncHandler(getVendorPrinters));
 router.put("/printers/select", requireVendorAdmin, asyncHandler(selectVendorPrinter));
 router.put("/printers/capabilities", requireVendorAdmin, asyncHandler(updateVendorPrinterCapabilities));
+
+// Dynamic Vendor Printing Prices & Shop Availability Controls
+router.get("/pricing", requireVendorAdmin, asyncHandler(getVendorPricing));
+router.put("/pricing", requireVendorAdmin, asyncHandler(updateVendorPricing));
+router.put("/availability", requireVendorAdmin, asyncHandler(updateVendorShopAvailability));
 
 // Vendor Shop Settings & Password Management
 router.put("/settings", requireVendorAdmin, asyncHandler(updateVendorSettings));

@@ -12,6 +12,11 @@ const { parseAndValidatePages } = require("../utils/pageRange");
 const { buildShopPublicUrl } = require("../utils/agentCredentials");
 const { recordAuditLog } = require("../utils/auditLogger");
 const {
+  normalizeVendorPricing,
+  validatePricingOptionEnabled,
+  calculateOrderPriceQuote
+} = require("../utils/pricingCalculator");
+const {
   uploadBufferToGridFS,
   findGridFSFileById,
   markGridFSFileBoundToJob,
@@ -85,9 +90,15 @@ async function getActivePrinterState(tenantId) {
   }
 
   const now = Date.now();
-  const lastSeenMs = agent?.lastSeenAt ? new Date(agent.lastSeenAt).getTime() : 0;
+  const heartbeatSourceDate = agent?.lastHeartbeatAt || agent?.lastSeenAt || null;
+  const lastSeenMs = heartbeatSourceDate ? new Date(heartbeatSourceDate).getTime() : 0;
+  const isAgentMarkedClosed =
+    agent?.connectionStatus === "OFFLINE" || agent?.applicationStatus === "CLOSED";
   const agentOnline = Boolean(
-    agent && lastSeenMs > 0 && now - lastSeenMs <= heartbeatTimeoutSeconds * 1000
+    agent &&
+      !isAgentMarkedClosed &&
+      lastSeenMs > 0 &&
+      now - lastSeenMs <= heartbeatTimeoutSeconds * 1000
   );
 
   const availablePrinters = Array.isArray(agent?.availablePrinters) ? agent.availablePrinters : [];
@@ -119,6 +130,7 @@ async function getActivePrinterState(tenantId) {
     !preferredPrinterName &&
     !activePrinterObj &&
     availablePrinters.length === 1 &&
+    availablePrinters[0].printerAvailable &&
     tenant?.autoSelectSinglePrinter !== false
   ) {
     activePrinterObj = availablePrinters[0];
@@ -197,8 +209,11 @@ async function getActivePrinterState(tenantId) {
     supportsDuplex: false
   };
 
+  const pricing = normalizeVendorPricing(tenant?.pricing);
+  const eo = pricing.enabledOptions;
+
   const useManualOverride = Boolean(tenant?.capabilityOverrides?.useManualOverride);
-  const effectiveCapabilities = useManualOverride
+  const baseCapabilities = useManualOverride
     ? {
         supportedPaperSizes:
           tenant.capabilityOverrides.supportedPaperSizes?.length > 0
@@ -220,10 +235,91 @@ async function getActivePrinterState(tenantId) {
         capabilitiesDetected: Boolean(activePrinterObj?.capabilitiesDetected ?? true)
       };
 
+  // Intersect hardware capabilities with vendor-enabled pricing options
+  const intersectedPaperSizes = baseCapabilities.supportedPaperSizes.filter((sz) =>
+    eo.enabledPaperSizes.includes(sz)
+  );
+  const effectiveCapabilities = {
+    ...baseCapabilities,
+    supportedPaperSizes:
+      intersectedPaperSizes.length > 0
+        ? intersectedPaperSizes
+        : baseCapabilities.supportedPaperSizes,
+    supportsColor: Boolean(
+      baseCapabilities.supportsColor && (eo.colorSingle || eo.colorDuplex)
+    ),
+    supportsDuplex: Boolean(
+      baseCapabilities.supportsDuplex && (eo.bwDuplex || eo.colorDuplex)
+    ),
+    enabledOptions: eo
+  };
+
+  // Compute strict 8-condition shop availability state
+  const tenantActive = tenant?.status === "ACTIVE";
+  const acceptingOrders = tenant?.config?.acceptingOrders !== false;
+  const hasRealPrinter =
+    Boolean(resolvedPrinterName) &&
+    ![
+      "No Printer Selected",
+      "No Printer Detected",
+      "Multiple Printers Detected — Select One",
+      "Detecting Windows Printers..."
+    ].includes(resolvedPrinterName);
+
+  const shopAvailable = Boolean(
+    tenantActive &&
+      acceptingOrders &&
+      agentOnline &&
+      hasRealPrinter &&
+      printerAvailable &&
+      !resolvedDriverMissing &&
+      !requiresManualSelection &&
+      !selectedPrinterDisconnected
+  );
+
+  let unavailableReasonCode = null;
+  let unavailableReason = null;
+
+  if (!shopAvailable) {
+    if (!tenantActive) {
+      unavailableReasonCode = "ACCOUNT_SUSPENDED";
+      unavailableReason =
+        "Sorry, this shop account is currently inactive and cannot accept print orders.";
+    } else if (!acceptingOrders) {
+      unavailableReasonCode = "SHOP_CLOSED_BY_VENDOR";
+      unavailableReason =
+        "Sorry, this shop is currently closed by the shopkeeper and not accepting new orders.";
+    } else if (!agentOnline) {
+      unavailableReasonCode = "AGENT_OFFLINE";
+      unavailableReason =
+        "Sorry, this shop is temporarily unavailable because the shop's computer application is closed or offline. Please try again later.";
+    } else if (requiresManualSelection) {
+      unavailableReasonCode = "SELECTION_REQUIRED";
+      unavailableReason =
+        "Sorry, this shop is temporarily unavailable while the shopkeeper selects their active printer.";
+    } else if (resolvedDriverMissing) {
+      unavailableReasonCode = "DRIVER_MISSING";
+      unavailableReason =
+        "Sorry, this shop is temporarily unavailable because its printer driver is not ready.";
+    } else {
+      unavailableReasonCode = "PRINTER_DISCONNECTED";
+      unavailableReason =
+        "Sorry, this shop is temporarily unavailable because its printer is disconnected or offline. Please try again later.";
+    }
+    connectionState = !acceptingOrders ? "SHOP_CLOSED" : connectionState;
+  }
+
   return {
-    online: connectionState === "PRINTER_READY",
+    online: shopAvailable,
+    shopAvailable,
+    availabilityStatus: shopAvailable ? "AVAILABLE" : "UNAVAILABLE",
+    availabilityLabel: shopAvailable
+      ? "Shop Open — Accepting Orders"
+      : "Shop Temporarily Unavailable",
+    unavailableReasonCode,
+    unavailableReason,
     connectionState,
-    statusLabel,
+    statusLabel: !acceptingOrders ? "Shop Closed" : statusLabel,
     agentOnline,
     printerAvailable,
     requiresManualSelection,
@@ -237,29 +333,35 @@ async function getActivePrinterState(tenantId) {
     model: activePrinterObj?.model || null,
     connectionType: activePrinterObj?.connectionType || null,
     printerCategory: activePrinterObj?.printerCategory || null,
-    selectedPrinterName: preferredPrinterName || (availablePrinters.length === 1 ? availablePrinters[0].name : null),
+    selectedPrinterName:
+      preferredPrinterName ||
+      (availablePrinters.length === 1 && availablePrinters[0].printerAvailable
+        ? availablePrinters[0].name
+        : null),
     portName: resolvedPortName,
     driverName: resolvedDriverName,
     driverMissing: resolvedDriverMissing,
     availablePrinters,
-    lastSeenAt: agent?.lastSeenAt || null,
+    lastSeenAt: heartbeatSourceDate,
+    lastHeartbeatAt: heartbeatSourceDate,
     heartbeatTimeoutSeconds,
-    status: connectionState === "PRINTER_READY" ? resolvedStatus || "READY" : "OFFLINE",
-    statusMessage,
+    status: shopAvailable ? resolvedStatus || "READY" : "OFFLINE",
+    statusMessage: !shopAvailable && unavailableReason ? unavailableReason : statusMessage,
     spoolerJobCount: resolvedSpoolerJobs,
     capabilities: effectiveCapabilities,
     detectedCapabilities: detectedCaps,
+    pricing,
     config: {
       maxUploadMb: tenant?.config?.maxUploadMb || defaultMaxUploadMb,
       maxCopies: tenant?.config?.maxCopies || defaultMaxCopiesAllowed,
-      acceptingOrders: tenant?.config?.acceptingOrders !== false
+      acceptingOrders
     }
   };
 }
 
 /**
  * GET /api/shops/:shopSlug
- * Returns public shop details, printer availability, and verified capabilities for the customer website.
+ * Returns public shop details, printer availability, verified capabilities, and vendor pricing for the customer website.
  */
 async function getShopPublicInfo(req, res) {
   const tenant = req.tenant;
@@ -276,6 +378,11 @@ async function getShopPublicInfo(req, res) {
       address: tenant.address || null,
       status: tenant.status,
       publicUrl: buildShopPublicUrl(tenant.shopSlug),
+      shopAvailable: printer.shopAvailable,
+      availabilityStatus: printer.availabilityStatus,
+      availabilityLabel: printer.availabilityLabel,
+      unavailableReason: printer.unavailableReason,
+      pricing: printer.pricing,
       config: printer.config
     },
     printer
@@ -386,9 +493,11 @@ function formatJobResponse(order) {
   return {
     id: order._id,
     tenantId: order.tenantId,
+    shopId: order.tenantId,
     shopSlug: order.shopSlug,
     token: order.token,
     originalName: order.originalName,
+    documentId: order.gridFsFileId,
     documentType: order.documentType || "pdf",
     mimeType: order.mimeType || "application/pdf",
     fileSize: order.fileSize,
@@ -403,6 +512,11 @@ function formatJobResponse(order) {
     orientation: order.orientation || "auto",
     printablePageCount: order.printablePageCount,
     targetPrinterName: order.targetPrinterName || null,
+    totalPrice: order.totalPrice ?? order.pricingSnapshot?.totalPrice ?? 0,
+    amountPaise: order.amountPaise ?? order.pricingSnapshot?.amountPaise ?? 0,
+    currency: order.currency || "INR",
+    pricingSnapshot: order.pricingSnapshot || null,
+    printConfigSnapshot: order.printConfigSnapshot || null,
     status: order.status,
     spoolerJobId: order.spoolerJobId || null,
     fileDeleted: Boolean(order.fileDeleted),
@@ -464,12 +578,42 @@ async function createOrder(req, res) {
 
     const data = parsed.data;
     const printerState = await getActivePrinterState(req.tenantId);
+
+    // Server-side Shop Availability Protection:
+    // Reject order submission if the vendor closed their shop, closed the desktop app,
+    // lost heartbeat, or disconnected/turned off their printer.
+    if (!printerState.shopAvailable) {
+      const statusCode =
+        printerState.unavailableReasonCode === "SHOP_CLOSED_BY_VENDOR" ? 403 : 503;
+      return res.status(statusCode).json({
+        success: false,
+        shopAvailable: false,
+        unavailableReasonCode: printerState.unavailableReasonCode,
+        message:
+          printerState.unavailableReason ||
+          "Sorry, this shop is temporarily unavailable because its printer is disconnected. Please try again later."
+      });
+    }
+
     const maxCopies = printerState.config.maxCopies || defaultMaxCopiesAllowed;
 
     if (data.copies > maxCopies) {
       return res.status(400).json({
         success: false,
         message: `Maximum allowed copies per job at this shop is ${maxCopies}.`
+      });
+    }
+
+    // Validate requested options against vendor's enabled pricing options
+    const pricingOptionCheck = validatePricingOptionEnabled(req.tenant.pricing, {
+      colorMode: data.colorMode,
+      sides: data.sides,
+      paperSize: data.paperSize
+    });
+    if (!pricingOptionCheck.allowed) {
+      return res.status(400).json({
+        success: false,
+        message: pricingOptionCheck.reason
       });
     }
 
@@ -623,6 +767,44 @@ async function createOrder(req, res) {
       });
     }
 
+    // Atomic race-condition check right before Order.create in case the shop disconnected during upload
+    const latestPrinterState = await getActivePrinterState(req.tenantId);
+    if (!latestPrinterState.shopAvailable) {
+      if (newlyUploadedGridFsId) {
+        await deleteGridFSFile(newlyUploadedGridFsId, req.tenantId);
+      }
+      const statusCode =
+        latestPrinterState.unavailableReasonCode === "SHOP_CLOSED_BY_VENDOR" ? 403 : 503;
+      return res.status(statusCode).json({
+        success: false,
+        shopAvailable: false,
+        unavailableReasonCode: latestPrinterState.unavailableReasonCode,
+        message:
+          latestPrinterState.unavailableReason ||
+          "Sorry, this shop became unavailable before your order could be queued. Please try again later."
+      });
+    }
+
+    const effectiveSides =
+      fileMeta.documentType === "image" || uniquePages.length === 1
+        ? "single"
+        : data.sides;
+
+    const priceQuote = calculateOrderPriceQuote(req.tenant.pricing, {
+      selectedPageCount: uniquePages.length,
+      copies: data.copies,
+      colorMode: data.colorMode,
+      sides: effectiveSides,
+      paperSize: data.paperSize,
+      documentType: fileMeta.documentType
+    });
+
+    const targetPrinterName =
+      latestPrinterState.selectedPrinterName ||
+      (latestPrinterState.printerName !== "No Printer Selected"
+        ? latestPrinterState.printerName
+        : null);
+
     const token = await generateUniqueJobToken();
 
     const order = await Order.create({
@@ -644,14 +826,32 @@ async function createOrder(req, res) {
       selectedPages: uniquePages,
       copies: data.copies,
       colorMode: data.colorMode,
-      sides: fileMeta.documentType === "image" ? "single" : data.sides,
+      sides: effectiveSides,
       paperSize: data.paperSize,
       orientation: data.orientation,
       pageCount: fileMeta.pageCount,
       printablePageCount: uniquePages.length * data.copies,
-      targetPrinterName:
-        printerState.selectedPrinterName ||
-        (printerState.printerName !== "No Printer Selected" ? printerState.printerName : null),
+      targetPrinterName,
+      totalPrice: priceQuote.totalPrice,
+      amountPaise: priceQuote.amountPaise,
+      currency: "INR",
+      pricingSnapshot: priceQuote,
+      printConfigSnapshot: {
+        tenantId: String(req.tenantId),
+        shopId: String(req.tenantId),
+        shopSlug: req.tenant.shopSlug,
+        documentId: String(fileMeta.gridFsFileId),
+        printerId: targetPrinterName,
+        printerName: targetPrinterName,
+        colorMode: data.colorMode,
+        paperSize: data.paperSize,
+        orientation: data.orientation,
+        sides: effectiveSides,
+        copies: data.copies,
+        selectedPages: uniquePages,
+        pageSelectionMode: data.pageSelectionMode,
+        customPageRange: data.customPageRange || null
+      },
       status: "QUEUED"
     });
 

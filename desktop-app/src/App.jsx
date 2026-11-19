@@ -30,7 +30,9 @@ import {
   Server,
   Eye,
   EyeOff,
-  UserCheck
+  UserCheck,
+  IndianRupee,
+  Power
 } from "lucide-react";
 import {
   configureDesktopApi,
@@ -41,6 +43,9 @@ import {
   selectVendorPrinter,
   updatePrinterCapabilities,
   updateVendorSettings,
+  fetchVendorPricing,
+  updateVendorPricing,
+  updateVendorShopAvailability,
   changeVendorPassword,
   fetchVendorOrders,
   cancelVendorOrder,
@@ -52,8 +57,66 @@ import {
 
 const ALL_PAPER_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "B5", "Executive"];
 
+const DEFAULT_VENDOR_PRICING = {
+  currency: "INR",
+  currencySymbol: "₹",
+  bwSingleRate: 2,
+  colorSingleRate: 5,
+  bwDuplexRate: 3,
+  colorDuplexRate: 8,
+  paperSizeAdjustments: {
+    A4: 0,
+    A3: 0,
+    A5: 0,
+    Letter: 0,
+    Legal: 0,
+    B5: 0,
+    Executive: 0
+  },
+  enabledOptions: {
+    bwSingle: true,
+    colorSingle: true,
+    bwDuplex: true,
+    colorDuplex: true,
+    enabledPaperSizes: [...ALL_PAPER_SIZES]
+  }
+};
+
+function normalizeLocalPricing(raw = {}) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const adjSrc = src.paperSizeAdjustments || {};
+  const optSrc = src.enabledOptions || {};
+  const paperSizeAdjustments = {};
+  for (const sz of ALL_PAPER_SIZES) {
+    const val = Number(adjSrc[sz]);
+    paperSizeAdjustments[sz] = Number.isFinite(val) && val >= 0 ? val : 0;
+  }
+  const enabledPaperSizes = Array.isArray(optSrc.enabledPaperSizes) && optSrc.enabledPaperSizes.length > 0
+    ? optSrc.enabledPaperSizes.filter((s) => ALL_PAPER_SIZES.includes(s))
+    : [...ALL_PAPER_SIZES];
+
+  return {
+    currency: "INR",
+    currencySymbol: "₹",
+    bwSingleRate: Number.isFinite(Number(src.bwSingleRate)) && Number(src.bwSingleRate) >= 0 ? Number(src.bwSingleRate) : 2,
+    colorSingleRate: Number.isFinite(Number(src.colorSingleRate)) && Number(src.colorSingleRate) >= 0 ? Number(src.colorSingleRate) : 5,
+    bwDuplexRate: Number.isFinite(Number(src.bwDuplexRate)) && Number(src.bwDuplexRate) >= 0 ? Number(src.bwDuplexRate) : 3,
+    colorDuplexRate: Number.isFinite(Number(src.colorDuplexRate)) && Number(src.colorDuplexRate) >= 0 ? Number(src.colorDuplexRate) : 8,
+    paperSizeAdjustments,
+    enabledOptions: {
+      bwSingle: optSrc.bwSingle !== false,
+      colorSingle: optSrc.colorSingle !== false,
+      bwDuplex: optSrc.bwDuplex !== false,
+      colorDuplex: optSrc.colorDuplex !== false,
+      enabledPaperSizes: enabledPaperSizes.length > 0 ? enabledPaperSizes : ["A4"]
+    },
+    updatedAt: src.updatedAt || null
+  };
+}
+
 const NAV_ITEMS = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { id: "pricing", label: "Printing Prices & Rates", icon: IndianRupee },
   { id: "printers", label: "Printer Management", icon: Printer },
   { id: "qrcode", label: "Shop QR Code", icon: QrCode },
   { id: "jobs", label: "Print Jobs", icon: FileText },
@@ -177,6 +240,20 @@ export default function App() {
     confirm: false
   });
   const [changingPassword, setChangingPassword] = useState(false);
+
+  // Printing Prices & Rates Form
+  const [savedPricing, setSavedPricing] = useState(DEFAULT_VENDOR_PRICING);
+  const [pricingForm, setPricingForm] = useState(DEFAULT_VENDOR_PRICING);
+  const [pricingDirty, setPricingDirty] = useState(false);
+  const [savingPricing, setSavingPricing] = useState(false);
+  const [togglingAvailability, setTogglingAvailability] = useState(false);
+  const [sampleQuote, setSampleQuote] = useState({
+    pages: 5,
+    copies: 1,
+    colorMode: "bw",
+    sides: "single",
+    paperSize: "A4"
+  });
 
   const isDark = theme === "dark";
 
@@ -351,7 +428,7 @@ export default function App() {
         supportsDuplex: Boolean(t.capabilityOverrides.supportsDuplex)
       });
     }
-    setSettingsForm({
+        setSettingsForm({
       shopName: t.shopName || "",
       phone: t.phone || "",
       address: t.address || "",
@@ -363,9 +440,18 @@ export default function App() {
       customerBaseUrl: session.customerBaseUrl || "https://smart-xerox-web-2mwa.onrender.com",
       autoStartWithWindows: session.autoStartWithWindows !== false
     });
+    if (t.pricing) {
+      const normalized = normalizeLocalPricing(t.pricing);
+      setSavedPricing(normalized);
+      if (!pricingDirty) {
+        setPricingForm(normalized);
+      }
+    }
   }, [
     session.tenant?.id,
     session.tenant?.shopName,
+    session.tenant?.pricing,
+    pricingDirty,
     session.apiBaseUrl,
     session.customerBaseUrl,
     session.autoStartWithWindows
@@ -683,6 +769,116 @@ export default function App() {
       toast.error(getApiErrorMessage(err, "Failed to save settings"));
     } finally {
       setSavingSettings(false);
+    }
+  };
+
+  const handleSavePricing = async (e) => {
+    e.preventDefault();
+    if (savingPricing) return;
+
+    const rateChecks = [
+      { key: "bwSingleRate", label: "Black & White, Single-sided" },
+      { key: "colorSingleRate", label: "Colour, Single-sided" },
+      { key: "bwDuplexRate", label: "Black & White, Duplex" },
+      { key: "colorDuplexRate", label: "Colour, Duplex" }
+    ];
+
+    for (const item of rateChecks) {
+      const n = Number(pricingForm[item.key]);
+      if (!Number.isFinite(n) || n < 0 || n > 10000) {
+        toast.error(`${item.label} rate must be a valid non-negative price (₹0 – ₹10,000).`);
+        return;
+      }
+    }
+
+    for (const sz of ALL_PAPER_SIZES) {
+      const n = Number(pricingForm.paperSizeAdjustments?.[sz] ?? 0);
+      if (!Number.isFinite(n) || n < 0 || n > 10000) {
+        toast.error(`Paper size ${sz} adjustment must be a valid non-negative number.`);
+        return;
+      }
+    }
+
+    const opts = pricingForm.enabledOptions || {};
+    if (!opts.bwSingle && !opts.colorSingle && !opts.bwDuplex && !opts.colorDuplex) {
+      toast.error("At least one printing mode must remain enabled for customers.");
+      return;
+    }
+
+    if (!Array.isArray(opts.enabledPaperSizes) || opts.enabledPaperSizes.length === 0) {
+      toast.error("At least one paper size must remain enabled for customers.");
+      return;
+    }
+
+    try {
+      setSavingPricing(true);
+      const res = await updateVendorPricing({
+        bwSingleRate: Number(pricingForm.bwSingleRate),
+        colorSingleRate: Number(pricingForm.colorSingleRate),
+        bwDuplexRate: Number(pricingForm.bwDuplexRate),
+        colorDuplexRate: Number(pricingForm.colorDuplexRate),
+        paperSizeAdjustments: pricingForm.paperSizeAdjustments,
+        enabledOptions: pricingForm.enabledOptions
+      });
+      if (res?.success) {
+        const nextPricing = normalizeLocalPricing(res.pricing || pricingForm);
+        setSavedPricing(nextPricing);
+        setPricingForm(nextPricing);
+        setPricingDirty(false);
+        if (res.tenant) {
+          setSession((prev) => ({ ...prev, tenant: res.tenant }));
+          if (window.electronAPI) {
+            await window.electronAPI.updateLocalSettings({ tenant: res.tenant });
+          }
+        }
+        if (res.printer) {
+          setPrinterState(res.printer);
+        }
+        toast.success(res.message || "Printing prices and rates saved.");
+      }
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, "Failed to update printing prices"));
+    } finally {
+      setSavingPricing(false);
+    }
+  };
+
+  const handleCancelPricingChanges = () => {
+    setPricingForm(savedPricing);
+    setPricingDirty(false);
+    toast.success("Reverted unsaved price changes.");
+  };
+
+  const handleToggleShopAvailability = async (nextAcceptingOrders) => {
+    if (togglingAvailability) return;
+    try {
+      setTogglingAvailability(true);
+      const res = await updateVendorShopAvailability(nextAcceptingOrders);
+      if (res?.success) {
+        if (res.tenant) {
+          setSession((prev) => ({ ...prev, tenant: res.tenant }));
+          setSettingsForm((prev) => ({
+            ...prev,
+            acceptingOrders: res.tenant.config?.acceptingOrders !== false
+          }));
+          if (window.electronAPI) {
+            await window.electronAPI.updateLocalSettings({ tenant: res.tenant });
+          }
+        }
+        if (res.printer) {
+          setPrinterState(res.printer);
+        }
+        toast.success(
+          res.message ||
+            (nextAcceptingOrders
+              ? "Shop is now OPEN and accepting customer print orders."
+              : "Shop is now CLOSED and paused from accepting customer print orders.")
+        );
+      }
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, "Failed to update shop availability"));
+    } finally {
+      setTogglingAvailability(false);
     }
   };
 
@@ -1021,6 +1217,40 @@ export default function App() {
       activeLocalPrinterObj.printerAvailable
   );
   const isAgentOnline = Boolean(localAgentStatus.running || printerState?.agentOnline);
+  const isShopAcceptingOrders = session.tenant?.config?.acceptingOrders !== false;
+  const isShopAvailableForCustomers = Boolean(
+    session.tenant?.status !== "SUSPENDED" &&
+      isShopAcceptingOrders &&
+      isAgentOnline &&
+      isPrinterOnline
+  );
+
+  // Sample Quote calculation for Live Pricing Preview
+  const sampleLogicalPages = Math.max(1, Number(sampleQuote.pages) || 1);
+  const sampleCopies = Math.max(1, Number(sampleQuote.copies) || 1);
+  const sampleIsColor = sampleQuote.colorMode === "color";
+  const sampleIsDuplex = sampleQuote.sides === "duplex";
+  const sampleSingleRate = sampleIsColor
+    ? Number(pricingForm.colorSingleRate) || 0
+    : Number(pricingForm.bwSingleRate) || 0;
+  const sampleDuplexRate = sampleIsColor
+    ? Number(pricingForm.colorDuplexRate) || 0
+    : Number(pricingForm.bwDuplexRate) || 0;
+  const samplePaperSurcharge =
+    Number(pricingForm.paperSizeAdjustments?.[sampleQuote.paperSize]) || 0;
+  const sampleDuplexSheetsPerCopy = sampleIsDuplex ? Math.floor(sampleLogicalPages / 2) : 0;
+  const sampleSinglePagesPerCopy = sampleIsDuplex
+    ? sampleLogicalPages % 2
+    : sampleLogicalPages;
+  const samplePhysicalSheetsPerCopy = sampleIsDuplex
+    ? sampleDuplexSheetsPerCopy + sampleSinglePagesPerCopy
+    : sampleLogicalPages;
+  const sampleTotalPhysicalSheets = samplePhysicalSheetsPerCopy * sampleCopies;
+  const sampleCostPerCopy =
+    sampleDuplexSheetsPerCopy * sampleDuplexRate +
+    sampleSinglePagesPerCopy * sampleSingleRate +
+    samplePhysicalSheetsPerCopy * samplePaperSurcharge;
+  const sampleTotalCost = Math.round(sampleCostPerCopy * sampleCopies * 100) / 100;
 
   return (
     <div
@@ -1176,16 +1406,38 @@ export default function App() {
             </h2>
             <span
               className={`px-2.5 py-0.5 rounded-md text-[11px] font-semibold border ${
-                session.tenant?.status === "ACTIVE"
+                isShopAvailableForCustomers
                   ? "bg-emerald-50 text-emerald-800 border-emerald-200"
-                  : "bg-red-50 text-red-700 border-red-200"
+                  : "bg-amber-50 text-amber-800 border-amber-200"
               }`}
             >
-              Shop {session.tenant?.status || "ACTIVE"}
+              {isShopAvailableForCustomers
+                ? "Shop Open — Accepting Orders"
+                : !isShopAcceptingOrders
+                  ? "Shop Closed (Paused)"
+                  : "Shop Temporarily Unavailable"}
             </span>
           </div>
 
           <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              disabled={togglingAvailability}
+              onClick={() => handleToggleShopAvailability(!isShopAcceptingOrders)}
+              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition disabled:opacity-50 ${
+                isShopAcceptingOrders
+                  ? "bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100"
+                  : "bg-emerald-600 border-emerald-700 text-white hover:bg-emerald-700"
+              }`}
+            >
+              <Power className="w-3.5 h-3.5" />
+              <span>
+                {isShopAcceptingOrders
+                  ? "Close Shop / Stop Accepting Orders"
+                  : "Open Shop / Accept Orders"}
+              </span>
+            </button>
+
             <div
               className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-2 ${
                 isPrinterOnline
@@ -1260,18 +1512,54 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-bold uppercase tracking-wider text-zinc-500">
-                      Shop Status
+                      Shop Availability
                     </span>
-                    <span className="px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                      {session.tenant?.status || "ACTIVE"}
+                    <span
+                      className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
+                        isShopAvailableForCustomers
+                          ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                          : "bg-amber-50 text-amber-800 border-amber-200"
+                      }`}
+                    >
+                      {isShopAvailableForCustomers
+                        ? "Shop Open — Accepting Orders"
+                        : !isShopAcceptingOrders
+                          ? "Closed by Vendor"
+                          : "Temporarily Unavailable"}
                     </span>
                   </div>
                   <h3 className="text-lg font-bold mt-2 truncate">
                     {session.tenant?.shopName}
                   </h3>
                   <p className="text-xs text-zinc-500 font-mono-code mt-1 truncate">
-                    /shop/{session.tenant?.shopSlug}
+                    /shop/{session.tenant?.shopSlug} • B&amp;W ₹{savedPricing.bwSingleRate} • Colour ₹{savedPricing.colorSingleRate}
                   </p>
+                  <div className="mt-3 pt-2.5 border-t border-zinc-100 flex items-center justify-between gap-2">
+                    <button
+                      type="button"
+                      disabled={togglingAvailability}
+                      onClick={() => handleToggleShopAvailability(!isShopAcceptingOrders)}
+                      className={`text-xs font-semibold inline-flex items-center gap-1 ${
+                        isShopAcceptingOrders
+                          ? "text-amber-700 hover:underline"
+                          : "text-emerald-700 hover:underline"
+                      }`}
+                    >
+                      <Power className="w-3 h-3" />
+                      <span>
+                        {isShopAcceptingOrders
+                          ? "Pause / Close Shop"
+                          : "Open Shop & Accept Orders"}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("pricing")}
+                      className="text-xs font-semibold text-[#8D0100] hover:underline"
+                    >
+                      Edit Prices →
+                    </button>
+                  </div>
                 </div>
 
                 <div
@@ -1489,7 +1777,8 @@ export default function App() {
                               <p className="text-xs text-zinc-500 font-mono-code mt-0.5">
                                 {job.token} • {job.copies}x • {job.paperSize} •{" "}
                                 {job.colorMode === "color" ? "Colour" : "B&W"} •{" "}
-                                {job.printablePageCount} page(s)
+                                {job.printablePageCount} page(s) • ₹
+                                {job.totalPrice ?? job.pricingSnapshot?.totalPrice ?? 0}
                               </p>
                             </div>
                             <span
@@ -1505,6 +1794,485 @@ export default function App() {
                     )}
                   </div>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* ================================================================
+              SECTION 2B: PRINTING PRICES & RATES (VENDOR DYNAMIC PRICING)
+              ================================================================ */}
+          {activeTab === "pricing" && (
+            <div className="space-y-6">
+              <div
+                className={`rounded-2xl border p-6 space-y-6 ${
+                  isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
+                }`}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-4 pb-4 border-b border-zinc-100">
+                  <div className="flex items-center gap-3">
+                    <div className="w-11 h-11 rounded-2xl bg-[#8D0100]/10 text-[#8D0100] flex items-center justify-center shrink-0">
+                      <IndianRupee className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-base font-bold">
+                        Printing Prices &amp; Rates — {session.tenant?.shopName}
+                      </h3>
+                      <p className="text-xs text-zinc-500 mt-0.5">
+                        Configure your shop&apos;s per-page and per-duplex-sheet prices in Indian Rupees (₹). Changes apply immediately to your shop&apos;s customer QR portal without affecting any other vendor.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    {pricingDirty && (
+                      <button
+                        type="button"
+                        onClick={handleCancelPricingChanges}
+                        disabled={savingPricing}
+                        className="px-4 py-2 rounded-xl border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-700 text-xs font-semibold"
+                      >
+                        Cancel Changes
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleSavePricing}
+                      disabled={savingPricing}
+                      className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                    >
+                      {savingPricing ? "Saving Prices..." : "Save Prices & Rates"}
+                    </button>
+                  </div>
+                </div>
+
+                <form onSubmit={handleSavePricing} className="space-y-6">
+                  {/* Core 4 Printing Option Rates */}
+                  <div>
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500 mb-3">
+                      1. Base Printing Rates (INR ₹)
+                    </h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {[
+                        {
+                          rateKey: "bwSingleRate",
+                          toggleKey: "bwSingle",
+                          title: "Black & White, Single-sided",
+                          subtitle: "Charged per printed single-sided page",
+                          unit: "per page",
+                          example: "₹2"
+                        },
+                        {
+                          rateKey: "colorSingleRate",
+                          toggleKey: "colorSingle",
+                          title: "Colour, Single-sided",
+                          subtitle: "Charged per printed single-sided colour page",
+                          unit: "per page",
+                          example: "₹5"
+                        },
+                        {
+                          rateKey: "bwDuplexRate",
+                          toggleKey: "bwDuplex",
+                          title: "Black & White, Duplex (Double-sided)",
+                          subtitle: "Charged per duplex physical sheet (2 printed sides)",
+                          unit: "per duplex sheet",
+                          example: "₹3"
+                        },
+                        {
+                          rateKey: "colorDuplexRate",
+                          toggleKey: "colorDuplex",
+                          title: "Colour, Duplex (Double-sided)",
+                          subtitle: "Charged per duplex physical sheet (2 printed colour sides)",
+                          unit: "per duplex sheet",
+                          example: "₹8"
+                        }
+                      ].map((opt) => {
+                        const enabled = pricingForm.enabledOptions?.[opt.toggleKey] !== false;
+                        return (
+                          <div
+                            key={opt.rateKey}
+                            className={`rounded-2xl border p-4 space-y-3 transition ${
+                              enabled
+                                ? isDark
+                                  ? "border-zinc-800 bg-zinc-950"
+                                  : "border-zinc-200 bg-zinc-50/70"
+                                : "border-zinc-200 bg-zinc-100/70 opacity-75"
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-sm font-bold">{opt.title}</span>
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                      enabled
+                                        ? "bg-emerald-100 text-emerald-800"
+                                        : "bg-zinc-200 text-zinc-600"
+                                    }`}
+                                  >
+                                    {enabled ? "Enabled" : "Disabled"}
+                                  </span>
+                                </div>
+                                <p className="text-xs text-zinc-500 mt-0.5">{opt.subtitle}</p>
+                              </div>
+
+                              <label className="inline-flex items-center gap-1.5 text-xs font-semibold cursor-pointer select-none">
+                                <input
+                                  type="checkbox"
+                                  checked={enabled}
+                                  onChange={(e) => {
+                                    setPricingDirty(true);
+                                    setPricingForm((prev) => ({
+                                      ...prev,
+                                      enabledOptions: {
+                                        ...prev.enabledOptions,
+                                        [opt.toggleKey]: e.target.checked
+                                      }
+                                    }));
+                                  }}
+                                  className="w-4 h-4 accent-[#8D0100]"
+                                />
+                                <span>Offer Option</span>
+                              </label>
+                            </div>
+
+                            <div className="flex items-center gap-3">
+                              <div className="relative flex-1">
+                                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-zinc-500">
+                                  ₹
+                                </span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={10000}
+                                  step="0.5"
+                                  required
+                                  value={pricingForm[opt.rateKey]}
+                                  onChange={(e) => {
+                                    setPricingDirty(true);
+                                    setPricingForm((prev) => ({
+                                      ...prev,
+                                      [opt.rateKey]: e.target.value
+                                    }));
+                                  }}
+                                  className="w-full h-11 pl-8 pr-28 rounded-xl border border-zinc-300 bg-white text-zinc-900 text-sm font-mono-code font-bold focus:border-[#8D0100] focus:outline-none"
+                                />
+                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-semibold text-zinc-400">
+                                  {opt.unit}
+                                </span>
+                              </div>
+                              <span className="text-[11px] text-zinc-400 shrink-0">
+                                Example: {opt.example}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Paper Size Surcharges & Enable/Disable */}
+                  <div className="pt-2 border-t border-zinc-100">
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <div>
+                        <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500">
+                          2. Paper Size Availability &amp; Optional Extra Charge (₹ per physical sheet)
+                        </h4>
+                        <p className="text-xs text-zinc-500 mt-0.5">
+                          Enable the paper sizes your shop offers and optionally add an extra per-sheet surcharge for larger sizes (leave ₹0 for standard pricing).
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
+                      {ALL_PAPER_SIZES.map((sz) => {
+                        const isSizeEnabled = (
+                          pricingForm.enabledOptions?.enabledPaperSizes || ALL_PAPER_SIZES
+                        ).includes(sz);
+                        return (
+                          <div
+                            key={sz}
+                            className={`rounded-xl border p-3 space-y-2 ${
+                              isSizeEnabled
+                                ? isDark
+                                  ? "border-zinc-800 bg-zinc-950"
+                                  : "border-zinc-200 bg-zinc-50"
+                                : "border-zinc-200 bg-zinc-100 opacity-65"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-bold font-mono-code">{sz}</span>
+                              <input
+                                type="checkbox"
+                                checked={isSizeEnabled}
+                                onChange={(e) => {
+                                  const curr =
+                                    pricingForm.enabledOptions?.enabledPaperSizes ||
+                                    ALL_PAPER_SIZES;
+                                  const next = e.target.checked
+                                    ? Array.from(new Set([...curr, sz]))
+                                    : curr.filter((s) => s !== sz);
+                                  if (next.length === 0) {
+                                    toast.error("At least one paper size must remain enabled.");
+                                    return;
+                                  }
+                                  setPricingDirty(true);
+                                  setPricingForm((prev) => ({
+                                    ...prev,
+                                    enabledOptions: {
+                                      ...prev.enabledOptions,
+                                      enabledPaperSizes: next
+                                    }
+                                  }));
+                                }}
+                                className="w-3.5 h-3.5 accent-[#8D0100]"
+                                title={`Enable or disable ${sz} paper`}
+                              />
+                            </div>
+                            <div className="relative">
+                              <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-xs font-bold text-zinc-400">
+                                +₹
+                              </span>
+                              <input
+                                type="number"
+                                min={0}
+                                max={10000}
+                                step="0.5"
+                                value={pricingForm.paperSizeAdjustments?.[sz] ?? 0}
+                                onChange={(e) => {
+                                  setPricingDirty(true);
+                                  setPricingForm((prev) => ({
+                                    ...prev,
+                                    paperSizeAdjustments: {
+                                      ...prev.paperSizeAdjustments,
+                                      [sz]: e.target.value
+                                    }
+                                  }));
+                                }}
+                                className="w-full h-9 pl-7 pr-2 rounded-lg border border-zinc-300 bg-white text-zinc-900 text-xs font-mono-code font-bold focus:border-[#8D0100] focus:outline-none"
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Live Customer Pricing Preview Table & Interactive Calculator */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 pt-3 border-t border-zinc-100">
+                    {/* Live Rate Table */}
+                    <div className="rounded-2xl border border-zinc-200 bg-zinc-50/70 p-4 space-y-3 text-zinc-900">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold uppercase tracking-wider text-zinc-500">
+                          Live Customer Rate Card Preview
+                        </span>
+                        <span className="text-[11px] font-semibold text-[#8D0100]">
+                          Shown on /shop/{session.tenant?.shopSlug}
+                        </span>
+                      </div>
+
+                      <div className="overflow-hidden rounded-xl border border-zinc-200 bg-white">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-zinc-100 text-zinc-600 font-bold">
+                            <tr>
+                              <th className="py-2.5 px-3">Printing Option</th>
+                              <th className="py-2.5 px-3">Status</th>
+                              <th className="py-2.5 px-3 text-right">Customer Price</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-zinc-100">
+                            {[
+                              {
+                                label: "Black & White, Single-sided",
+                                enabled: pricingForm.enabledOptions?.bwSingle !== false,
+                                price: `₹${Number(pricingForm.bwSingleRate) || 0} / page`
+                              },
+                              {
+                                label: "Colour, Single-sided",
+                                enabled: pricingForm.enabledOptions?.colorSingle !== false,
+                                price: `₹${Number(pricingForm.colorSingleRate) || 0} / page`
+                              },
+                              {
+                                label: "Black & White, Duplex (2 sides)",
+                                enabled: pricingForm.enabledOptions?.bwDuplex !== false,
+                                price: `₹${Number(pricingForm.bwDuplexRate) || 0} / sheet`
+                              },
+                              {
+                                label: "Colour, Duplex (2 sides)",
+                                enabled: pricingForm.enabledOptions?.colorDuplex !== false,
+                                price: `₹${Number(pricingForm.colorDuplexRate) || 0} / sheet`
+                              }
+                            ].map((row) => (
+                              <tr key={row.label}>
+                                <td className="py-2.5 px-3 font-semibold">{row.label}</td>
+                                <td className="py-2.5 px-3">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                      row.enabled
+                                        ? "bg-emerald-50 text-emerald-700"
+                                        : "bg-zinc-100 text-zinc-500"
+                                    }`}
+                                  >
+                                    {row.enabled ? "Active" : "Disabled"}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono-code font-bold text-zinc-900">
+                                  {row.price}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="text-[11px] text-zinc-500">
+                        Enabled Paper Sizes:{" "}
+                        <strong className="font-mono-code">
+                          {(pricingForm.enabledOptions?.enabledPaperSizes || ["A4"]).join(", ")}
+                        </strong>
+                      </p>
+                    </div>
+
+                    {/* Interactive Sample Order Price Simulator */}
+                    <div className="rounded-2xl border border-zinc-200 bg-zinc-50/70 p-4 space-y-3 text-zinc-900">
+                      <span className="text-xs font-bold uppercase tracking-wider text-zinc-500 block">
+                        Interactive Price Breakdown Simulator
+                      </span>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 text-xs">
+                        <div>
+                          <label className="text-[11px] font-semibold text-zinc-500 block mb-1">
+                            Document Pages
+                          </label>
+                          <input
+                            type="number"
+                            min={1}
+                            max={500}
+                            value={sampleQuote.pages}
+                            onChange={(e) =>
+                              setSampleQuote((prev) => ({ ...prev, pages: e.target.value }))
+                            }
+                            className="w-full h-9 px-2.5 rounded-lg border border-zinc-300 bg-white font-mono-code font-bold"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] font-semibold text-zinc-500 block mb-1">
+                            Copies
+                          </label>
+                          <input
+                            type="number"
+                            min={1}
+                            max={100}
+                            value={sampleQuote.copies}
+                            onChange={(e) =>
+                              setSampleQuote((prev) => ({ ...prev, copies: e.target.value }))
+                            }
+                            className="w-full h-9 px-2.5 rounded-lg border border-zinc-300 bg-white font-mono-code font-bold"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] font-semibold text-zinc-500 block mb-1">
+                            Paper Size
+                          </label>
+                          <select
+                            value={sampleQuote.paperSize}
+                            onChange={(e) =>
+                              setSampleQuote((prev) => ({ ...prev, paperSize: e.target.value }))
+                            }
+                            className="w-full h-9 px-2 rounded-lg border border-zinc-300 bg-white font-semibold"
+                          >
+                            {ALL_PAPER_SIZES.map((sz) => (
+                              <option key={sz} value={sz}>
+                                {sz}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-[11px] font-semibold text-zinc-500 block mb-1">
+                            Colour Mode
+                          </label>
+                          <select
+                            value={sampleQuote.colorMode}
+                            onChange={(e) =>
+                              setSampleQuote((prev) => ({ ...prev, colorMode: e.target.value }))
+                            }
+                            className="w-full h-9 px-2 rounded-lg border border-zinc-300 bg-white font-semibold"
+                          >
+                            <option value="bw">Black &amp; White</option>
+                            <option value="color">Colour</option>
+                          </select>
+                        </div>
+                        <div className="col-span-2">
+                          <label className="text-[11px] font-semibold text-zinc-500 block mb-1">
+                            Printing Sides
+                          </label>
+                          <select
+                            value={sampleQuote.sides}
+                            onChange={(e) =>
+                              setSampleQuote((prev) => ({ ...prev, sides: e.target.value }))
+                            }
+                            className="w-full h-9 px-2 rounded-lg border border-zinc-300 bg-white font-semibold"
+                          >
+                            <option value="single">Single-sided (1 side per sheet)</option>
+                            <option value="duplex">Duplex (Front &amp; Back — 2 sides per sheet)</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl bg-white border border-zinc-200 p-3 space-y-1.5 text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-zinc-500">Logical Printed Pages:</span>
+                          <span className="font-mono-code font-semibold">
+                            {sampleLogicalPages} page(s) × {sampleCopies} copy ={" "}
+                            {sampleLogicalPages * sampleCopies} sides
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-zinc-500">Physical Paper Sheets:</span>
+                          <span className="font-mono-code font-semibold">
+                            {samplePhysicalSheetsPerCopy} sheet(s)/copy × {sampleCopies} ={" "}
+                            {sampleTotalPhysicalSheets} sheet(s)
+                          </span>
+                        </div>
+                        {sampleIsDuplex && (
+                          <div className="flex justify-between text-[11px] text-zinc-500">
+                            <span>Duplex Breakdown per Copy:</span>
+                            <span className="font-mono-code">
+                              {sampleDuplexSheetsPerCopy} duplex sheet(s) @ ₹{sampleDuplexRate}
+                              {sampleSinglePagesPerCopy > 0
+                                ? ` + ${sampleSinglePagesPerCopy} odd page @ ₹${sampleSingleRate}`
+                                : ""}
+                            </span>
+                          </div>
+                        )}
+                        <div className="pt-2 border-t border-zinc-100 flex items-center justify-between">
+                          <span className="font-bold text-zinc-800">Estimated Customer Total:</span>
+                          <span className="text-base font-bold font-mono-code text-[#8D0100]">
+                            ₹{sampleTotalCost}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-end gap-3 pt-2 border-t border-zinc-100">
+                    {pricingDirty && (
+                      <button
+                        type="button"
+                        onClick={handleCancelPricingChanges}
+                        disabled={savingPricing}
+                        className="px-4 py-2.5 rounded-xl border border-zinc-300 bg-white hover:bg-zinc-50 text-zinc-700 text-xs font-semibold"
+                      >
+                        Cancel / Revert Changes
+                      </button>
+                    )}
+                    <button
+                      type="submit"
+                      disabled={savingPricing}
+                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                    >
+                      {savingPricing ? "Saving Prices..." : "Save Printing Prices & Rates"}
+                    </button>
+                  </div>
+                </form>
               </div>
             </div>
           )}
@@ -2083,7 +2851,9 @@ export default function App() {
                               </span>
                             </div>
                             <p className="text-xs text-zinc-500 font-mono-code mt-0.5">
-                              {order.token} • {formatBytes(order.fileSize)} •{" "}
+                              {order.token} • ₹
+                              {order.totalPrice ?? order.pricingSnapshot?.totalPrice ?? 0} •{" "}
+                              {formatBytes(order.fileSize)} •{" "}
                               {new Date(order.createdAt).toLocaleString()}
                             </p>
                           </div>

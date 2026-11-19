@@ -145,6 +145,21 @@ const agentSchema = new mongoose.Schema(
       type: Date,
       default: null
     },
+    lastHeartbeatAt: {
+      type: Date,
+      default: null,
+      index: true
+    },
+    connectionStatus: {
+      type: String,
+      enum: ["ONLINE", "OFFLINE"],
+      default: "OFFLINE"
+    },
+    applicationStatus: {
+      type: String,
+      enum: ["RUNNING", "CLOSED"],
+      default: "RUNNING"
+    },
     lastStatus: {
       type: String,
       enum: ["READY", "ONLINE", "PRINTING", "OFFLINE", "ERROR"],

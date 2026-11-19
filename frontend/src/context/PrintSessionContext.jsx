@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from "react";
 import { fetchShopInfo, getApiErrorMessage } from "../services/api";
+import { normalizeVendorPricing, DEFAULT_VENDOR_PRICING } from "../utils/pricingCalculator";
 
 const PrintSessionContext = createContext(null);
 
@@ -28,6 +29,10 @@ export function PrintSessionProvider({ children }) {
 
   const [printerState, setPrinterState] = useState({
     online: false,
+    shopAvailable: false,
+    availabilityStatus: "CONNECTING",
+    availabilityLabel: "Checking Shop Availability...",
+    unavailableReason: "Checking shop printer availability...",
     connectionState: "CONNECTING",
     statusLabel: "Connecting...",
     agentOnline: false,
@@ -37,6 +42,7 @@ export function PrintSessionProvider({ children }) {
     status: "CONNECTING",
     statusMessage: "Checking shop printer availability...",
     spoolerJobCount: 0,
+    pricing: DEFAULT_VENDOR_PRICING,
     capabilities: {
       supportedPaperSizes: ["A4", "Letter", "Legal", "A5"],
       supportsColor: false,
@@ -321,12 +327,17 @@ export function PrintSessionProvider({ children }) {
     }, 0);
   }, [uploadedDocuments]);
 
+  const shopPricing = useMemo(() => {
+    return normalizeVendorPricing(shopInfo?.pricing || printerState?.pricing);
+  }, [shopInfo?.pricing, printerState?.pricing]);
+
   return (
     <PrintSessionContext.Provider
       value={{
         shopSlug,
         setShopSlug,
         shopInfo,
+        shopPricing,
         shopLoading,
         shopError,
         uploadedDocuments,

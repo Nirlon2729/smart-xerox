@@ -26,14 +26,44 @@ const PAPER_ASPECT_RATIOS = {
   A4: { widthMm: 210, heightMm: 297, ratio: 210 / 297, label: "A4 (210 × 297 mm)" },
   A3: { widthMm: 297, heightMm: 420, ratio: 297 / 420, label: "A3 (297 × 420 mm)" },
   A5: { widthMm: 148, heightMm: 210, ratio: 148 / 210, label: "A5 (148 × 210 mm)" },
-  Letter: { widthMm: 216, heightMm: 279, ratio: 216 / 279, label: "Letter (8.5 × 11 in)" },
-  Legal: { widthMm: 216, heightMm: 356, ratio: 216 / 356, label: "Legal (8.5 × 14 in)" },
+  Letter: { widthMm: 216, heightMm: 279, ratio: 216 / 279, label: "Letter (216 × 279 mm)" },
+  Legal: { widthMm: 216, heightMm: 356, ratio: 216 / 356, label: "Legal (216 × 356 mm)" },
   B5: { widthMm: 176, heightMm: 250, ratio: 176 / 250, label: "B5 (176 × 250 mm)" },
-  Executive: { widthMm: 184, heightMm: 267, ratio: 184 / 267, label: "Executive (7.25 × 10.5 in)" }
+  Executive: { widthMm: 184, heightMm: 267, ratio: 184 / 267, label: "Executive (184 × 267 mm)" }
 };
 
+function getOrientedSheetDimensions(paperSize = "A4", isLandscape = false, scale = 1.0, compact = false) {
+  const meta = PAPER_ASPECT_RATIOS[paperSize] || PAPER_ASPECT_RATIOS.A4;
+  const sheetWmm = isLandscape ? meta.heightMm : meta.widthMm;
+  const sheetHmm = isLandscape ? meta.widthMm : meta.heightMm;
+
+  // Normalize visual size relative to A4 (297mm long edge) so Legal looks taller and A5 looks smaller
+  const baseLongEdgePx = compact ? 150 : Math.round(380 * scale);
+  const longEdgeMm = Math.max(sheetWmm, sheetHmm);
+  const sizeFactor = Math.max(0.82, Math.min(1.18, longEdgeMm / 297));
+  const scaledLongEdgePx = Math.round(baseLongEdgePx * sizeFactor);
+
+  const widthPx =
+    sheetWmm >= sheetHmm
+      ? scaledLongEdgePx
+      : Math.round(scaledLongEdgePx * (sheetWmm / sheetHmm));
+  const heightPx =
+    sheetHmm > sheetWmm
+      ? scaledLongEdgePx
+      : Math.round(scaledLongEdgePx * (sheetHmm / sheetWmm));
+
+  return {
+    widthPx,
+    heightPx,
+    sheetWmm,
+    sheetHmm,
+    dimensionsLabel: `${sheetWmm} × ${sheetHmm} mm`
+  };
+}
+
 /**
- * Renders a single PDF page from a loaded PDFDocumentProxy onto a <canvas>.
+ * Renders a single PDF page from a loaded PDFDocumentProxy onto a <canvas>
+ * fitted proportionally inside the selected Paper Size and Orientation sheet.
  */
 function PdfPageCanvas({
   pdfDoc,
@@ -50,6 +80,11 @@ function PdfPageCanvas({
   const [rendering, setRendering] = useState(true);
   const [pageError, setPageError] = useState(null);
 
+  const sheetDims = getOrientedSheetDimensions(paperSize, isLandscape, scale, compact);
+  const marginPx = compact ? 6 : 14;
+  const innerWidthPx = Math.max(40, sheetDims.widthPx - marginPx * 2);
+  const innerHeightPx = Math.max(40, sheetDims.heightPx - marginPx * 2);
+
   useEffect(() => {
     let cancelled = false;
     let renderTask = null;
@@ -62,10 +97,15 @@ function PdfPageCanvas({
         const page = await pdfDoc.getPage(pageNumber);
         if (cancelled) return;
 
-        const baseTargetWidth = compact ? 180 : Math.round(460 * scale);
         const unscaledViewport = page.getViewport({ scale: 1 });
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const computedScale = (baseTargetWidth / unscaledViewport.width) * dpr;
+
+        // Fit full page inside the oriented paper sheet without cropping
+        const fitScale = Math.min(
+          innerWidthPx / unscaledViewport.width,
+          innerHeightPx / unscaledViewport.height
+        );
+        const computedScale = fitScale * dpr;
         const viewport = page.getViewport({ scale: computedScale });
 
         const canvas = canvasRef.current;
@@ -104,10 +144,7 @@ function PdfPageCanvas({
         }
       }
     };
-  }, [pdfDoc, pageNumber, scale, compact]);
-
-  const paperMeta = PAPER_ASPECT_RATIOS[paperSize] || PAPER_ASPECT_RATIOS.A4;
-  const sheetRatio = isLandscape ? 1 / paperMeta.ratio : paperMeta.ratio;
+  }, [pdfDoc, pageNumber, innerWidthPx, innerHeightPx]);
 
   if (compact) {
     return (
@@ -126,8 +163,11 @@ function PdfPageCanvas({
         }`}
       >
         <div
-          style={{ aspectRatio: `${sheetRatio}` }}
-          className="w-full rounded-lg bg-white border border-zinc-200 overflow-hidden flex items-center justify-center relative"
+          style={{
+            width: `${sheetDims.widthPx}px`,
+            height: `${sheetDims.heightPx}px`
+          }}
+          className="mx-auto rounded-lg bg-white border border-zinc-200 overflow-hidden flex items-center justify-center relative"
         >
           {rendering && (
             <Loader2 className="w-4 h-4 text-[#8D0100] animate-spin absolute" />
@@ -197,10 +237,14 @@ function PdfPageCanvas({
         )}
       </div>
 
-      <div className="overflow-auto rounded-xl bg-zinc-100 border border-zinc-200 p-3 sm:p-5 flex items-center justify-center min-h-[260px]">
+      <div className="overflow-auto rounded-xl bg-zinc-100 border border-zinc-200 p-3 sm:p-5 flex flex-col items-center justify-center min-h-[280px] gap-2">
         <div
-          style={{ aspectRatio: `${sheetRatio}` }}
-          className="bg-white border border-zinc-300 shadow-sm p-2 flex items-center justify-center relative transition-all"
+          style={{
+            width: `${sheetDims.widthPx}px`,
+            height: `${sheetDims.heightPx}px`,
+            padding: `${marginPx}px`
+          }}
+          className="bg-white border-2 border-zinc-300 shadow-sm flex items-center justify-center relative transition-all duration-200 shrink-0"
         >
           {rendering && (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/80 z-10 gap-1.5">
@@ -221,6 +265,9 @@ function PdfPageCanvas({
             />
           )}
         </div>
+        <span className="text-[11px] font-mono-code font-semibold text-zinc-500">
+          {paperSize} Sheet • {isLandscape ? "Landscape" : "Portrait"} ({sheetDims.dimensionsLabel})
+        </span>
       </div>
     </div>
   );
@@ -236,6 +283,7 @@ export default function DocumentPreview({
   height = null,
   selectedPages = [1],
   onTogglePage = null,
+  onOrientationChange = null,
   colorMode = "bw",
   sides = "single",
   paperSize = "A4",
@@ -258,7 +306,7 @@ export default function DocumentPreview({
     orientation === "auto" ? detectedOrientation || "portrait" : orientation;
   const isLandscape = effectiveOrientation === "landscape";
   const paperMeta = PAPER_ASPECT_RATIOS[paperSize] || PAPER_ASPECT_RATIOS.A4;
-  const sheetRatio = isLandscape ? 1 / paperMeta.ratio : paperMeta.ratio;
+  const imageSheetDims = getOrientedSheetDimensions(paperSize, isLandscape, zoom, false);
 
   const totalPages = isImage ? 1 : Math.max(1, loadedPageCount || pageCount || 1);
   const selectedSet = new Set(selectedPages);
@@ -427,13 +475,34 @@ export default function DocumentPreview({
         </div>
 
         {/* Proportional Paper Sheet Simulation */}
-        <div className="bg-zinc-100 rounded-xl p-4 sm:p-6 flex items-center justify-center border border-zinc-200 overflow-auto min-h-[260px]">
+        <div className="bg-zinc-100 rounded-xl p-4 sm:p-6 flex flex-col items-center justify-center border border-zinc-200 overflow-auto min-h-[280px] gap-2">
+          {onOrientationChange && (
+            <div className="flex items-center gap-1.5 bg-white p-1 rounded-xl border border-zinc-200 shadow-2xs mb-1">
+              {["portrait", "landscape"].map((orient) => {
+                const active = effectiveOrientation === orient;
+                return (
+                  <button
+                    key={orient}
+                    type="button"
+                    onClick={() => onOrientationChange(orient)}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold capitalize transition ${
+                      active
+                        ? "bg-[#8D0100] text-white"
+                        : "text-zinc-600 hover:bg-zinc-100"
+                    }`}
+                  >
+                    {orient}
+                  </button>
+                );
+              })}
+            </div>
+          )}
           <div
             style={{
-              aspectRatio: `${sheetRatio}`,
-              width: `${Math.round((isLandscape ? 300 : 220) * zoom)}px`
+              width: `${imageSheetDims.widthPx}px`,
+              height: `${imageSheetDims.heightPx}px`
             }}
-            className="bg-white border border-zinc-300 shadow-sm p-3 flex items-center justify-center transition-all shrink-0"
+            className="bg-white border-2 border-zinc-300 shadow-sm p-3 flex items-center justify-center transition-all duration-200 shrink-0"
           >
             {previewObjectUrl ? (
               <img
@@ -447,6 +516,9 @@ export default function DocumentPreview({
               <span className="text-xs text-zinc-400">Image Preview</span>
             )}
           </div>
+          <span className="text-[11px] font-mono-code font-semibold text-zinc-500">
+            {paperSize} Sheet • {isLandscape ? "Landscape" : "Portrait"} ({imageSheetDims.dimensionsLabel})
+          </span>
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500 pt-1">
@@ -609,6 +681,27 @@ export default function DocumentPreview({
             >
               Fit Width
             </button>
+            {onOrientationChange && (
+              <div className="flex items-center gap-1 ml-1 pl-1 border-l border-zinc-200">
+                {["portrait", "landscape"].map((orient) => {
+                  const active = effectiveOrientation === orient;
+                  return (
+                    <button
+                      key={orient}
+                      type="button"
+                      onClick={() => onOrientationChange(orient)}
+                      className={`px-2 py-1 rounded-lg text-[11px] font-semibold capitalize border transition ${
+                        active
+                          ? "border-[#8D0100] bg-[#8D0100] text-white"
+                          : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-100"
+                      }`}
+                    >
+                      {orient}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       )}

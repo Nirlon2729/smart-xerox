@@ -60,6 +60,7 @@ export default function Home() {
     printerState,
     refreshPrinterStatus,
     shopConfig,
+    shopPricing,
     clearDocument
   } = usePrintSession();
 
@@ -234,7 +235,8 @@ export default function Home() {
     }
   };
 
-  const connBadge = getConnectionBadgeStyle(printerState?.connectionState);
+  const connBadge = getConnectionBadgeStyle(printerState?.connectionState, printerState);
+  const isShopAvailable = Boolean(printerState?.shopAvailable || printerState?.online);
 
   return (
     <div className={documentMeta ? "pb-24 space-y-5" : "pb-12 space-y-5"}>
@@ -268,9 +270,11 @@ export default function Home() {
                 </span>
               </div>
               <p className="text-xs text-zinc-500 truncate mt-0.5">
-                {printerState?.online
+                {isShopAvailable
                   ? `Ready to print on ${printerState.printerName}`
-                  : printerState?.statusMessage || "Checking printer connection..."}
+                  : printerState?.unavailableReason ||
+                    printerState?.statusMessage ||
+                    "Checking printer connection..."}
               </p>
             </div>
           </div>
@@ -287,6 +291,91 @@ export default function Home() {
             <RefreshCw className="w-4 h-4" />
           </button>
         </div>
+
+        {/* Shop Unavailable Warning Banner */}
+        {!isShopAvailable && printerState?.connectionState !== "CONNECTING" && (
+          <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+            <div className="flex items-start gap-2 min-w-0 flex-1">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold">Shop Temporarily Unavailable</p>
+                <p className="text-amber-800 mt-0.5 leading-relaxed">
+                  {printerState?.unavailableReason ||
+                    printerState?.statusMessage ||
+                    "This shop is currently offline or its printer is not ready. Please wait for the shop to come online."}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => refreshPrinterStatus()}
+              className="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold text-xs inline-flex items-center gap-1 shrink-0"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Check Availability</span>
+            </button>
+          </div>
+        )}
+
+        {/* Live Shop Printing Rates Summary */}
+        {shopPricing && (
+          <div className="pt-2.5 border-t border-zinc-100">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-500">
+                Shop Printing Rates
+              </span>
+              <span className="text-[11px] font-medium text-zinc-400">
+                Live shop pricing (₹)
+              </span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              {shopPricing.enabledOptions?.bwSingle !== false && (
+                <div className="p-2 rounded-xl bg-zinc-50 border border-zinc-200/80">
+                  <span className="block text-[10px] font-semibold text-zinc-500">
+                    B&amp;W Single
+                  </span>
+                  <span className="font-mono-code font-bold text-zinc-900">
+                    ₹{shopPricing.bwSingleRate} / page
+                  </span>
+                </div>
+              )}
+              {shopPricing.enabledOptions?.colorSingle !== false &&
+                printerState?.capabilities?.supportsColor && (
+                  <div className="p-2 rounded-xl bg-zinc-50 border border-zinc-200/80">
+                    <span className="block text-[10px] font-semibold text-zinc-500">
+                      Colour Single
+                    </span>
+                    <span className="font-mono-code font-bold text-zinc-900">
+                      ₹{shopPricing.colorSingleRate} / page
+                    </span>
+                  </div>
+                )}
+              {shopPricing.enabledOptions?.bwDuplex !== false &&
+                printerState?.capabilities?.supportsDuplex && (
+                  <div className="p-2 rounded-xl bg-zinc-50 border border-zinc-200/80">
+                    <span className="block text-[10px] font-semibold text-zinc-500">
+                      B&amp;W Duplex
+                    </span>
+                    <span className="font-mono-code font-bold text-zinc-900">
+                      ₹{shopPricing.bwDuplexRate} / sheet
+                    </span>
+                  </div>
+                )}
+              {shopPricing.enabledOptions?.colorDuplex !== false &&
+                printerState?.capabilities?.supportsColor &&
+                printerState?.capabilities?.supportsDuplex && (
+                  <div className="p-2 rounded-xl bg-zinc-50 border border-zinc-200/80">
+                    <span className="block text-[10px] font-semibold text-zinc-500">
+                      Colour Duplex
+                    </span>
+                    <span className="font-mono-code font-bold text-zinc-900">
+                      ₹{shopPricing.colorDuplexRate} / sheet
+                    </span>
+                  </div>
+                )}
+            </div>
+          </div>
+        )}
 
         {(shopInfo?.address || shopInfo?.phone) && (
           <div className="pt-2.5 border-t border-zinc-100 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-500">

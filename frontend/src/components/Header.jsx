@@ -3,32 +3,33 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Printer, ArrowLeft } from "lucide-react";
 import { usePrintSession } from "../context/PrintSessionContext";
 
-export function getConnectionBadgeStyle(connectionState) {
+export function getConnectionBadgeStyle(connectionState, printerState = null) {
+  if (printerState?.shopAvailable || connectionState === "PRINTER_READY") {
+    return {
+      label: "Shop Open — Accepting Orders",
+      shortLabel: "Shop Open",
+      pillClass: "bg-emerald-50 border-emerald-200 text-emerald-800",
+      dotClass: "bg-emerald-600 animate-pulse"
+    };
+  }
   switch (connectionState) {
-    case "PRINTER_READY":
-      return {
-        label: "Printer Ready",
-        pillClass: "bg-emerald-50 border-emerald-200 text-emerald-800",
-        dotClass: "bg-emerald-600 animate-pulse"
-      };
-    case "PRINTER_OFFLINE":
-      return {
-        label: "Printer Offline",
-        pillClass: "bg-amber-50 border-amber-200 text-amber-800",
-        dotClass: "bg-amber-500"
-      };
     case "CONNECTING":
       return {
-        label: "Connecting",
+        label: "Checking Availability...",
+        shortLabel: "Connecting",
         pillClass: "bg-blue-50 border-blue-200 text-blue-800",
         dotClass: "bg-blue-500 animate-pulse"
       };
+    case "SHOP_PAUSED":
+    case "SHOP_SUSPENDED":
+    case "PRINTER_OFFLINE":
     case "AGENT_OFFLINE":
     default:
       return {
-        label: "Shop Offline",
-        pillClass: "bg-zinc-100 border-zinc-200 text-zinc-600",
-        dotClass: "bg-zinc-400"
+        label: "Shop Temporarily Unavailable",
+        shortLabel: "Unavailable",
+        pillClass: "bg-amber-50 border-amber-200 text-amber-800",
+        dotClass: "bg-amber-500"
       };
   }
 }
@@ -44,7 +45,7 @@ export default function Header() {
     location.pathname === `/shop/${shopSlug}` ||
     location.pathname.startsWith("/super-admin");
 
-  const badge = getConnectionBadgeStyle(printerState?.connectionState);
+  const badge = getConnectionBadgeStyle(printerState?.connectionState, printerState);
 
   return (
     <header className="sticky top-0 z-30 bg-white border-b border-zinc-200 pt-safe">
@@ -95,7 +96,8 @@ export default function Header() {
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-semibold ${badge.pillClass}`}
             >
               <span className={`w-2 h-2 rounded-full ${badge.dotClass}`} />
-              <span>{badge.label}</span>
+              <span className="hidden sm:inline">{badge.label}</span>
+              <span className="sm:hidden">{badge.shortLabel || badge.label}</span>
             </div>
           </div>
         )}

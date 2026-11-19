@@ -234,6 +234,9 @@ async function heartbeat(req, res) {
     driverMissing: matchedSelected ? matchedSelected.driverMissing : Boolean(driverMissing),
     printerAvailable: isPrinterReady,
     lastSeenAt: now,
+    lastHeartbeatAt: now,
+    connectionStatus: "ONLINE",
+    applicationStatus: "RUNNING",
     lastStatus: normalizedStatus,
     statusMessage: matchedSelected
       ? matchedSelected.statusMessage
@@ -262,6 +265,27 @@ async function heartbeat(req, res) {
     { _id: req.agent._id, tenantId: req.tenantId },
     { $set: updateFields },
     { new: true }
+  );
+
+  const isShopAccepting = req.tenant.config?.acceptingOrders !== false;
+  const shopAvailableNow = Boolean(
+    req.tenant.status === "ACTIVE" && isShopAccepting && isPrinterReady
+  );
+  const unavailableReasonNow = !isShopAccepting
+    ? "Shop is temporarily closed by the shopkeeper."
+    : !isPrinterReady
+      ? updateFields.statusMessage || "Shop printer is currently offline or disconnected."
+      : null;
+
+  await Tenant.updateOne(
+    { _id: req.tenantId },
+    {
+      $set: {
+        "availability.calculatedStatus": shopAvailableNow ? "AVAILABLE" : "UNAVAILABLE",
+        "availability.unavailableReason": unavailableReasonNow,
+        "availability.lastStatusUpdateAt": now
+      }
+    }
   );
 
   recoverExpiredLeases(req.tenantId).catch(() => {});
@@ -343,9 +367,11 @@ async function nextJob(req, res) {
     job: {
       orderId: job._id,
       tenantId: job.tenantId,
+      shopId: job.tenantId,
       shopSlug: job.shopSlug,
       token: job.token,
       originalName: job.originalName,
+      documentId: job.gridFsFileId,
       gridFsFileId: job.gridFsFileId,
       fileSha256: job.fileSha256,
       documentType: job.documentType || "pdf",
@@ -359,7 +385,10 @@ async function nextJob(req, res) {
       sides: job.sides,
       paperSize: job.paperSize || "A4",
       orientation: job.orientation || "auto",
+      printerId: resolvedPrinter,
       printerName: resolvedPrinter,
+      pricingSnapshot: job.pricingSnapshot || null,
+      printConfigSnapshot: job.printConfigSnapshot || null,
       agentJobId: job.agentJobId
     }
   });
@@ -516,8 +545,53 @@ async function updateJobStatus(req, res) {
   });
 }
 
+/**
+ * POST /api/agent/offline
+ * Graceful shutdown notification when the vendor closes the Smart Xerox Windows Desktop App.
+ * Immediately marks the agent offline and updates the shop's calculated availability to UNAVAILABLE.
+ */
+async function agentOffline(req, res) {
+  const now = new Date();
+  const reason = req.body?.reason
+    ? String(req.body.reason).slice(0, 200)
+    : "Vendor desktop application was closed.";
+
+  await Agent.findOneAndUpdate(
+    { _id: req.agent._id, tenantId: req.tenantId },
+    {
+      $set: {
+        connectionStatus: "OFFLINE",
+        applicationStatus: "CLOSED",
+        printerAvailable: false,
+        lastStatus: "OFFLINE",
+        statusMessage: reason
+      }
+    }
+  );
+
+  await Tenant.updateOne(
+    { _id: req.tenantId },
+    {
+      $set: {
+        "availability.calculatedStatus": "UNAVAILABLE",
+        "availability.unavailableReason":
+          "Sorry, this shop is temporarily unavailable because the shop's computer application is closed.",
+        "availability.lastStatusUpdateAt": now
+      }
+    }
+  );
+
+  res.json({
+    success: true,
+    status: "OFFLINE",
+    shopAvailable: false,
+    message: "Agent marked offline and shop availability updated to UNAVAILABLE."
+  });
+}
+
 module.exports = {
   heartbeat,
+  agentOffline,
   nextJob,
   downloadJobFile,
   updateJobStatus,

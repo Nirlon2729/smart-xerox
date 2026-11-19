@@ -779,8 +779,123 @@ async function runTests() {
     }
     console.log("  PASS: Agent job claiming, GridFS stream verification, and status lifecycle verified.");
 
-    // 8. Agent Revocation & Audit Log Verification
-    console.log("\n[8/8] Testing Agent Revocation & Audit Logging...");
+    // 8. Multi-Vendor Dynamic Pricing Isolation & Immutable Order Price Snapshot
+    console.log("\n[8/10] Testing Multi-Vendor Dynamic Pricing Isolation & Order Snapshot Immutability...");
+    const setPriceA = await apiRequest(baseUrl, "PUT", "/vendor/pricing", {
+      headers: { Authorization: `Bearer ${tokenA}` },
+      body: {
+        bwSingleRate: 3,
+        colorSingleRate: 5,
+        bwDuplexRate: 4,
+        colorDuplexRate: 8
+      }
+    });
+    assert.strictEqual(setPriceA.status, 200);
+    assert.strictEqual(setPriceA.data.pricing.bwSingleRate, 3);
+    assert.strictEqual(setPriceA.data.pricing.colorSingleRate, 5);
+
+    const setPriceB = await apiRequest(baseUrl, "PUT", "/vendor/pricing", {
+      headers: { Authorization: `Bearer ${tokenB}` },
+      body: {
+        bwSingleRate: 2,
+        colorSingleRate: 7,
+        bwDuplexRate: 3,
+        colorDuplexRate: 10
+      }
+    });
+    assert.strictEqual(setPriceB.status, 200);
+    assert.strictEqual(setPriceB.data.pricing.colorSingleRate, 7);
+
+    // Negative price must be rejected with 400
+    const negPrice = await apiRequest(baseUrl, "PUT", "/vendor/pricing", {
+      headers: { Authorization: `Bearer ${tokenA}` },
+      body: { bwSingleRate: -5 }
+    });
+    assert.strictEqual(negPrice.status, 400, "Negative price must be rejected");
+
+    // Verify customer shop endpoints return each vendor's independent pricing
+    const pubPriceA = await apiRequest(baseUrl, "GET", `/shops/${vendorA.shopSlug}`);
+    const pubPriceB = await apiRequest(baseUrl, "GET", `/shops/${vendorB.shopSlug}`);
+    assert.strictEqual(pubPriceA.data.shop.pricing.colorSingleRate, 5);
+    assert.strictEqual(pubPriceB.data.shop.pricing.colorSingleRate, 7);
+
+    // Existing Order A price snapshot must remain unchanged even after Vendor A changed bwSingleRate to ₹3
+    const orderACheck = await apiRequest(baseUrl, "GET", `/shops/${vendorA.shopSlug}/orders/${orderA.token}`);
+    assert.strictEqual(orderACheck.status, 200);
+    assert.strictEqual(
+      orderACheck.data.order.pricingSnapshot.appliedSingleRate,
+      2,
+      "Historical order pricingSnapshot must remain immutable after vendor edits prices"
+    );
+    console.log("  PASS: Multi-vendor pricing isolation and historical order snapshot immutability verified.");
+
+    // 9. Automatic Shop Availability & Server-Side Order Protection
+    console.log("\n[9/10] Testing Shop Availability (Manual Pause, App Close /agent/offline, Multi-Vendor Isolation)...");
+    const inspectA2 = await apiRequest(
+      baseUrl,
+      "POST",
+      `/shops/${vendorA.shopSlug}/orders/inspect`,
+      { body: buildMultipartPdfForm("alpha-availability.pdf", SAMPLE_PDF) }
+    );
+    assert.strictEqual(inspectA2.status, 200);
+    const uploadIdA2 = inspectA2.data.document.uploadId;
+    createdGridFsIds.push({ id: uploadIdA2, tenantId: vendorA.id });
+
+    // 9a. Vendor A manually pauses shop -> Shop A rejects orders (403), Shop B remains AVAILABLE
+    const pauseA = await apiRequest(baseUrl, "PUT", "/vendor/availability", {
+      headers: { Authorization: `Bearer ${tokenA}` },
+      body: { acceptingOrders: false }
+    });
+    assert.strictEqual(pauseA.status, 200);
+    assert.strictEqual(pauseA.data.printer.shopAvailable, false);
+
+    const rejectedPausedOrder = await apiRequest(
+      baseUrl,
+      "POST",
+      `/shops/${vendorA.shopSlug}/orders`,
+      {
+        body: { uploadId: uploadIdA2, colorMode: "bw", sides: "single", paperSize: "A4", copies: 1 }
+      }
+    );
+    assert.strictEqual(rejectedPausedOrder.status, 403, "Paused shop must reject new orders with 403");
+
+    const shopBStillOpen = await apiRequest(baseUrl, "GET", `/shops/${vendorB.shopSlug}`);
+    assert.strictEqual(shopBStillOpen.data.printer.shopAvailable, true, "Shop B must stay available when Shop A pauses");
+
+    // Re-open Shop A
+    const reopenA = await apiRequest(baseUrl, "PUT", "/vendor/availability", {
+      headers: { Authorization: `Bearer ${tokenA}` },
+      body: { acceptingOrders: true }
+    });
+    assert.strictEqual(reopenA.status, 200);
+    assert.strictEqual(reopenA.data.printer.shopAvailable, true);
+
+    // 9b. Vendor A closes desktop app -> /agent/offline immediately marks Shop A UNAVAILABLE (503 on order)
+    const offlineA = await apiRequest(baseUrl, "POST", "/agent/offline", {
+      headers: {
+        "x-agent-id": credsA.agentId,
+        "x-agent-secret": credsA.agentSecret
+      },
+      body: { reason: "Vendor closed Smart Xerox desktop application." }
+    });
+    assert.strictEqual(offlineA.status, 200);
+
+    const shopAOfflineInfo = await apiRequest(baseUrl, "GET", `/shops/${vendorA.shopSlug}`);
+    assert.strictEqual(shopAOfflineInfo.data.printer.shopAvailable, false);
+
+    const rejectedOfflineOrder = await apiRequest(
+      baseUrl,
+      "POST",
+      `/shops/${vendorA.shopSlug}/orders`,
+      {
+        body: { uploadId: uploadIdA2, colorMode: "bw", sides: "single", paperSize: "A4", copies: 1 }
+      }
+    );
+    assert.strictEqual(rejectedOfflineOrder.status, 503, "Offline shop must reject new orders with 503");
+    console.log("  PASS: Server-side order protection blocks paused/offline shops while keeping other vendors unaffected.");
+
+    // 10. Agent Revocation & Audit Log Verification
+    console.log("\n[10/10] Testing Agent Revocation & Audit Logging...");
     const revokeRes = await apiRequest(
       baseUrl,
       "POST",
@@ -806,7 +921,7 @@ async function runTests() {
     console.log("  PASS: Agent revocation enforced immediately and security events recorded in AuditLog.");
 
     console.log("\n====================================================================");
-    console.log("STAGE 2 RESULT: ALL 8 MULTI-VENDOR ISOLATION & SECURITY TESTS PASSED!");
+    console.log("STAGE 2 RESULT: ALL 10 MULTI-VENDOR PRICING, AVAILABILITY & ISOLATION TESTS PASSED!");
     console.log("====================================================================");
   } finally {
     // Clean up ONLY the temporary test documents created during this test run

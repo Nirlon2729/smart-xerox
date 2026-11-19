@@ -510,6 +510,32 @@ class UniversalPrinterTests(unittest.TestCase):
                 self.assertEqual(mock_dib.return_value.draw.call_count, 4)
                 mock_dc.EndDoc.assert_called_once()
 
+    def test_15_portrait_vs_landscape_and_paper_size_sheet_composition(self):
+        # Create a 600x900 portrait image
+        src_img = Image.new("RGB", (600, 900), color=(40, 120, 200))
+
+        # 1. A4 Portrait at 150 DPI -> 210x297 mm -> width < height
+        a4_portrait = agent.compose_image_onto_sheet(
+            src_img, paper_size="A4", requested_orientation="portrait", dpi=150
+        )
+        self.assertLess(a4_portrait.width, a4_portrait.height)
+        self.assertEqual(a4_portrait.width, int(round((210.0 / 25.4) * 150)))
+        self.assertEqual(a4_portrait.height, int(round((297.0 / 25.4) * 150)))
+
+        # 2. A4 Landscape at 150 DPI -> 297x210 mm -> width > height
+        a4_landscape = agent.compose_image_onto_sheet(
+            src_img, paper_size="A4", requested_orientation="landscape", dpi=150
+        )
+        self.assertGreater(a4_landscape.width, a4_landscape.height)
+        self.assertEqual(a4_landscape.width, int(round((297.0 / 25.4) * 150)))
+        self.assertEqual(a4_landscape.height, int(round((210.0 / 25.4) * 150)))
+
+        # 3. Legal Portrait at 150 DPI -> 216x356 mm -> taller than A4
+        legal_portrait = agent.compose_image_onto_sheet(
+            src_img, paper_size="Legal", requested_orientation="portrait", dpi=150
+        )
+        self.assertGreater(legal_portrait.height, a4_portrait.height)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

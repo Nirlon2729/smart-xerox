@@ -145,6 +145,17 @@ PAPER_SIZE_MAP = {
     "Executive": getattr(win32con, "DMPAPER_EXECUTIVE", 7),
 }
 
+# Physical paper dimensions in millimeters (Portrait width x height)
+PAPER_DIMENSIONS_MM = {
+    "A4": (210.0, 297.0),
+    "A3": (297.0, 420.0),
+    "A5": (148.0, 210.0),
+    "Letter": (215.9, 279.4),
+    "Legal": (215.9, 355.6),
+    "B5": (176.0, 250.0),
+    "Executive": (184.15, 266.7),
+}
+
 # Standard paper sizes exposed to the customer & vendor configuration schemas
 STANDARD_CUSTOMER_PAPER_SIZES = ("A4", "A3", "A5", "Letter", "Legal", "B5", "Executive")
 
@@ -1198,6 +1209,30 @@ def send_heartbeat(
         return False, {"error": str(exc)}
 
 
+def send_offline_notification(
+    backend_url: str,
+    agent_id: str,
+    agent_secret: str,
+    reason: str = "Vendor desktop application closed.",
+) -> bool:
+    """
+    Notifies the cloud backend that this print agent is going offline so the shop
+    is immediately marked UNAVAILABLE for new customer print orders.
+    """
+    if not backend_url or not agent_id or not agent_secret:
+        return False
+    try:
+        resp = requests.post(
+            f"{backend_url}/agent/offline",
+            headers=build_agent_headers(agent_id, agent_secret),
+            json={"reason": reason},
+            timeout=4,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def update_backend_job_status(
     backend_url: str,
     agent_id: str,
@@ -1270,14 +1305,60 @@ def download_job_document(
     return total_bytes
 
 
+def compose_image_onto_sheet(
+    content_img: Image.Image,
+    paper_size: str = "A4",
+    requested_orientation: str = "auto",
+    dpi: int = 300,
+) -> Image.Image:
+    """
+    Fits a rendered page or image onto a white sheet canvas matching the exact
+    requested paper size (A4, A3, A5, Letter, Legal, B5, Executive) and orientation
+    (Portrait vs Landscape) without cropping any content.
+    """
+    w_mm, h_mm = PAPER_DIMENSIONS_MM.get(paper_size, PAPER_DIMENSIONS_MM["A4"])
+    is_content_landscape = content_img.width > content_img.height
+
+    if requested_orientation == "landscape":
+        use_landscape = True
+    elif requested_orientation == "portrait":
+        use_landscape = False
+    else:
+        use_landscape = is_content_landscape
+
+    sheet_w_mm, sheet_h_mm = (h_mm, w_mm) if use_landscape else (w_mm, h_mm)
+    sheet_w_px = max(100, int(round((sheet_w_mm / 25.4) * dpi)))
+    sheet_h_px = max(100, int(round((sheet_h_mm / 25.4) * dpi)))
+
+    scale = min(
+        sheet_w_px / float(max(1, content_img.width)),
+        sheet_h_px / float(max(1, content_img.height)),
+    )
+    target_w = max(1, int(round(content_img.width * scale)))
+    target_h = max(1, int(round(content_img.height * scale)))
+
+    resized = (
+        content_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        if (target_w, target_h) != content_img.size
+        else content_img
+    )
+
+    sheet = Image.new("RGB", (sheet_w_px, sheet_h_px), (255, 255, 255))
+    offset_x = max(0, (sheet_w_px - target_w) // 2)
+    offset_y = max(0, (sheet_h_px - target_h) // 2)
+    sheet.paste(resized, (offset_x, offset_y))
+    return sheet
+
+
 def render_pages_to_pil_images(job: dict, file_path: Path, dpi: int = 300) -> list:
     """
     Uses PyMuPDF (for PDFs) or Pillow (for JPG/PNG images) to prepare the exact selected pages,
-    colour mode (B&W grayscale vs Colour), and orientation into 300 DPI PIL Images.
+    colour mode (B&W grayscale vs Colour), paper size, and orientation into 300 DPI PIL Images.
     """
     doc_type = job.get("documentType", "pdf")
     color_mode = job.get("colorMode", "bw")
     requested_orientation = job.get("orientation", "auto")
+    paper_size = job.get("paperSize", "A4")
     selected_pages = job.get("selectedPages") or [1]
 
     pil_pages = []
@@ -1290,13 +1371,13 @@ def render_pages_to_pil_images(job: dict, file_path: Path, dpi: int = 300) -> li
         else:
             img = img.convert("RGB")
 
-        is_img_landscape = img.width > img.height
-        if requested_orientation == "portrait" and is_img_landscape:
-            img = img.rotate(90, expand=True)
-        elif requested_orientation == "landscape" and not is_img_landscape:
-            img = img.rotate(90, expand=True)
-
-        pil_pages.append(img)
+        composed = compose_image_onto_sheet(
+            img,
+            paper_size=paper_size,
+            requested_orientation=requested_orientation,
+            dpi=dpi,
+        )
+        pil_pages.append(composed)
         return pil_pages
 
     pdf_doc = fitz.open(file_path)
@@ -1317,13 +1398,13 @@ def render_pages_to_pil_images(job: dict, file_path: Path, dpi: int = 300) -> li
             if mode == "L":
                 img = img.convert("RGB")
 
-            is_page_landscape = img.width > img.height
-            if requested_orientation == "portrait" and is_page_landscape:
-                img = img.rotate(90, expand=True)
-            elif requested_orientation == "landscape" and not is_page_landscape:
-                img = img.rotate(90, expand=True)
-
-            pil_pages.append(img)
+            composed = compose_image_onto_sheet(
+                img,
+                paper_size=paper_size,
+                requested_orientation=requested_orientation,
+                dpi=dpi,
+            )
+            pil_pages.append(composed)
     finally:
         pdf_doc.close()
 
@@ -1432,11 +1513,21 @@ def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
 
         hdc.StartDoc(doc_title)
         try:
+            dc_is_landscape = printable_width > printable_height
             for _copy_idx in range(copies):
                 for page_img in pil_pages:
                     hdc.StartPage()
 
-                    img_w, img_h = page_img.size
+                    draw_img = page_img
+                    img_is_landscape = draw_img.width > draw_img.height
+                    # If the composed sheet is Landscape (width > height) and the physical
+                    # GDI paper feed is Portrait (printable_width < printable_height),
+                    # rotate the composed Landscape sheet 90 degrees so its long axis aligns
+                    # with the physical paper sheet without shrinking or cropping!
+                    if img_is_landscape != dc_is_landscape:
+                        draw_img = draw_img.rotate(90, expand=True)
+
+                    img_w, img_h = draw_img.size
                     scale = min(
                         printable_width / float(img_w), printable_height / float(img_h)
                     )
@@ -1445,7 +1536,7 @@ def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
                     offset_x = max(0, (printable_width - draw_w) // 2)
                     offset_y = max(0, (printable_height - draw_h) // 2)
 
-                    dib = ImageWin.Dib(page_img)
+                    dib = ImageWin.Dib(draw_img)
                     dib.draw(
                         hdc.GetHandleOutput(),
                         (offset_x, offset_y, offset_x + draw_w, offset_y + draw_h),
@@ -1765,6 +1856,12 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
                             )
         except KeyboardInterrupt:
             logger.info("Print agent stopped by user.")
+            send_offline_notification(
+                cfg.get("backendApiUrl", ""),
+                cfg.get("agentId", ""),
+                cfg.get("agentSecret", ""),
+                reason="Print agent stopped by user.",
+            )
             break
         except Exception as loop_err:
             logger.error("Agent loop error: %s", loop_err)

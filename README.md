@@ -71,3 +71,4 @@ npm install
 npm run dist:win
 ```
 The installer is output to `desktop-app/release/SmartXerox-Setup.exe`.
+for new venders use this "https://smart-xerox-web-2mwa.onrender.com/super-admin"
