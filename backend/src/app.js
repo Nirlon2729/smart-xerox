@@ -10,8 +10,12 @@ const agentRoutes = require("./routes/agentRoutes");
 const adminRoutes = require("./routes/adminRoutes");
 const superAdminRoutes = require("./routes/superAdminRoutes");
 const { notFound, errorHandler } = require("./middleware/errorMiddleware");
+const { rejectNoSqlInjection } = require("./middleware/securityMiddleware");
+const { recordAuditLog } = require("./utils/auditLogger");
 
 const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
 app.use(
   helmet({
@@ -103,7 +107,8 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+app.use(rejectNoSqlInjection);
 if (process.env.NODE_ENV !== "test") {
   app.use(morgan("dev"));
 }
@@ -122,7 +127,20 @@ const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 240,
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  handler: (req, res) => {
+    recordAuditLog({
+      actorType: "SYSTEM",
+      actorId: req.ip,
+      action: "API_RATE_LIMIT_EXCEEDED",
+      details: { path: req.originalUrl },
+      req
+    }).catch(() => {});
+    res.status(429).json({
+      success: false,
+      message: "Too many requests. Please slow down and try again shortly."
+    });
+  }
 });
 
 // 1. Customer Shop-Scoped Routes (/api/shops/:shopSlug/*)

@@ -1,6 +1,7 @@
 const router = require("express").Router();
 const asyncHandler = require("../utils/asyncHandler");
 const { requireVendorAdmin } = require("../middleware/authMiddleware");
+const { authLimiter } = require("../middleware/securityMiddleware");
 const {
   login,
   changeVendorPassword,
@@ -23,7 +24,7 @@ const {
   clearFailedOrders
 } = require("../controllers/adminController");
 
-router.post("/login", asyncHandler(login));
+router.post("/login", authLimiter, asyncHandler(login));
 router.get("/me", requireVendorAdmin, asyncHandler(getAdminProfile));
 router.get("/dashboard", requireVendorAdmin, asyncHandler(getAdminProfile));
 
@@ -43,7 +44,8 @@ router.get("/pricing", requireVendorAdmin, asyncHandler(getVendorPricing));
 router.put("/pricing", requireVendorAdmin, asyncHandler(updateVendorPricing));
 router.put("/availability", requireVendorAdmin, asyncHandler(updateVendorShopAvailability));
 
-// Vendor Shop Settings & Password Management
+// Vendor Shop Profile, Settings & Password Management
+router.put("/profile", requireVendorAdmin, asyncHandler(updateVendorSettings));
 router.put("/settings", requireVendorAdmin, asyncHandler(updateVendorSettings));
 router.put("/password", requireVendorAdmin, asyncHandler(changeVendorPassword));
 

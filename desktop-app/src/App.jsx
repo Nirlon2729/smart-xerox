@@ -42,6 +42,7 @@ import {
   fetchVendorDashboard,
   selectVendorPrinter,
   updatePrinterCapabilities,
+  updateVendorProfile,
   updateVendorSettings,
   fetchVendorPricing,
   updateVendorPricing,
@@ -230,6 +231,7 @@ export default function App() {
     autoStartWithWindows: true
   });
   const [savingSettings, setSavingSettings] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
   const [passwordForm, setPasswordForm] = useState({
     currentPassword: "",
     newPassword: "",
@@ -577,8 +579,7 @@ export default function App() {
 
     try {
       setLoggingIn(true);
-      const cleanApiUrl = loginApiUrl.trim().replace(/\/+$/, "");
-      const res = await vendorLogin(loginEmail.trim(), loginPassword, cleanApiUrl);
+      const res = await vendorLogin(loginEmail.trim(), loginPassword);
 
       if (!res?.success || !res.token) {
         throw new Error("Login failed");
@@ -599,7 +600,6 @@ export default function App() {
       }
 
       configureDesktopApi({
-        apiBaseUrl: cleanApiUrl,
         vendorToken: res.token
       });
 
@@ -627,7 +627,6 @@ export default function App() {
 
       if (window.electronAPI) {
         await window.electronAPI.saveSession({
-          apiBaseUrl: cleanApiUrl,
           vendorToken: res.token,
           admin: res.admin,
           tenant: sanitizedTenant,
@@ -638,7 +637,6 @@ export default function App() {
 
       setSession((prev) => ({
         ...prev,
-        apiBaseUrl: cleanApiUrl,
         vendorToken: res.token,
         admin: res.admin,
         tenant: sanitizedTenant,
@@ -741,16 +739,45 @@ export default function App() {
     win.document.close();
   };
 
+  const handleSaveShopProfile = async (e) => {
+    e.preventDefault();
+    if (savingProfile) return;
+    const trimmedName = String(settingsForm.shopName || "").trim();
+    if (trimmedName.length < 2) {
+      toast.error("Shop display name must be at least 2 characters.");
+      return;
+    }
+    try {
+      setSavingProfile(true);
+      const res = await updateVendorProfile({
+        shopName: trimmedName,
+        phone: String(settingsForm.phone || "").trim(),
+        address: String(settingsForm.address || "").trim(),
+        logoUrl: String(settingsForm.logoUrl || "").trim()
+      });
+      if (res?.tenant) {
+        if (window.electronAPI) {
+          await window.electronAPI.updateLocalSettings({ tenant: res.tenant });
+        }
+        setSession((prev) => ({
+          ...prev,
+          tenant: res.tenant
+        }));
+      }
+      toast.success("Shop profile updated.");
+    } catch (err) {
+      toast.error(getApiErrorMessage(err, "Failed to update shop profile"));
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
   const handleSaveSettings = async (e) => {
     e.preventDefault();
     if (savingSettings) return;
     try {
       setSavingSettings(true);
       const res = await updateVendorSettings({
-        shopName: settingsForm.shopName,
-        phone: settingsForm.phone,
-        address: settingsForm.address,
-        logoUrl: settingsForm.logoUrl,
         maxCopies: Number(settingsForm.maxCopies) || 100,
         maxUploadMb: Number(settingsForm.maxUploadMb) || 20,
         acceptingOrders: settingsForm.acceptingOrders
@@ -758,26 +785,17 @@ export default function App() {
 
       if (window.electronAPI) {
         await window.electronAPI.updateLocalSettings({
-          apiBaseUrl: settingsForm.apiBaseUrl,
-          customerBaseUrl: settingsForm.customerBaseUrl,
           autoStartWithWindows: settingsForm.autoStartWithWindows,
           tenant: res?.tenant || session.tenant
         });
       }
 
-      configureDesktopApi({
-        apiBaseUrl: settingsForm.apiBaseUrl,
-        vendorToken: session.vendorToken
-      });
-
       setSession((prev) => ({
         ...prev,
         tenant: res?.tenant || prev.tenant,
-        apiBaseUrl: settingsForm.apiBaseUrl,
-        customerBaseUrl: settingsForm.customerBaseUrl,
         autoStartWithWindows: settingsForm.autoStartWithWindows
       }));
-      toast.success("Shop & desktop settings saved.");
+      toast.success("Operational & desktop settings saved.");
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Failed to save settings"));
     } finally {
@@ -1134,20 +1152,6 @@ export default function App() {
               />
             </div>
 
-            <div>
-              <label className="block text-xs font-semibold text-zinc-700 mb-1.5">
-                Cloud Server URL
-              </label>
-              <input
-                type="url"
-                required
-                value={loginApiUrl}
-                onChange={(e) => setLoginApiUrl(e.target.value)}
-                placeholder="https://smart-xerox-api.onrender.com/api"
-                className="w-full h-10 px-3.5 rounded-xl border border-zinc-300 text-xs font-mono-code focus:border-[#8D0100] focus:outline-none"
-              />
-            </div>
-
             <LoadingButton
               type="submit"
               loading={loggingIn}
@@ -1161,8 +1165,8 @@ export default function App() {
           </form>
 
           <div className="pt-2 border-t border-zinc-100 flex items-center justify-between text-[11px] text-zinc-400">
-            <span>Host: {session.hostname}</span>
-            <span>Smart Xerox Desktop v3.0</span>
+            <span>Secure Vendor Console</span>
+            <span>Smart Xerox Desktop v3.1</span>
           </div>
         </div>
         <Toaster position="top-right" />
@@ -3227,7 +3231,7 @@ export default function App() {
 
                   <div className="p-3 rounded-xl bg-zinc-50 border border-zinc-200/80 text-zinc-800">
                     <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 block">
-                      Unique Shop Slug &amp; Customer URL
+                      Shop Link Identifier (Read-Only)
                     </span>
                     <span className="font-mono-code font-semibold text-zinc-900 mt-0.5 block truncate">
                       /shop/{session.tenant?.shopSlug}
@@ -3236,10 +3240,10 @@ export default function App() {
 
                   <div className="p-3 rounded-xl bg-zinc-50 border border-zinc-200/80 text-zinc-800">
                     <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 block">
-                      Account Role &amp; Tenant ID
+                      Account Role (Read-Only)
                     </span>
                     <span className="font-mono-code font-semibold text-zinc-900 mt-0.5 block truncate">
-                      {session.admin?.role || "VENDOR_ADMIN"} • {session.tenant?.id || session.tenant?.tenantId}
+                      {session.admin?.role === "SUPER_ADMIN" ? "Platform Administrator" : "Shop Vendor"}
                     </span>
                   </div>
                 </div>
@@ -3429,186 +3433,200 @@ export default function App() {
                 </form>
               </div>
 
-              {/* 3. SHOP & DESKTOP OPERATIONAL SETTINGS */}
+              {/* 3. SHOP PROFILE MANAGEMENT (PUBLIC DISPLAY DETAILS) */}
               <div
                 className={`rounded-2xl border p-6 space-y-5 ${
                   isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
                 }`}
               >
-                <div>
-                  <h3 className="text-base font-bold">Shop &amp; Desktop Settings</h3>
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-zinc-100">
+                  <div>
+                    <h3 className="text-base font-bold">Shop Profile</h3>
+                    <p className="text-xs text-zinc-500 mt-0.5">
+                      Update the public shop name, contact phone, and address shown to customers on your shop page. Protected identifiers (Shop Slug &amp; QR link) remain locked so printed QR codes never break.
+                    </p>
+                  </div>
+                  <span className="px-2.5 py-1 rounded-md text-[11px] font-semibold bg-zinc-100 text-zinc-700 border border-zinc-200 font-mono-code">
+                    /shop/{session.tenant?.shopSlug} (Protected)
+                  </span>
+                </div>
+
+                <form onSubmit={handleSaveShopProfile} className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                        Shop Display Name *
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        minLength={2}
+                        maxLength={120}
+                        value={settingsForm.shopName}
+                        onChange={(e) =>
+                          setSettingsForm({ ...settingsForm, shopName: e.target.value })
+                        }
+                        placeholder="e.g. Smart Xerox Counter"
+                        className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm focus:border-[#8D0100] focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                        Contact Phone Number
+                      </label>
+                      <input
+                        type="text"
+                        maxLength={30}
+                        value={settingsForm.phone}
+                        onChange={(e) =>
+                          setSettingsForm({ ...settingsForm, phone: e.target.value })
+                        }
+                        placeholder="+91 98765 43210"
+                        className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm focus:border-[#8D0100] focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                      Shop Address
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={240}
+                      value={settingsForm.address}
+                      onChange={(e) =>
+                        setSettingsForm({ ...settingsForm, address: e.target.value })
+                      }
+                      placeholder="Shop address displayed to customers"
+                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm focus:border-[#8D0100] focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                      Shop Logo URL (Optional, HTTPS only)
+                    </label>
+                    <input
+                      type="url"
+                      maxLength={500}
+                      value={settingsForm.logoUrl}
+                      onChange={(e) =>
+                        setSettingsForm({ ...settingsForm, logoUrl: e.target.value })
+                      }
+                      placeholder="https://example.com/shop-logo.png"
+                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-xs font-mono-code focus:border-[#8D0100] focus:outline-none"
+                    />
+                  </div>
+
+                  <div className="pt-1">
+                    <LoadingButton
+                      type="submit"
+                      loading={savingProfile}
+                      loadingText="Saving..."
+                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
+                    >
+                      Save Shop Profile
+                    </LoadingButton>
+                  </div>
+                </form>
+              </div>
+
+              {/* 4. OPERATIONAL & DESKTOP APPLICATION SETTINGS */}
+              <div
+                className={`rounded-2xl border p-6 space-y-5 ${
+                  isDark ? "bg-zinc-900 border-zinc-800" : "bg-white border-zinc-200"
+                }`}
+              >
+                <div className="pb-3 border-b border-zinc-100">
+                  <h3 className="text-base font-bold">Operational &amp; Desktop Settings</h3>
                   <p className="text-xs text-zinc-500 mt-0.5">
-                    Configure your Xerox shop profile, customer limits, and Windows startup preferences.
+                    Configure customer order limits and Windows startup preferences. Cloud server endpoints are centrally managed and locked for security.
                   </p>
                 </div>
 
-              <form onSubmit={handleSaveSettings} className="space-y-4">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
-                      Shop Name
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={settingsForm.shopName}
-                      onChange={(e) =>
-                        setSettingsForm({ ...settingsForm, shopName: e.target.value })
-                      }
-                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm"
-                    />
+                <form onSubmit={handleSaveSettings} className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                        Maximum Copies per Job
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={1000}
+                        value={settingsForm.maxCopies}
+                        onChange={(e) =>
+                          setSettingsForm({ ...settingsForm, maxCopies: e.target.value })
+                        }
+                        className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm font-mono-code focus:border-[#8D0100] focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                        Max Upload File Size (MB)
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={settingsForm.maxUploadMb}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            maxUploadMb: e.target.value
+                          })
+                        }
+                        className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm font-mono-code focus:border-[#8D0100] focus:outline-none"
+                      />
+                    </div>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
-                      Contact Phone
+                  <div className="space-y-2.5 pt-2">
+                    <label className="flex items-center gap-2.5 text-xs font-semibold cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={settingsForm.acceptingOrders}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            acceptingOrders: e.target.checked
+                          })
+                        }
+                        className="w-4 h-4 accent-[#8D0100]"
+                      />
+                      <span>Accept incoming customer print jobs</span>
                     </label>
-                    <input
-                      type="text"
-                      value={settingsForm.phone}
-                      onChange={(e) =>
-                        setSettingsForm({ ...settingsForm, phone: e.target.value })
-                      }
-                      placeholder="+91 ..."
-                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm"
-                    />
-                  </div>
-                </div>
 
-                <div>
-                  <label className="block text-xs font-semibold text-zinc-600 mb-1">
-                    Shop Address
-                  </label>
-                  <input
-                    type="text"
-                    value={settingsForm.address}
-                    onChange={(e) =>
-                      setSettingsForm({ ...settingsForm, address: e.target.value })
-                    }
-                    placeholder="Shop address displayed to customers"
-                    className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm"
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
-                      Maximum Copies per Job
+                    <label className="flex items-center gap-2.5 text-xs font-semibold cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={settingsForm.autoStartWithWindows}
+                        onChange={(e) =>
+                          setSettingsForm({
+                            ...settingsForm,
+                            autoStartWithWindows: e.target.checked
+                          })
+                        }
+                        className="w-4 h-4 accent-[#8D0100]"
+                      />
+                      <span>Start Smart Xerox background agent automatically when Windows starts</span>
                     </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={1000}
-                      value={settingsForm.maxCopies}
-                      onChange={(e) =>
-                        setSettingsForm({ ...settingsForm, maxCopies: e.target.value })
-                      }
-                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm font-mono-code"
-                    />
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
-                      Max Upload File Size (MB)
-                    </label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={100}
-                      value={settingsForm.maxUploadMb}
-                      onChange={(e) =>
-                        setSettingsForm({
-                          ...settingsForm,
-                          maxUploadMb: e.target.value
-                        })
-                      }
-                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-sm font-mono-code"
-                    />
+                  <div className="pt-2">
+                    <LoadingButton
+                      type="submit"
+                      loading={savingSettings}
+                      loadingText="Saving..."
+                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
+                    >
+                      Save Operational Settings
+                    </LoadingButton>
                   </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-zinc-100">
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
-                      Customer Website Domain (for QR Code)
-                    </label>
-                    <input
-                      type="url"
-                      required
-                      value={settingsForm.customerBaseUrl}
-                      onChange={(e) =>
-                        setSettingsForm({
-                          ...settingsForm,
-                          customerBaseUrl: e.target.value
-                        })
-                      }
-                      placeholder="https://smart-xerox-web-2mwa.onrender.com"
-                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-xs font-mono-code"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-zinc-600 mb-1">
-                      Cloud Backend API URL
-                    </label>
-                    <input
-                      type="url"
-                      required
-                      value={settingsForm.apiBaseUrl}
-                      onChange={(e) =>
-                        setSettingsForm({
-                          ...settingsForm,
-                          apiBaseUrl: e.target.value
-                        })
-                      }
-                      className="w-full h-10 px-3 rounded-lg border border-zinc-300 text-xs font-mono-code"
-                    />
-                  </div>
-                </div>
-
-                <div className="space-y-2.5 pt-2">
-                  <label className="flex items-center gap-2.5 text-xs font-semibold cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settingsForm.acceptingOrders}
-                      onChange={(e) =>
-                        setSettingsForm({
-                          ...settingsForm,
-                          acceptingOrders: e.target.checked
-                        })
-                      }
-                      className="w-4 h-4 accent-[#8D0100]"
-                    />
-                    <span>Accept incoming customer print jobs</span>
-                  </label>
-
-                  <label className="flex items-center gap-2.5 text-xs font-semibold cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settingsForm.autoStartWithWindows}
-                      onChange={(e) =>
-                        setSettingsForm({
-                          ...settingsForm,
-                          autoStartWithWindows: e.target.checked
-                        })
-                      }
-                      className="w-4 h-4 accent-[#8D0100]"
-                    />
-                    <span>Start Smart Xerox background agent automatically when Windows starts</span>
-                  </label>
-                </div>
-
-                <div className="pt-2">
-                  <LoadingButton
-                    type="submit"
-                    loading={savingSettings}
-                    loadingText="Saving..."
-                    className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
-                  >
-                    Save Settings
-                  </LoadingButton>
-                </div>
-              </form>
+                </form>
               </div>
             </div>
           )}

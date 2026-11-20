@@ -19,17 +19,15 @@ export function normalizeDesktopApiUrl(url) {
   return `${withoutTrailingApi}/api`;
 }
 
-export function configureDesktopApi({ apiBaseUrl, vendorToken }) {
-  if (apiBaseUrl) {
-    activeApiBaseUrl = normalizeDesktopApiUrl(apiBaseUrl);
-  }
+export function configureDesktopApi({ vendorToken }) {
+  activeApiBaseUrl = DEFAULT_PRODUCTION_API_URL;
   if (vendorToken !== undefined) {
     activeVendorToken = vendorToken || "";
   }
 }
 
 export function getActiveApiBaseUrl() {
-  return activeApiBaseUrl;
+  return DEFAULT_PRODUCTION_API_URL;
 }
 
 function getClient() {
@@ -40,7 +38,7 @@ function getClient() {
     headers.Authorization = `Bearer ${activeVendorToken}`;
   }
   return axios.create({
-    baseURL: activeApiBaseUrl,
+    baseURL: DEFAULT_PRODUCTION_API_URL,
     timeout: 30000,
     headers
   });
@@ -51,15 +49,12 @@ export function getApiErrorMessage(error, fallback = "Operation failed. Please t
     return error.response.data.message;
   }
   if (!error?.response && error?.request) {
-    return `Cannot reach Smart Xerox Cloud API (${activeApiBaseUrl}). Verify internet or server connection.`;
+    return "Cannot reach Smart Xerox Cloud service. Please verify your internet connection.";
   }
   return error?.message || fallback;
 }
 
-export async function vendorLogin(email, password, apiBaseUrlOverride = null) {
-  if (apiBaseUrlOverride) {
-    activeApiBaseUrl = normalizeDesktopApiUrl(apiBaseUrlOverride);
-  }
+export async function vendorLogin(email, password) {
   const { data } = await getClient().post("/vendor/login", { email, password });
   return data;
 }
@@ -102,6 +97,11 @@ export async function selectVendorPrinter(printerName, autoSelectSinglePrinter =
 
 export async function updatePrinterCapabilities(payload) {
   const { data } = await getClient().put("/vendor/printers/capabilities", payload);
+  return data;
+}
+
+export async function updateVendorProfile(payload) {
+  const { data } = await getClient().put("/vendor/profile", payload);
   return data;
 }
 

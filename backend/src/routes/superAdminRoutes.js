@@ -1,6 +1,7 @@
 const router = require("express").Router();
 const asyncHandler = require("../utils/asyncHandler");
 const { requireSuperAdmin } = require("../middleware/authMiddleware");
+const { authLimiter } = require("../middleware/securityMiddleware");
 const {
   superAdminLogin,
   getSuperAdminOverview,
@@ -10,7 +11,7 @@ const {
   listAuditLogs
 } = require("../controllers/adminController");
 
-router.post("/login", asyncHandler(superAdminLogin));
+router.post("/login", authLimiter, asyncHandler(superAdminLogin));
 router.get("/overview", requireSuperAdmin, asyncHandler(getSuperAdminOverview));
 router.post("/vendors", requireSuperAdmin, asyncHandler(createVendor));
 router.patch("/vendors/:tenantId/status", requireSuperAdmin, asyncHandler(updateVendorStatus));

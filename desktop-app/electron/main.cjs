@@ -544,8 +544,37 @@ function createMainWindow() {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true,
+      devTools: isDev
     }
+  });
+
+  // Block navigation away from the bundled application UI
+  mainWindow.webContents.on("will-navigate", (event, targetUrl) => {
+    const allowedDev = isDev && process.env.VITE_DEV_SERVER_URL && targetUrl.startsWith(process.env.VITE_DEV_SERVER_URL);
+    const allowedLocalFile = targetUrl.startsWith("file://");
+    if (!allowedDev && !allowedLocalFile) {
+      event.preventDefault();
+    }
+  });
+
+  // Allow only about:blank popups (used for local QR standee print preview) and blob: document inspection
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url === "about:blank" || url === "" || url.startsWith("blob:")) {
+      return {
+        action: "allow",
+        overrideBrowserWindowOptions: {
+          autoHideMenuBar: true,
+          webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true,
+            devTools: false
+          }
+        }
+      };
+    }
+    return { action: "deny" };
   });
 
   if (isDev && process.env.VITE_DEV_SERVER_URL) {
@@ -567,15 +596,30 @@ function createMainWindow() {
 }
 
 /* ==========================================================================
-   IPC HANDLERS FOR ELECTRON RENDERER
+   IPC SENDER VALIDATION & HANDLERS FOR ELECTRON RENDERER
    ========================================================================== */
 
-ipcMain.handle("session:get", async () => {
+function assertTrustedIpcSender(event) {
+  if (!event || !event.sender || (mainWindow && event.sender !== mainWindow.webContents)) {
+    throw new Error("Unauthorized IPC sender");
+  }
+  const frameUrl = String(event.senderFrame?.url || "");
+  if (isDev && process.env.VITE_DEV_SERVER_URL) {
+    if (!frameUrl.startsWith(process.env.VITE_DEV_SERVER_URL) && !frameUrl.startsWith("file://")) {
+      throw new Error("Unauthorized IPC origin");
+    }
+  } else if (frameUrl && !frameUrl.startsWith("file://")) {
+    throw new Error("Unauthorized IPC origin");
+  }
+}
+
+ipcMain.handle("session:get", async (event) => {
+  assertTrustedIpcSender(event);
   const s = getDecryptedSession();
   return {
     deviceId: s.deviceId,
-    apiBaseUrl: s.apiBaseUrl,
-    customerBaseUrl: s.customerBaseUrl,
+    apiBaseUrl: DEFAULT_PRODUCTION_API_URL,
+    customerBaseUrl: DEFAULT_PRODUCTION_WEB_URL,
     autoStartWithWindows: s.autoStartWithWindows,
     theme: s.theme,
     admin: s.admin,
@@ -588,15 +632,14 @@ ipcMain.handle("session:get", async () => {
   };
 });
 
-ipcMain.handle("session:save", async (_event, payload) => {
+ipcMain.handle("session:save", async (event, payload) => {
+  assertTrustedIpcSender(event);
   const raw = readRawStore();
 
-  if (payload.apiBaseUrl) {
-    raw.apiBaseUrl = normalizeStoredApiUrl(payload.apiBaseUrl);
-  }
-  if (payload.customerBaseUrl) {
-    raw.customerBaseUrl = normalizeStoredCustomerUrl(payload.customerBaseUrl);
-  }
+  // Production endpoints are centrally locked and cannot be overridden from renderer UI
+  raw.apiBaseUrl = DEFAULT_PRODUCTION_API_URL;
+  raw.customerBaseUrl = DEFAULT_PRODUCTION_WEB_URL;
+
   if (payload.admin !== undefined) {
     raw.admin = payload.admin;
   }
@@ -614,7 +657,7 @@ ipcMain.handle("session:save", async (_event, payload) => {
         raw.tenant.selectedPrinterName = prevSelectedPrinter;
       }
       if (raw.tenant.shopSlug) {
-        raw.tenant.publicUrl = `${raw.customerBaseUrl || DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
+        raw.tenant.publicUrl = `${DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
       }
     }
   }
@@ -646,7 +689,8 @@ ipcMain.handle("session:save", async (_event, payload) => {
   };
 });
 
-ipcMain.handle("session:clear", async (_event, { keepAgentRunning = false } = {}) => {
+ipcMain.handle("session:clear", async (event, { keepAgentRunning = false } = {}) => {
+  assertTrustedIpcSender(event);
   if (!keepAgentRunning) {
     await notifyBackendAgentOffline("Vendor signed out of Smart Xerox desktop application.");
   }
@@ -731,11 +775,13 @@ function stopPrinterMonitor() {
   }
 }
 
-ipcMain.handle("printers:discover-local", async (_event, opts = {}) => {
+ipcMain.handle("printers:discover-local", async (event, opts = {}) => {
+  assertTrustedIpcSender(event);
   return pollAndNotifyPrinters(Boolean(opts?.includeVirtual));
 });
 
-ipcMain.handle("printers:set-selected", async (_event, { printerName }) => {
+ipcMain.handle("printers:set-selected", async (event, { printerName }) => {
+  assertTrustedIpcSender(event);
   const raw = readRawStore();
   if (raw.tenant) {
     raw.tenant.selectedPrinterName = printerName;
@@ -745,7 +791,8 @@ ipcMain.handle("printers:set-selected", async (_event, { printerName }) => {
   return { success: true, selectedPrinterName: printerName };
 });
 
-ipcMain.handle("agent:status", async () => {
+ipcMain.handle("agent:status", async (event) => {
+  assertTrustedIpcSender(event);
   const s = getDecryptedSession();
   return {
     running: agentState.running,
@@ -762,7 +809,8 @@ ipcMain.handle("agent:status", async () => {
   };
 });
 
-ipcMain.handle("agent:restart", async () => {
+ipcMain.handle("agent:restart", async (event) => {
+  assertTrustedIpcSender(event);
   const state = startBackgroundAgent();
   return {
     success: true,
@@ -771,7 +819,8 @@ ipcMain.handle("agent:restart", async () => {
   };
 });
 
-ipcMain.handle("agent:stop", async () => {
+ipcMain.handle("agent:stop", async (event) => {
+  assertTrustedIpcSender(event);
   await notifyBackendAgentOffline("Background print agent stopped by vendor.");
   stopBackgroundAgent();
   return {
@@ -780,19 +829,19 @@ ipcMain.handle("agent:stop", async () => {
   };
 });
 
-ipcMain.handle("agent:diagnose", async () => {
+ipcMain.handle("agent:diagnose", async (event) => {
+  assertTrustedIpcSender(event);
   const cfgPath = syncAgentRuntimeConfigFile();
   return runAgentCliJson(["--diagnose", "--config", cfgPath], 20000);
 });
 
-ipcMain.handle("settings:update", async (_event, partial) => {
+ipcMain.handle("settings:update", async (event, partial) => {
+  assertTrustedIpcSender(event);
   const raw = readRawStore();
-  if (partial.apiBaseUrl !== undefined) {
-    raw.apiBaseUrl = normalizeStoredApiUrl(partial.apiBaseUrl);
-  }
-  if (partial.customerBaseUrl !== undefined) {
-    raw.customerBaseUrl = normalizeStoredCustomerUrl(partial.customerBaseUrl);
-  }
+  // Server endpoints are centrally locked — never allow renderer override
+  raw.apiBaseUrl = DEFAULT_PRODUCTION_API_URL;
+  raw.customerBaseUrl = DEFAULT_PRODUCTION_WEB_URL;
+
   if (partial.autoStartWithWindows !== undefined) {
     raw.autoStartWithWindows = Boolean(partial.autoStartWithWindows);
     configureWindowsAutoStart(raw.autoStartWithWindows);
@@ -803,7 +852,7 @@ ipcMain.handle("settings:update", async (_event, partial) => {
   if (partial.tenant !== undefined) {
     raw.tenant = partial.tenant;
     if (raw.tenant && raw.tenant.shopSlug) {
-      raw.tenant.publicUrl = `${raw.customerBaseUrl || DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
+      raw.tenant.publicUrl = `${DEFAULT_PRODUCTION_WEB_URL}/shop/${raw.tenant.shopSlug}`;
     }
   }
   writeRawStore(raw);
@@ -811,18 +860,25 @@ ipcMain.handle("settings:update", async (_event, partial) => {
   return {
     success: true,
     settings: {
-      apiBaseUrl: raw.apiBaseUrl,
-      customerBaseUrl: raw.customerBaseUrl,
       autoStartWithWindows: raw.autoStartWithWindows,
       theme: raw.theme
     }
   };
 });
 
-ipcMain.handle("external:open", async (_event, url) => {
-  if (url && /^https?:\/\//i.test(String(url))) {
-    await shell.openExternal(String(url));
-    return { success: true };
+ipcMain.handle("external:open", async (event, url) => {
+  assertTrustedIpcSender(event);
+  try {
+    const parsed = new URL(String(url || ""));
+    if (
+      parsed.protocol === "https:" &&
+      parsed.origin === DEFAULT_PRODUCTION_WEB_URL
+    ) {
+      await shell.openExternal(parsed.toString());
+      return { success: true };
+    }
+  } catch (_e) {
+    // Reject invalid or non-allowlisted external URLs
   }
   return { success: false };
 });

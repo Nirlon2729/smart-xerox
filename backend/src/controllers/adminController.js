@@ -628,41 +628,138 @@ async function updateVendorPrinterCapabilities(req, res) {
   });
 }
 
+const PROTECTED_TENANT_FIELDS = [
+  "tenantId",
+  "shopSlug",
+  "status",
+  "role",
+  "agentId",
+  "agentSecret",
+  "apiBaseUrl",
+  "customerBaseUrl",
+  "publicUrl",
+  "ownerId"
+];
+
+function isSafePublicHttpsUrl(value) {
+  if (!value) return true;
+  try {
+    const parsed = new URL(String(value).trim());
+    if (parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host === "127.0.0.1" ||
+      host === "::1" ||
+      host.endsWith(".local") ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+      /^169\.254\./.test(host)
+    ) {
+      return false;
+    }
+    return host.includes(".");
+  } catch (_err) {
+    return false;
+  }
+}
+
 /**
- * PUT /api/vendor/settings
- * Updates vendor shop profile and operational settings (never mutates shopSlug so QR codes never break).
+ * PUT /api/vendor/settings & PUT /api/vendor/profile
+ * Updates ONLY allowlisted vendor shop profile & operational settings for req.tenantId.
+ * Strictly blocks modification of shopSlug, tenantId, status, agent credentials, or server URLs.
  */
 async function updateVendorSettings(req, res) {
-  const { shopName, phone, address, logoUrl, maxCopies, maxUploadMb, acceptingOrders } = req.body;
+  const body = req.body && typeof req.body === "object" ? req.body : {};
 
-  if (shopName && String(shopName).trim()) {
-    req.tenant.shopName = String(shopName).trim().slice(0, 120);
+  // Audit any attempted mass-assignment of protected fields
+  const attemptedProtected = PROTECTED_TENANT_FIELDS.filter(
+    (field) => body[field] !== undefined
+  );
+  if (attemptedProtected.length > 0) {
+    await recordAuditLog({
+      tenantId: req.tenantId,
+      actorType: "VENDOR_ADMIN",
+      actorId: req.admin._id,
+      action: "PROTECTED_FIELD_MODIFICATION_IGNORED",
+      details: { attemptedFields: attemptedProtected },
+      req
+    });
   }
+
+  const { shopName, phone, address, logoUrl, maxCopies, maxUploadMb, acceptingOrders } = body;
+
+  if (shopName !== undefined) {
+    const cleanedName = String(shopName || "").replace(/\s+/g, " ").trim();
+    if (cleanedName.length < 2 || cleanedName.length > 120) {
+      return res.status(400).json({
+        success: false,
+        message: "Shop display name must be between 2 and 120 characters."
+      });
+    }
+    req.tenant.shopName = cleanedName;
+  }
+
   if (phone !== undefined) {
-    req.tenant.phone = phone ? String(phone).trim().slice(0, 40) : null;
+    const cleanedPhone = phone ? String(phone).trim() : "";
+    if (cleanedPhone && !/^[0-9+\-\s()]{6,30}$/.test(cleanedPhone)) {
+      return res.status(400).json({
+        success: false,
+        message: "Contact phone number contains invalid characters (use digits, +, -, or spaces)."
+      });
+    }
+    req.tenant.phone = cleanedPhone || null;
   }
+
   if (address !== undefined) {
-    req.tenant.address = address ? String(address).trim().slice(0, 240) : null;
+    const cleanedAddress = address ? String(address).replace(/\s+/g, " ").trim() : "";
+    if (cleanedAddress.length > 240) {
+      return res.status(400).json({
+        success: false,
+        message: "Shop address must be 240 characters or fewer."
+      });
+    }
+    req.tenant.address = cleanedAddress || null;
   }
+
   if (logoUrl !== undefined) {
-    req.tenant.logoUrl = logoUrl ? String(logoUrl).trim() : null;
+    const cleanedLogo = logoUrl ? String(logoUrl).trim() : "";
+    if (cleanedLogo && !isSafePublicHttpsUrl(cleanedLogo)) {
+      return res.status(400).json({
+        success: false,
+        message: "Logo URL must be a valid public HTTPS image URL."
+      });
+    }
+    req.tenant.logoUrl = cleanedLogo ? cleanedLogo.slice(0, 500) : null;
   }
 
   if (!req.tenant.config) {
     req.tenant.config = { maxUploadMb: 20, maxCopies: 100, acceptingOrders: true };
   }
+
   if (maxCopies !== undefined) {
     const parsedCopies = Number(maxCopies);
-    if (Number.isInteger(parsedCopies) && parsedCopies >= 1 && parsedCopies <= 1000) {
-      req.tenant.config.maxCopies = parsedCopies;
+    if (!Number.isInteger(parsedCopies) || parsedCopies < 1 || parsedCopies > 1000) {
+      return res.status(400).json({
+        success: false,
+        message: "Maximum copies per job must be a whole number between 1 and 1000."
+      });
     }
+    req.tenant.config.maxCopies = parsedCopies;
   }
+
   if (maxUploadMb !== undefined) {
     const parsedMb = Number(maxUploadMb);
-    if (Number.isInteger(parsedMb) && parsedMb >= 1 && parsedMb <= 100) {
-      req.tenant.config.maxUploadMb = parsedMb;
+    if (!Number.isInteger(parsedMb) || parsedMb < 1 || parsedMb > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Maximum upload file size must be a whole number between 1 and 100 MB."
+      });
     }
+    req.tenant.config.maxUploadMb = parsedMb;
   }
+
   if (acceptingOrders !== undefined) {
     req.tenant.config.acceptingOrders = Boolean(acceptingOrders);
   }
@@ -676,6 +773,8 @@ async function updateVendorSettings(req, res) {
     action: "VENDOR_SETTINGS_UPDATED",
     details: {
       shopName: req.tenant.shopName,
+      hasPhone: Boolean(req.tenant.phone),
+      hasAddress: Boolean(req.tenant.address),
       config: req.tenant.config
     },
     req
@@ -683,7 +782,7 @@ async function updateVendorSettings(req, res) {
 
   res.json({
     success: true,
-    message: "Shop settings saved.",
+    message: "Shop profile and settings saved.",
     tenant: formatTenantSummary(req.tenant)
   });
 }

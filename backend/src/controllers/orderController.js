@@ -360,17 +360,51 @@ async function getActivePrinterState(tenantId) {
 }
 
 /**
+ * Strips internal vendor computer, agent, driver, port, and multi-printer inventory
+ * metadata before returning printer availability & capabilities to public customer endpoints.
+ */
+function formatPublicPrinterState(printer) {
+  if (!printer) return null;
+  return {
+    online: Boolean(printer.online),
+    shopAvailable: Boolean(printer.shopAvailable),
+    availabilityStatus: printer.availabilityStatus,
+    availabilityLabel: printer.availabilityLabel,
+    unavailableReasonCode: printer.unavailableReasonCode || null,
+    unavailableReason: printer.unavailableReason || null,
+    connectionState: printer.connectionState,
+    statusLabel: printer.statusLabel,
+    agentOnline: Boolean(printer.agentOnline),
+    printerAvailable: Boolean(printer.printerAvailable),
+    selectedPrinterDisconnected: Boolean(printer.selectedPrinterDisconnected),
+    printerName: printer.printerName || "Shop Printer",
+    status: printer.status,
+    statusMessage: printer.statusMessage,
+    heartbeatTimeoutSeconds: printer.heartbeatTimeoutSeconds,
+    capabilities: {
+      supportedPaperSizes: printer.capabilities?.supportedPaperSizes || ["A4"],
+      supportsColor: Boolean(printer.capabilities?.supportsColor),
+      supportsDuplex: Boolean(printer.capabilities?.supportsDuplex),
+      enabledOptions: printer.capabilities?.enabledOptions || null
+    },
+    pricing: printer.pricing,
+    config: printer.config
+  };
+}
+
+/**
  * GET /api/shops/:shopSlug
  * Returns public shop details, printer availability, verified capabilities, and vendor pricing for the customer website.
+ * Never exposes internal agent IDs, hostnames, device IDs, port names, or private vendor configuration.
  */
 async function getShopPublicInfo(req, res) {
   const tenant = req.tenant;
   const printer = await getActivePrinterState(req.tenantId);
+  const publicPrinter = formatPublicPrinterState(printer);
 
   res.json({
     success: true,
     shop: {
-      id: tenant._id,
       shopName: tenant.shopName,
       shopSlug: tenant.shopSlug,
       logoUrl: tenant.logoUrl || null,
@@ -378,14 +412,14 @@ async function getShopPublicInfo(req, res) {
       address: tenant.address || null,
       status: tenant.status,
       publicUrl: buildShopPublicUrl(tenant.shopSlug),
-      shopAvailable: printer.shopAvailable,
-      availabilityStatus: printer.availabilityStatus,
-      availabilityLabel: printer.availabilityLabel,
-      unavailableReason: printer.unavailableReason,
-      pricing: printer.pricing,
-      config: printer.config
+      shopAvailable: publicPrinter.shopAvailable,
+      availabilityStatus: publicPrinter.availabilityStatus,
+      availabilityLabel: publicPrinter.availabilityLabel,
+      unavailableReason: publicPrinter.unavailableReason,
+      pricing: publicPrinter.pricing,
+      config: publicPrinter.config
     },
-    printer
+    printer: publicPrinter
   });
 }
 
@@ -395,15 +429,15 @@ async function getShopPublicInfo(req, res) {
  */
 async function getPrinterStatus(req, res) {
   const printer = await getActivePrinterState(req.tenantId);
+  const publicPrinter = formatPublicPrinterState(printer);
   res.json({
     success: true,
     shop: {
-      id: req.tenant._id,
       shopName: req.tenant.shopName,
       shopSlug: req.tenant.shopSlug,
       logoUrl: req.tenant.logoUrl || null
     },
-    printer
+    printer: publicPrinter
   });
 }
 
