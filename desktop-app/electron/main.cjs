@@ -13,6 +13,7 @@ const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn, execFile } = require("child_process");
+const { validateSelectedPrinterPayload } = require("./ipcValidators.cjs");
 
 const isDev = !app.isPackaged && process.env.NODE_ENV !== "production";
 
@@ -713,6 +714,7 @@ ipcMain.handle("session:clear", async (event, { keepAgentRunning = false } = {})
 });
 
 let lastPrinterSnapshotHash = "";
+let lastDiscoveredPhysicalPrinters = [];
 let printerMonitorTimer = null;
 let printerMonitorBusy = false;
 
@@ -743,6 +745,13 @@ async function pollAndNotifyPrinters(includeVirtual = false) {
     args.push("--include-virtual");
   }
   const res = await runAgentCliJson(args);
+  if (res && Array.isArray(res.physicalPrinters)) {
+    lastDiscoveredPhysicalPrinters = res.physicalPrinters;
+  } else if (res && Array.isArray(res.printers)) {
+    lastDiscoveredPhysicalPrinters = res.printers.filter(
+      (p) => !p.isVirtual && p.printerCategory !== "VIRTUAL"
+    );
+  }
   const nextHash = computePrinterSnapshotHash(res);
   if (nextHash && nextHash !== lastPrinterSnapshotHash) {
     lastPrinterSnapshotHash = nextHash;
@@ -780,15 +789,23 @@ ipcMain.handle("printers:discover-local", async (event, opts = {}) => {
   return pollAndNotifyPrinters(Boolean(opts?.includeVirtual));
 });
 
-ipcMain.handle("printers:set-selected", async (event, { printerName }) => {
+ipcMain.handle("printers:set-selected", async (event, payload) => {
   assertTrustedIpcSender(event);
+  if (lastDiscoveredPhysicalPrinters.length === 0) {
+    await pollAndNotifyPrinters(false);
+  }
+  const check = validateSelectedPrinterPayload(payload, lastDiscoveredPhysicalPrinters);
+  if (!check.valid) {
+    throw new Error(check.error);
+  }
+
   const raw = readRawStore();
   if (raw.tenant) {
-    raw.tenant.selectedPrinterName = printerName;
+    raw.tenant.selectedPrinterName = check.printerName;
     writeRawStore(raw);
   }
   syncAgentRuntimeConfigFile();
-  return { success: true, selectedPrinterName: printerName };
+  return { success: true, selectedPrinterName: check.printerName };
 });
 
 ipcMain.handle("agent:status", async (event) => {

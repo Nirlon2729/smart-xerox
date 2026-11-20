@@ -237,7 +237,31 @@ async function runSecurityTests() {
     assert.ok(!appJsx.includes("Cloud Server URL"), "Vendor login must not show Cloud Server URL field");
     assert.ok(!appJsx.includes("Cloud Backend API URL"), "Vendor settings must not show Cloud Backend API URL field");
     assert.ok(!appJsx.includes("Customer Website Domain"), "Vendor settings must not show Customer Website Domain field");
-    console.log("  PASS: Electron sandbox, IPC validation, DevTools lock, and server URL removal verified.");
+    assert.ok(mainCjs.includes("validateSelectedPrinterPayload"), "Electron printers:set-selected must use strict validator");
+
+    // Unit-test Electron IPC `printers:set-selected` validator directly
+    const { validateSelectedPrinterPayload } = require(
+      path.resolve(__dirname, "../../desktop-app/electron/ipcValidators.cjs")
+    );
+    const mockDiscovered = [
+      { name: "HP LaserJet MFP M129-M134", printerCategory: "PHYSICAL", isVirtual: false },
+      { name: "Microsoft Print to PDF", printerCategory: "VIRTUAL", isVirtual: true }
+    ];
+    assert.strictEqual(validateSelectedPrinterPayload(null, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload(["HP"], mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: "" }, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: "   " }, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: { $ne: "" } }, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: ["HP"] }, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: 12345 }, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: "A".repeat(201) }, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: "HP\x00Evil" }, mockDiscovered).valid, false);
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: "Microsoft Print to PDF" }, mockDiscovered).valid, false, "Virtual printer must be rejected");
+    assert.strictEqual(validateSelectedPrinterPayload({ printerName: "Unknown Arbitrary Printer" }, mockDiscovered).valid, false, "Undiscovered printer must be rejected");
+    const validPrinterCheck = validateSelectedPrinterPayload({ printerName: "hp laserjet mfp m129-m134" }, mockDiscovered);
+    assert.strictEqual(validPrinterCheck.valid, true, "Valid discovered physical printer must pass");
+    assert.strictEqual(validPrinterCheck.printerName, "HP LaserJet MFP M129-M134", "Must return canonical discovered name");
+    console.log("  PASS: Electron sandbox, IPC sender & printer-selection validation, DevTools lock, and URL removal verified.");
 
     console.log("\n====================================================================");
     console.log("SECURITY AUDIT SUITE: ALL 6 SECURITY HARDENING CHECKS PASSED!");
