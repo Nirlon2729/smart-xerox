@@ -54,6 +54,7 @@ import {
   downloadVendorOrderBlob,
   getApiErrorMessage
 } from "./services/desktopApi";
+import LoadingButton, { InlineSpinner } from "./components/LoadingButton";
 
 const ALL_PAPER_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "B5", "Executive"];
 
@@ -247,6 +248,14 @@ export default function App() {
   const [pricingDirty, setPricingDirty] = useState(false);
   const [savingPricing, setSavingPricing] = useState(false);
   const [togglingAvailability, setTogglingAvailability] = useState(false);
+  const [selectingPrinterName, setSelectingPrinterName] = useState(null);
+  const [cancellingOrderId, setCancellingOrderId] = useState(null);
+  const [reprintingOrderId, setReprintingOrderId] = useState(null);
+  const [inspectingOrderId, setInspectingOrderId] = useState(null);
+  const [clearingFailed, setClearingFailed] = useState(false);
+  const [restartingAgent, setRestartingAgent] = useState(false);
+  const [stoppingAgent, setStoppingAgent] = useState(false);
+  const [loggingOutMode, setLoggingOutMode] = useState(null);
   const [sampleQuote, setSampleQuote] = useState({
     pages: 5,
     copies: 1,
@@ -647,7 +656,9 @@ export default function App() {
   };
 
   const handleSelectPrinter = async (printerName) => {
+    if (selectingPrinterName) return;
     try {
+      setSelectingPrinterName(printerName);
       const res = await selectVendorPrinter(printerName, true);
       if (res?.success) {
         if (window.electronAPI) {
@@ -662,6 +673,8 @@ export default function App() {
       }
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Failed to select printer"));
+    } finally {
+      setSelectingPrinterName(null);
     }
   };
 
@@ -952,7 +965,9 @@ export default function App() {
   };
 
   const handleLogout = async (unpairAgent = false) => {
+    if (loggingOutMode) return;
     try {
+      setLoggingOutMode(unpairAgent ? "unpair" : "keep");
       if (unpairAgent && session.agentId) {
         await revokeDesktopAgent(session.agentId).catch(() => {});
       }
@@ -974,11 +989,15 @@ export default function App() {
       );
     } catch (_err) {
       setShowLogoutModal(false);
+    } finally {
+      setLoggingOutMode(null);
     }
   };
 
   const handleCancelOrder = async (order) => {
+    if (cancellingOrderId === order._id) return;
     try {
+      setCancellingOrderId(order._id);
       const res = await cancelVendorOrder(order.token);
       if (res?.success) {
         toast.success(`Cancelled ${order.originalName}`);
@@ -986,14 +1005,16 @@ export default function App() {
       }
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Could not cancel job"));
+    } finally {
+      setCancellingOrderId(null);
     }
   };
 
   const handleConfirmReprint = async () => {
-    if (!confirmReprintJob) return;
+    if (!confirmReprintJob || reprintingOrderId) return;
     const job = confirmReprintJob;
-    setConfirmReprintJob(null);
     try {
+      setReprintingOrderId(job._id);
       const res = await reprintVendorOrder(job.token);
       if (res?.success) {
         toast.success(`Reprint queued for ${job.originalName}`);
@@ -1001,11 +1022,16 @@ export default function App() {
       }
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Could not reprint job"));
+    } finally {
+      setReprintingOrderId(null);
+      setConfirmReprintJob(null);
     }
   };
 
   const handleClearFailedOrders = async () => {
+    if (clearingFailed) return;
     try {
+      setClearingFailed(true);
       const res = await clearFailedVendorOrders();
       if (res?.success) {
         toast.success(res.message || "Cleared failed jobs");
@@ -1013,16 +1039,22 @@ export default function App() {
       }
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Could not clear failed jobs"));
+    } finally {
+      setClearingFailed(false);
     }
   };
 
   const handleOpenGridFsFile = async (order) => {
+    if (inspectingOrderId === order._id) return;
     try {
+      setInspectingOrderId(order._id);
       const blob = await downloadVendorOrderBlob(order._id);
       const url = URL.createObjectURL(blob);
       window.open(url, "_blank", "noopener,noreferrer");
     } catch (err) {
       toast.error(err.message || "Could not open document file");
+    } finally {
+      setInspectingOrderId(null);
     }
   };
 
@@ -1116,14 +1148,16 @@ export default function App() {
               />
             </div>
 
-            <button
+            <LoadingButton
               type="submit"
-              disabled={loggingIn}
-              className="w-full h-11 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-sm font-semibold transition flex items-center justify-center gap-2 disabled:opacity-50"
+              loading={loggingIn}
+              loadingText="Signing In..."
+              icon={Lock}
+              spinnerClassName="w-4 h-4"
+              className="w-full h-11 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-sm font-semibold"
             >
-              <Lock className="w-4 h-4" />
-              <span>{loggingIn ? "Signing In & Pairing Agent..." : "Vendor Sign In & Connect Printer"}</span>
-            </button>
+              Vendor Sign In &amp; Connect Printer
+            </LoadingButton>
           </form>
 
           <div className="pt-2 border-t border-zinc-100 flex items-center justify-between text-[11px] text-zinc-400">
@@ -1420,23 +1454,22 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2.5">
-            <button
+            <LoadingButton
               type="button"
-              disabled={togglingAvailability}
+              loading={togglingAvailability}
+              loadingText={isShopAcceptingOrders ? "Closing..." : "Opening..."}
+              icon={Power}
               onClick={() => handleToggleShopAvailability(!isShopAcceptingOrders)}
-              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition disabled:opacity-50 ${
+              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold ${
                 isShopAcceptingOrders
                   ? "bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100"
                   : "bg-emerald-600 border-emerald-700 text-white hover:bg-emerald-700"
               }`}
             >
-              <Power className="w-3.5 h-3.5" />
-              <span>
-                {isShopAcceptingOrders
-                  ? "Close Shop / Stop Accepting Orders"
-                  : "Open Shop / Accept Orders"}
-              </span>
-            </button>
+              {isShopAcceptingOrders
+                ? "Close Shop / Stop Accepting Orders"
+                : "Open Shop / Accept Orders"}
+            </LoadingButton>
 
             <div
               className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-2 ${
@@ -1450,26 +1483,24 @@ export default function App() {
               <span>• {isPrinterOnline ? "Online" : "Offline"}</span>
             </div>
 
-            <button
+            <LoadingButton
               type="button"
+              loading={loadingDashboard || discoveringPrinters}
+              loadingText="Refreshing..."
+              icon={RefreshCw}
               onClick={() => {
                 refreshCloudData(false);
                 refreshLocalPrinters(true);
                 refreshLocalAgentStatus();
               }}
-              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition ${
+              className={`px-3 py-1.5 rounded-xl border text-xs font-semibold ${
                 isDark
                   ? "border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
                   : "border-zinc-200 bg-zinc-50 text-zinc-700 hover:bg-zinc-100"
               }`}
             >
-              <RefreshCw
-                className={`w-3.5 h-3.5 ${
-                  loadingDashboard || discoveringPrinters ? "animate-spin" : ""
-                }`}
-              />
-              <span>Refresh</span>
-            </button>
+              Refresh
+            </LoadingButton>
           </div>
         </header>
 
@@ -1770,11 +1801,29 @@ export default function App() {
                             key={job._id}
                             className="py-3 flex items-center justify-between gap-3"
                           >
-                            <div className="min-w-0">
-                              <p className="text-sm font-semibold truncate">
-                                {job.originalName}
-                              </p>
-                              <p className="text-xs text-zinc-500 font-mono-code mt-0.5">
+                            <div className="min-w-0 space-y-1">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <p className="text-sm font-semibold truncate max-w-[240px]">
+                                  {job.originalName}
+                                </p>
+                                {job.pickupCode && (
+                                  <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-[#8D0100]/10 border border-[#8D0100]/25 text-[#8D0100] text-[11px] font-bold font-mono-code tracking-wider shrink-0">
+                                    <span>PRINT CODE: {job.pickupCode}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        navigator.clipboard.writeText(String(job.pickupCode));
+                                        toast.success(`Copied Print Code ${job.pickupCode}`);
+                                      }}
+                                      title="Copy 4-digit print code"
+                                      className="hover:text-[#5e0100] transition"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                    </button>
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-xs text-zinc-500 font-mono-code">
                                 {job.token} • {job.copies}x • {job.paperSize} •{" "}
                                 {job.colorMode === "color" ? "Colour" : "B&W"} •{" "}
                                 {job.printablePageCount} page(s) • ₹
@@ -1834,14 +1883,15 @@ export default function App() {
                         Cancel Changes
                       </button>
                     )}
-                    <button
+                    <LoadingButton
                       type="button"
                       onClick={handleSavePricing}
-                      disabled={savingPricing}
-                      className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                      loading={savingPricing}
+                      loadingText="Saving..."
+                      className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                     >
-                      {savingPricing ? "Saving Prices..." : "Save Prices & Rates"}
-                    </button>
+                      Save Prices &amp; Rates
+                    </LoadingButton>
                   </div>
                 </div>
 
@@ -2264,13 +2314,14 @@ export default function App() {
                         Cancel / Revert Changes
                       </button>
                     )}
-                    <button
+                    <LoadingButton
                       type="submit"
-                      disabled={savingPricing}
-                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                      loading={savingPricing}
+                      loadingText="Saving..."
+                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                     >
-                      {savingPricing ? "Saving Prices..." : "Save Printing Prices & Rates"}
-                    </button>
+                      Save Printing Prices &amp; Rates
+                    </LoadingButton>
                   </div>
                 </form>
               </div>
@@ -2323,17 +2374,16 @@ export default function App() {
                       <span>Show Virtual Printers ({localVirtualPrinters.length})</span>
                     </label>
 
-                    <button
+                    <LoadingButton
                       type="button"
                       onClick={() => refreshLocalPrinters(true)}
-                      disabled={discoveringPrinters}
-                      className="px-3.5 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold inline-flex items-center gap-1.5"
+                      loading={discoveringPrinters}
+                      loadingText="Scanning..."
+                      icon={RefreshCw}
+                      className="px-3.5 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                     >
-                      <RefreshCw
-                        className={`w-3.5 h-3.5 ${discoveringPrinters ? "animate-spin" : ""}`}
-                      />
-                      <span>Refresh Printers</span>
-                    </button>
+                      Refresh Printers
+                    </LoadingButton>
                   </div>
                 </div>
 
@@ -2553,13 +2603,16 @@ export default function App() {
                                 <span>Active Smart Xerox Printer</span>
                               </span>
                             ) : (
-                              <button
+                              <LoadingButton
                                 type="button"
+                                loading={selectingPrinterName === p.name}
+                                loadingText="Selecting..."
+                                disabled={Boolean(selectingPrinterName)}
                                 onClick={() => handleSelectPrinter(p.name)}
-                                className="px-3 py-1.5 rounded-xl border border-[#8D0100] bg-white hover:bg-[#8D0100] hover:text-white text-[#8D0100] text-xs font-semibold transition"
+                                className="px-3 py-1.5 rounded-xl border border-[#8D0100] bg-white hover:bg-[#8D0100] hover:text-white text-[#8D0100] text-xs font-semibold"
                               >
                                 Set as Default for Smart Xerox
-                              </button>
+                              </LoadingButton>
                             )}
                           </div>
                         </div>
@@ -2671,13 +2724,14 @@ export default function App() {
                   )}
 
                   <div>
-                    <button
+                    <LoadingButton
                       type="submit"
-                      disabled={savingCaps}
-                      className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                      loading={savingCaps}
+                      loadingText="Saving..."
+                      className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                     >
-                      {savingCaps ? "Saving..." : "Save Capability Settings"}
-                    </button>
+                      Save Capability Settings
+                    </LoadingButton>
                   </div>
                 </form>
               </div>
@@ -2774,7 +2828,7 @@ export default function App() {
                     type="text"
                     value={orderSearch}
                     onChange={(e) => setOrderSearch(e.target.value)}
-                    placeholder="Search by file name or job token (XR-...)"
+                    placeholder="Search by 4-digit print code (e.g. 4827), file name, or job token (XR-...)"
                     className="w-full h-10 pl-9 pr-3.5 rounded-xl border border-zinc-200 text-xs focus:border-[#8D0100] focus:outline-none"
                   />
                 </div>
@@ -2797,14 +2851,16 @@ export default function App() {
                     )
                   )}
 
-                  <button
+                  <LoadingButton
                     type="button"
                     onClick={handleClearFailedOrders}
-                    className="px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 text-red-700 text-xs font-semibold inline-flex items-center gap-1 hover:bg-red-100"
+                    loading={clearingFailed}
+                    loadingText="Clearing..."
+                    icon={Trash2}
+                    className="px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 text-red-700 text-xs font-semibold hover:bg-red-100"
                   >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>Clear Failed</span>
-                  </button>
+                    Clear Failed
+                  </LoadingButton>
                 </div>
               </div>
 
@@ -2838,10 +2894,26 @@ export default function App() {
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
-                            <div className="flex items-center gap-2">
-                              <span className="text-sm font-bold truncate">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-sm font-bold truncate max-w-[260px]">
                                 {order.originalName}
                               </span>
+                              {order.pickupCode && (
+                                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-[#8D0100]/10 border border-[#8D0100]/25 text-[#8D0100] text-[11px] font-bold font-mono-code tracking-wider shrink-0">
+                                  <span>PRINT CODE: {order.pickupCode}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      navigator.clipboard.writeText(String(order.pickupCode));
+                                      toast.success(`Copied Print Code ${order.pickupCode}`);
+                                    }}
+                                    title="Copy 4-digit print code"
+                                    className="hover:text-[#5e0100] transition"
+                                  >
+                                    <Copy className="w-3 h-3" />
+                                  </button>
+                                </span>
+                              )}
                               <span
                                 className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
                                   STATUS_BADGES[order.status] || STATUS_BADGES.QUEUED
@@ -2860,36 +2932,42 @@ export default function App() {
 
                           <div className="flex items-center gap-2 shrink-0">
                             {!order.fileDeleted && (
-                              <button
+                              <LoadingButton
                                 type="button"
+                                loading={inspectingOrderId === order._id}
+                                loadingText="Opening..."
+                                icon={ExternalLink}
                                 onClick={() => handleOpenGridFsFile(order)}
-                                className="px-3 py-1.5 rounded-lg border border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 text-xs font-semibold inline-flex items-center gap-1.5"
+                                className="px-3 py-1.5 rounded-lg border border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50 text-xs font-semibold"
                               >
-                                <ExternalLink className="w-3.5 h-3.5 text-[#8D0100]" />
-                                <span>Inspect File</span>
-                              </button>
+                                Inspect File
+                              </LoadingButton>
                             )}
 
                             {canReprint && (
-                              <button
+                              <LoadingButton
                                 type="button"
+                                loading={reprintingOrderId === order._id}
+                                loadingText="Submitting..."
+                                icon={RotateCcw}
                                 onClick={() => setConfirmReprintJob(order)}
-                                className="px-3 py-1.5 rounded-lg bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold inline-flex items-center gap-1.5"
+                                className="px-3 py-1.5 rounded-lg bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                               >
-                                <RotateCcw className="w-3.5 h-3.5" />
-                                <span>Reprint</span>
-                              </button>
+                                Reprint
+                              </LoadingButton>
                             )}
 
                             {canCancel && (
-                              <button
+                              <LoadingButton
                                 type="button"
+                                loading={cancellingOrderId === order._id}
+                                loadingText="Cancelling..."
+                                icon={XCircle}
                                 onClick={() => handleCancelOrder(order)}
-                                className="px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 text-xs font-semibold inline-flex items-center gap-1"
+                                className="px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 text-xs font-semibold"
                               >
-                                <XCircle className="w-3.5 h-3.5" />
-                                <span>Cancel</span>
-                              </button>
+                                Cancel
+                              </LoadingButton>
                             )}
                           </div>
                         </div>
@@ -2977,47 +3055,60 @@ export default function App() {
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <button
+                    <LoadingButton
                       type="button"
+                      loading={restartingAgent}
+                      loadingText="Restarting..."
+                      icon={Play}
                       onClick={async () => {
-                        if (window.electronAPI) {
+                        if (!window.electronAPI || restartingAgent) return;
+                        try {
+                          setRestartingAgent(true);
                           await window.electronAPI.restartAgent();
-                          refreshLocalAgentStatus();
+                          await refreshLocalAgentStatus();
                           toast.success("Background print agent restarted");
+                        } finally {
+                          setRestartingAgent(false);
                         }
                       }}
-                      className="px-3.5 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold inline-flex items-center gap-1.5"
+                      className="px-3.5 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                     >
-                      <Play className="w-3.5 h-3.5" />
-                      <span>{localAgentStatus.running ? "Restart Agent" : "Start Agent"}</span>
-                    </button>
+                      {localAgentStatus.running ? "Restart Agent" : "Start Agent"}
+                    </LoadingButton>
 
                     {localAgentStatus.running && (
-                      <button
+                      <LoadingButton
                         type="button"
+                        loading={stoppingAgent}
+                        loadingText="Stopping..."
+                        icon={Square}
                         onClick={async () => {
-                          if (window.electronAPI) {
+                          if (!window.electronAPI || stoppingAgent) return;
+                          try {
+                            setStoppingAgent(true);
                             await window.electronAPI.stopAgent();
-                            refreshLocalAgentStatus();
+                            await refreshLocalAgentStatus();
                             toast.success("Background print agent stopped");
+                          } finally {
+                            setStoppingAgent(false);
                           }
                         }}
-                        className="px-3.5 py-2 rounded-xl border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50 text-xs font-semibold inline-flex items-center gap-1.5"
+                        className="px-3.5 py-2 rounded-xl border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50 text-xs font-semibold"
                       >
-                        <Square className="w-3.5 h-3.5" />
-                        <span>Stop</span>
-                      </button>
+                        Stop
+                      </LoadingButton>
                     )}
 
-                    <button
+                    <LoadingButton
                       type="button"
                       onClick={handleRunDiagnostics}
-                      disabled={runningDiag}
-                      className="px-3.5 py-2 rounded-xl border border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-50 text-xs font-semibold inline-flex items-center gap-1.5"
+                      loading={runningDiag}
+                      loadingText="Running..."
+                      icon={ShieldCheck}
+                      className="px-3.5 py-2 rounded-xl border border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-50 text-xs font-semibold"
                     >
-                      <ShieldCheck className="w-3.5 h-3.5 text-[#8D0100]" />
-                      <span>{runningDiag ? "Running..." : "Run Diagnostics"}</span>
-                    </button>
+                      Run Diagnostics
+                    </LoadingButton>
                   </div>
                 </div>
 
@@ -3326,13 +3417,14 @@ export default function App() {
                   )}
 
                   <div className="pt-1">
-                    <button
+                    <LoadingButton
                       type="submit"
-                      disabled={changingPassword}
-                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                      loading={changingPassword}
+                      loadingText="Saving..."
+                      className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                     >
-                      {changingPassword ? "Saving Changes..." : "Save Changes"}
-                    </button>
+                      Save Changes
+                    </LoadingButton>
                   </div>
                 </form>
               </div>
@@ -3507,13 +3599,14 @@ export default function App() {
                 </div>
 
                 <div className="pt-2">
-                  <button
+                  <LoadingButton
                     type="submit"
-                    disabled={savingSettings}
-                    className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold disabled:opacity-50"
+                    loading={savingSettings}
+                    loadingText="Saving..."
+                    className="px-5 py-2.5 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
                   >
-                    {savingSettings ? "Saving..." : "Save Settings"}
-                  </button>
+                    Save Settings
+                  </LoadingButton>
                 </div>
               </form>
               </div>
@@ -3533,24 +3626,31 @@ export default function App() {
               Choose whether to sign out of the dashboard while keeping the background print agent active, or completely unpair this computer from your shop.
             </p>
             <div className="flex flex-col gap-2 pt-2">
-              <button
+              <LoadingButton
                 type="button"
+                loading={loggingOutMode === "keep"}
+                loadingText="Signing Out..."
+                disabled={Boolean(loggingOutMode)}
                 onClick={() => handleLogout(false)}
                 className="w-full py-2.5 px-4 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
               >
                 Sign Out (Keep Background Print Agent Active)
-              </button>
-              <button
+              </LoadingButton>
+              <LoadingButton
                 type="button"
+                loading={loggingOutMode === "unpair"}
+                loadingText="Unpairing..."
+                disabled={Boolean(loggingOutMode)}
                 onClick={() => handleLogout(true)}
                 className="w-full py-2.5 px-4 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-semibold"
               >
-                Sign Out & Unpair This Computer
-              </button>
+                Sign Out &amp; Unpair This Computer
+              </LoadingButton>
               <button
                 type="button"
+                disabled={Boolean(loggingOutMode)}
                 onClick={() => setShowLogoutModal(false)}
-                className="w-full py-2 px-4 rounded-xl border border-zinc-200 text-xs font-semibold text-zinc-600 hover:bg-zinc-50"
+                className="w-full py-2 px-4 rounded-xl border border-zinc-200 text-xs font-semibold text-zinc-600 hover:bg-zinc-50 disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -3573,18 +3673,21 @@ export default function App() {
             <div className="flex items-center justify-end gap-2">
               <button
                 type="button"
+                disabled={Boolean(reprintingOrderId)}
                 onClick={() => setConfirmReprintJob(null)}
-                className="px-4 py-2 rounded-xl border border-zinc-200 text-xs font-semibold text-zinc-700"
+                className="px-4 py-2 rounded-xl border border-zinc-200 text-xs font-semibold text-zinc-700 disabled:opacity-50"
               >
                 Cancel
               </button>
-              <button
+              <LoadingButton
                 type="button"
+                loading={Boolean(reprintingOrderId)}
+                loadingText="Submitting..."
                 onClick={handleConfirmReprint}
-                className="px-4 py-2 rounded-xl bg-[#8D0100] text-white text-xs font-semibold"
+                className="px-4 py-2 rounded-xl bg-[#8D0100] hover:bg-[#730100] text-white text-xs font-semibold"
               >
                 Print Now
-              </button>
+              </LoadingButton>
             </div>
           </div>
         </div>

@@ -16,6 +16,7 @@ import FileCard from "../components/FileCard";
 import DocumentPreview from "../components/DocumentPreview";
 import PrintOptions from "../components/PrintOptions";
 import BottomActionBar from "../components/BottomActionBar";
+import LoadingButton from "../components/LoadingButton";
 import { usePrintSession } from "../context/PrintSessionContext";
 import {
   inspectAndStagePdf,
@@ -63,6 +64,8 @@ export default function PrintSettings() {
   const [customRangeError, setCustomRangeError] = useState(null);
   const [replacing, setReplacing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [checkingAvailability, setCheckingAvailability] = useState(false);
+  const submittingRef = useRef(false);
   const addMoreInputRef = useRef(null);
 
   const idempotencyKeyRef = useRef(
@@ -229,20 +232,32 @@ export default function PrintSettings() {
 
   const isShopAvailable = Boolean(printerState?.shopAvailable || printerState?.online);
 
+  const handleCheckAvailability = async () => {
+    if (checkingAvailability) return;
+    try {
+      setCheckingAvailability(true);
+      await refreshPrinterStatus();
+    } finally {
+      setCheckingAvailability(false);
+    }
+  };
+
   const handlePrintNow = async () => {
-    if (submitting || !activeSlug) return;
+    if (submittingRef.current || submitting || !activeSlug) return;
     if (!isShopAvailable) {
       toast.error(
         printerState?.unavailableReason ||
           "Sorry, this shop is currently unavailable and cannot accept print orders right now."
       );
-      refreshPrinterStatus();
+      handleCheckAvailability();
       return;
     }
     if (customRangeError) {
       toast.error(customRangeError);
       return;
     }
+
+    submittingRef.current = true;
 
     const docsToSubmit =
       uploadedDocuments.length > 0
@@ -305,6 +320,7 @@ export default function PrintSettings() {
     } catch (err) {
       toast.error(getApiErrorMessage(err, "Failed to submit print job."));
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -380,15 +396,18 @@ export default function PrintSettings() {
             className="hidden"
             disabled={replacing || submitting}
           />
-          <button
+          <LoadingButton
             type="button"
-            disabled={replacing || submitting}
+            loading={replacing}
+            loadingText="Uploading..."
+            disabled={submitting}
+            icon={Plus}
+            spinnerClassName="w-3.5 h-3.5"
             onClick={() => addMoreInputRef.current?.click()}
-            className="px-3.5 py-2 rounded-xl border border-[#8D0100]/30 bg-white hover:bg-[#8D0100]/5 text-[#8D0100] text-xs font-semibold inline-flex items-center gap-1.5 transition shadow-2xs disabled:opacity-50"
+            className="px-3.5 py-2 rounded-xl border border-[#8D0100]/30 bg-white hover:bg-[#8D0100]/5 text-[#8D0100] text-xs font-semibold shadow-2xs"
           >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Add Another Document</span>
-          </button>
+            Add Another Document
+          </LoadingButton>
         </div>
       </div>
 
@@ -406,14 +425,17 @@ export default function PrintSettings() {
               </p>
             </div>
           </div>
-          <button
+          <LoadingButton
             type="button"
-            onClick={() => refreshPrinterStatus()}
-            className="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold text-xs inline-flex items-center gap-1 shrink-0"
+            loading={checkingAvailability}
+            loadingText="Checking..."
+            icon={RefreshCw}
+            spinnerClassName="w-3.5 h-3.5"
+            onClick={handleCheckAvailability}
+            className="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold text-xs shrink-0"
           >
-            <RefreshCw className="w-3.5 h-3.5" />
-            <span>Check Availability</span>
-          </button>
+            Check Availability
+          </LoadingButton>
         </div>
       )}
 
@@ -617,14 +639,13 @@ export default function PrintSettings() {
 
       <BottomActionBar
         primaryLabel={
-          submitting
-            ? "Sending to Shop Printer..."
-            : !isShopAvailable
-              ? "Shop Temporarily Unavailable"
-              : uploadedDocuments.length > 1
-                ? `Print All ${uploadedDocuments.length} Documents • ₹${displayedTotalPrice}`
-                : `Print Now • ₹${displayedTotalPrice}`
+          !isShopAvailable
+            ? "Shop Temporarily Unavailable"
+            : uploadedDocuments.length > 1
+              ? `Print All ${uploadedDocuments.length} Documents — ₹${displayedTotalPrice}`
+              : `Print Now — ₹${displayedTotalPrice}`
         }
+        primaryLoadingLabel="Submitting..."
         onPrimaryClick={handlePrintNow}
         primaryDisabled={
           submitting ||

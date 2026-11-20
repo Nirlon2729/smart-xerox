@@ -503,6 +503,9 @@ async function updateJobStatus(req, res) {
 
   if (status === "COMPLETED") {
     update.completedAt = new Date();
+    update.pickupCodeReservedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  } else if (status === "FAILED") {
+    update.pickupCodeReservedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000);
   }
 
   const query = {

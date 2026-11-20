@@ -894,8 +894,140 @@ async function runTests() {
     assert.strictEqual(rejectedOfflineOrder.status, 503, "Offline shop must reject new orders with 503");
     console.log("  PASS: Server-side order protection blocks paused/offline shops while keeping other vendors unaffected.");
 
-    // 10. Agent Revocation & Audit Log Verification
-    console.log("\n[10/10] Testing Agent Revocation & Audit Logging...");
+    // 10. 4-Digit Print Collection Code, Search, Reprint Preservation & Concurrent Idempotency Protection
+    console.log("\n[10/11] Testing 4-Digit Print Collection Code, Search, Reprint & Concurrent Idempotency...");
+    assert.ok(
+      /^\d{4}$/.test(String(orderA.pickupCode || "")),
+      `Order A must have a 4-digit numeric pickupCode, got ${orderA.pickupCode}`
+    );
+    assert.ok(
+      /^\d{4}$/.test(String(orderB.pickupCode || "")),
+      `Order B must have a 4-digit numeric pickupCode, got ${orderB.pickupCode}`
+    );
+
+    // Search by pickupCode for Vendor A returns Order A; Vendor B searching Vendor A's code NEVER sees Order A
+    const searchA = await apiRequest(
+      baseUrl,
+      "GET",
+      `/vendor/orders?search=${encodeURIComponent(orderA.pickupCode)}`,
+      { headers: { Authorization: `Bearer ${tokenA}` } }
+    );
+    assert.strictEqual(searchA.status, 200);
+    assert.ok(
+      searchA.data.orders.some((o) => String(o._id) === String(orderA.id)),
+      "Vendor A search by pickupCode must find Order A"
+    );
+
+    const crossSearchB = await apiRequest(
+      baseUrl,
+      "GET",
+      `/vendor/orders?search=${encodeURIComponent(orderA.pickupCode)}`,
+      { headers: { Authorization: `Bearer ${tokenB}` } }
+    );
+    assert.strictEqual(crossSearchB.status, 200);
+    assert.ok(
+      !crossSearchB.data.orders.some((o) => String(o._id) === String(orderA.id)),
+      "Vendor B must NEVER retrieve Vendor A's order via pickupCode search"
+    );
+
+    // Reprinting Order A (which is COMPLETED) must retain Order A's original pickupCode
+    const reprintARes = await apiRequest(
+      baseUrl,
+      "POST",
+      `/vendor/orders/${orderA.token}/reprint`,
+      { headers: { Authorization: `Bearer ${tokenA}` } }
+    );
+    assert.strictEqual(reprintARes.status, 201, "Reprinting completed Order A must succeed");
+    assert.strictEqual(
+      reprintARes.data.order.pickupCode,
+      orderA.pickupCode,
+      "Reprinted order must preserve the original order's 4-digit pickupCode"
+    );
+    createdOrderIds.push(reprintARes.data.order.id);
+
+    // Concurrent idempotency test on Vendor B: fire 4 simultaneous requests with the EXACT same idempotencyKey
+    const inspBIdem = await apiRequest(
+      baseUrl,
+      "POST",
+      `/shops/${vendorB.shopSlug}/orders/inspect`,
+      { body: buildMultipartPdfForm("idem-test.pdf", SAMPLE_PDF) }
+    );
+    assert.strictEqual(inspBIdem.status, 200);
+    createdGridFsIds.push({ id: inspBIdem.data.document.uploadId, tenantId: vendorB.id });
+
+    const sharedIdemKey = `concurrent-idem-${runSuffix}`;
+    const concurrentIdemResults = await Promise.all(
+      [1, 2, 3, 4].map(() =>
+        apiRequest(baseUrl, "POST", `/shops/${vendorB.shopSlug}/orders`, {
+          body: {
+            uploadId: inspBIdem.data.document.uploadId,
+            idempotencyKey: sharedIdemKey,
+            pickupCode: "1111", // Customer-supplied code must be ignored
+            colorMode: "bw",
+            sides: "single",
+            paperSize: "A4",
+            copies: 3
+          }
+        })
+      )
+    );
+    const createdOrDedupIds = new Set(
+      concurrentIdemResults.map((r) => {
+        assert.ok([200, 201].includes(r.status), `Expected 200 or 201, got ${r.status}`);
+        return String(r.data.order.id);
+      })
+    );
+    assert.strictEqual(
+      createdOrDedupIds.size,
+      1,
+      "4 simultaneous requests with identical idempotencyKey must create ONLY 1 order"
+    );
+    const idemOrderId = [...createdOrDedupIds][0];
+    createdOrderIds.push(idemOrderId);
+
+    // Concurrent distinct orders in Vendor B must all receive distinct 4-digit pickupCodes
+    const distinctUploadIds = [];
+    for (let i = 0; i < 4; i++) {
+      const insp = await apiRequest(
+        baseUrl,
+        "POST",
+        `/shops/${vendorB.shopSlug}/orders/inspect`,
+        { body: buildMultipartPdfForm(`conc-${i}.pdf`, SAMPLE_PDF) }
+      );
+      assert.strictEqual(insp.status, 200);
+      distinctUploadIds.push(insp.data.document.uploadId);
+      createdGridFsIds.push({ id: insp.data.document.uploadId, tenantId: vendorB.id });
+    }
+    const concurrentDistinctRes = await Promise.all(
+      distinctUploadIds.map((uid, idx) =>
+        apiRequest(baseUrl, "POST", `/shops/${vendorB.shopSlug}/orders`, {
+          body: {
+            uploadId: uid,
+            idempotencyKey: `distinct-${runSuffix}-${idx}`,
+            colorMode: "bw",
+            sides: "single",
+            paperSize: "A4",
+            copies: idx + 4
+          }
+        })
+      )
+    );
+    const distinctCodes = new Set();
+    for (const r of concurrentDistinctRes) {
+      assert.strictEqual(r.status, 201);
+      assert.ok(/^\d{4}$/.test(String(r.data.order.pickupCode)));
+      distinctCodes.add(r.data.order.pickupCode);
+      createdOrderIds.push(r.data.order.id);
+    }
+    assert.strictEqual(
+      distinctCodes.size,
+      4,
+      "4 simultaneous distinct orders in the same shop must receive 4 unique pickup codes"
+    );
+    console.log("  PASS: 4-digit pickup codes, search, cross-tenant isolation, reprint preservation & concurrent idempotency verified.");
+
+    // 11. Agent Revocation & Audit Log Verification
+    console.log("\n[11/11] Testing Agent Revocation & Audit Logging...");
     const revokeRes = await apiRequest(
       baseUrl,
       "POST",

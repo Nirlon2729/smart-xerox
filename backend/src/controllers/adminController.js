@@ -904,7 +904,7 @@ async function listOrders(req, res) {
   if (search && String(search).trim()) {
     const escaped = String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const regex = new RegExp(escaped, "i");
-    filter.$or = [{ token: regex }, { originalName: regex }];
+    filter.$or = [{ pickupCode: regex }, { token: regex }, { originalName: regex }];
   }
 
   const [orders, printer, stats] = await Promise.all([

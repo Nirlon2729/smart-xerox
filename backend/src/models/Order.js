@@ -20,6 +20,20 @@ const orderSchema = new mongoose.Schema(
       unique: true,
       index: true
     },
+    pickupCode: {
+      type: String,
+      trim: true,
+      default: null,
+      index: true
+    },
+    pickupCodeActive: {
+      type: Boolean,
+      default: false
+    },
+    pickupCodeReservedUntil: {
+      type: Date,
+      default: null
+    },
     idempotencyKey: {
       type: String,
       unique: true,
@@ -208,5 +222,16 @@ const orderSchema = new mongoose.Schema(
 
 orderSchema.index({ tenantId: 1, status: 1, createdAt: 1 });
 orderSchema.index({ tenantId: 1, createdAt: -1 });
+orderSchema.index(
+  { tenantId: 1, pickupCode: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      pickupCode: { $type: "string" },
+      pickupCodeActive: true
+    }
+  }
+);
+orderSchema.index({ tenantId: 1, pickupCodeActive: 1, pickupCodeReservedUntil: 1 });
 
 module.exports = mongoose.model("Order", orderSchema);

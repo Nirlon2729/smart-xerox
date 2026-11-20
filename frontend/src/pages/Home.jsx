@@ -17,6 +17,7 @@ import FileCard from "../components/FileCard";
 import DocumentPreview from "../components/DocumentPreview";
 import BottomActionBar from "../components/BottomActionBar";
 import Loader from "../components/Loader";
+import LoadingButton, { InlineSpinner } from "../components/LoadingButton";
 import { getConnectionBadgeStyle } from "../components/Header";
 import { getOrderStatusMeta } from "../components/OrderStatus";
 import { usePrintSession } from "../context/PrintSessionContext";
@@ -70,6 +71,17 @@ export default function Home() {
 
   const [myRecentJobs, setMyRecentJobs] = useState([]);
   const [busyJobToken, setBusyJobToken] = useState(null);
+  const [refreshingShop, setRefreshingShop] = useState(false);
+
+  const handleRefreshShopStatus = async () => {
+    if (refreshingShop) return;
+    try {
+      setRefreshingShop(true);
+      await Promise.all([refreshPrinterStatus(), loadCustomerRecentJobs()]);
+    } finally {
+      setRefreshingShop(false);
+    }
+  };
 
   useEffect(() => {
     if (routeShopSlug) {
@@ -281,14 +293,13 @@ export default function Home() {
 
           <button
             type="button"
-            onClick={() => {
-              refreshPrinterStatus();
-              loadCustomerRecentJobs();
-            }}
+            disabled={refreshingShop}
+            aria-busy={refreshingShop}
+            onClick={handleRefreshShopStatus}
             aria-label="Refresh printer status"
-            className="w-9 h-9 rounded-lg border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 text-zinc-700 flex items-center justify-center shrink-0 transition"
+            className="w-9 h-9 rounded-lg border border-zinc-200 bg-zinc-50 hover:bg-zinc-100 text-zinc-700 flex items-center justify-center shrink-0 transition disabled:opacity-60"
           >
-            <RefreshCw className="w-4 h-4" />
+            <RefreshCw className={`w-4 h-4 ${refreshingShop ? "animate-spin" : ""}`} />
           </button>
         </div>
 
@@ -306,14 +317,17 @@ export default function Home() {
                 </p>
               </div>
             </div>
-            <button
+            <LoadingButton
               type="button"
-              onClick={() => refreshPrinterStatus()}
-              className="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold text-xs inline-flex items-center gap-1 shrink-0"
+              loading={refreshingShop}
+              loadingText="Checking..."
+              icon={RefreshCw}
+              spinnerClassName="w-3.5 h-3.5"
+              onClick={handleRefreshShopStatus}
+              className="px-3 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold text-xs shrink-0"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>Check Availability</span>
-            </button>
+              Check Availability
+            </LoadingButton>
           </div>
         )}
 
@@ -502,9 +516,16 @@ export default function Home() {
                       )}
                     </div>
                     <div className="min-w-0">
-                      <p className="text-xs sm:text-sm font-semibold text-zinc-900 truncate group-hover:text-[#8D0100]">
-                        {job.originalName}
-                      </p>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <p className="text-xs sm:text-sm font-semibold text-zinc-900 truncate group-hover:text-[#8D0100]">
+                          {job.originalName}
+                        </p>
+                        {job.pickupCode && (
+                          <span className="px-1.5 py-0.5 rounded bg-[#8D0100]/10 border border-[#8D0100]/25 text-[#8D0100] font-mono-code text-[10px] font-bold shrink-0">
+                            CODE: {job.pickupCode}
+                          </span>
+                        )}
+                      </div>
                       <p className="text-[11px] text-zinc-500 font-mono-code mt-0.5">
                         {job.token} • {job.copies}x • {job.paperSize || "A4"} •{" "}
                         {job.colorMode === "color" ? "Colour" : "B&W"} •{" "}
@@ -527,11 +548,16 @@ export default function Home() {
                       <button
                         type="button"
                         disabled={isBusy}
+                        aria-busy={isBusy}
                         onClick={() => handleCancelJob(job)}
                         title="Cancel queued job"
-                        className="p-1.5 rounded-lg text-zinc-500 hover:text-red-700 hover:bg-red-50 transition"
+                        className="p-1.5 rounded-lg text-zinc-500 hover:text-red-700 hover:bg-red-50 transition disabled:opacity-60"
                       >
-                        <XCircle className="w-4 h-4" />
+                        {isBusy ? (
+                          <InlineSpinner className="w-4 h-4 text-red-600" />
+                        ) : (
+                          <XCircle className="w-4 h-4" />
+                        )}
                       </button>
                     )}
                   </div>

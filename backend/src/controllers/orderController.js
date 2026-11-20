@@ -480,6 +480,32 @@ const createJobSchema = z.object({
   orientation: z.enum(["portrait", "landscape", "auto"]).default("auto")
 });
 
+const PICKUP_CODE_RESERVATION_MS = 24 * 60 * 60 * 1000;
+const MAX_PICKUP_CODE_ATTEMPTS = 30;
+
+function generateRandomPickupCode() {
+  return String(crypto.randomInt(1000, 10000));
+}
+
+/**
+ * Safely releases expired pickup-code active locks ONLY on terminal orders
+ * whose 24-hour post-completion/cancellation reservation window has elapsed.
+ * Never overwrites or removes order.pickupCode on historical orders.
+ */
+async function releaseExpiredPickupCodes(tenantId) {
+  if (!tenantId) return;
+  const now = new Date();
+  await Order.updateMany(
+    {
+      tenantId,
+      pickupCodeActive: true,
+      status: { $in: ["COMPLETED", "FAILED", "CANCELLED"] },
+      pickupCodeReservedUntil: { $lte: now }
+    },
+    { $set: { pickupCodeActive: false } }
+  );
+}
+
 async function generateUniqueJobToken() {
   for (let attempt = 0; attempt < 10; attempt++) {
     const candidate = createPrintToken();
@@ -496,6 +522,7 @@ function formatJobResponse(order) {
     shopId: order.tenantId,
     shopSlug: order.shopSlug,
     token: order.token,
+    pickupCode: order.pickupCode || null,
     originalName: order.originalName,
     documentId: order.gridFsFileId,
     documentType: order.documentType || "pdf",
@@ -807,7 +834,10 @@ async function createOrder(req, res) {
 
     const token = await generateUniqueJobToken();
 
-    const order = await Order.create({
+    // Release any expired pickup-code locks (>24h post-completion) for this shop
+    await releaseExpiredPickupCodes(req.tenantId);
+
+    const baseOrderPayload = {
       tenantId: req.tenantId,
       shopSlug: req.tenant.shopSlug,
       token,
@@ -853,7 +883,78 @@ async function createOrder(req, res) {
         customPageRange: data.customPageRange || null
       },
       status: "QUEUED"
-    });
+    };
+
+    let order = null;
+    for (let attempt = 0; attempt < MAX_PICKUP_CODE_ATTEMPTS; attempt++) {
+      const candidateCode = generateRandomPickupCode();
+      const reservedUntil = new Date(Date.now() + PICKUP_CODE_RESERVATION_MS);
+      try {
+        order = await Order.create({
+          ...baseOrderPayload,
+          pickupCode: candidateCode,
+          pickupCodeActive: true,
+          pickupCodeReservedUntil: reservedUntil
+        });
+        break;
+      } catch (createErr) {
+        const isDuplicateKey = createErr && createErr.code === 11000;
+        const dupKeyPattern = createErr?.keyPattern || {};
+        const dupMsg = String(createErr?.message || "");
+
+        // Concurrent idempotency race: another request with the exact same idempotencyKey won
+        if (
+          isDuplicateKey &&
+          scopedIdempotencyKey &&
+          (dupKeyPattern.idempotencyKey || dupMsg.includes("idempotencyKey"))
+        ) {
+          const existingIdem = await Order.findOne({
+            tenantId: req.tenantId,
+            idempotencyKey: scopedIdempotencyKey
+          });
+          if (existingIdem) {
+            if (newlyUploadedGridFsId) {
+              await deleteGridFSFile(newlyUploadedGridFsId, req.tenantId);
+              newlyUploadedGridFsId = null;
+            }
+            return res.status(200).json({
+              success: true,
+              deduplicated: true,
+              order: formatJobResponse(existingIdem),
+              message: "Print order already queued."
+            });
+          }
+        }
+
+        // Pickup code collision within this shop's active/24h reservation window: retry with a new random code
+        if (
+          isDuplicateKey &&
+          (dupKeyPattern.pickupCode || dupMsg.includes("pickupCode"))
+        ) {
+          continue;
+        }
+
+        // Token collision: generate a fresh token and retry
+        if (isDuplicateKey && (dupKeyPattern.token || dupMsg.includes("token"))) {
+          baseOrderPayload.token = await generateUniqueJobToken();
+          continue;
+        }
+
+        throw createErr;
+      }
+    }
+
+    if (!order) {
+      if (newlyUploadedGridFsId) {
+        await deleteGridFSFile(newlyUploadedGridFsId, req.tenantId);
+        newlyUploadedGridFsId = null;
+      }
+      return res.status(503).json({
+        success: false,
+        message:
+          "All print collection codes for this shop are temporarily in use. Please try again shortly."
+      });
+    }
 
     await markGridFSFileBoundToJob(fileMeta.gridFsFileId, order._id, req.tenantId);
 
@@ -932,6 +1033,9 @@ async function cancelOrder(req, res) {
 
   order.status = "CANCELLED";
   order.leaseExpiresAt = null;
+  if (order.pickupCode) {
+    order.pickupCodeReservedUntil = new Date(Date.now() + PICKUP_CODE_RESERVATION_MS);
+  }
   if (order.gridFsFileId && !order.fileDeleted) {
     await deleteGridFSFile(order.gridFsFileId, req.tenantId);
     order.fileDeleted = true;
@@ -989,6 +1093,9 @@ async function reprintOrder(req, res) {
     sourceOrder.spoolerJobId = null;
     sourceOrder.leaseExpiresAt = null;
     sourceOrder.retryCount = 0;
+    if (sourceOrder.pickupCode) {
+      sourceOrder.pickupCodeReservedUntil = new Date(Date.now() + PICKUP_CODE_RESERVATION_MS);
+    }
     await sourceOrder.save();
 
     await recordAuditLog({
@@ -998,7 +1105,7 @@ async function reprintOrder(req, res) {
       action: "JOB_REPRINTED",
       targetType: "Order",
       targetId: sourceOrder._id,
-      details: { token: sourceOrder.token, mode: "reset_failed" },
+      details: { token: sourceOrder.token, pickupCode: sourceOrder.pickupCode || null, mode: "reset_failed" },
       req
     });
 
@@ -1009,11 +1116,20 @@ async function reprintOrder(req, res) {
     });
   }
 
+  const nextReservedUntil = new Date(Date.now() + PICKUP_CODE_RESERVATION_MS);
+  if (sourceOrder.pickupCode && sourceOrder.pickupCodeActive) {
+    sourceOrder.pickupCodeReservedUntil = nextReservedUntil;
+    await sourceOrder.save();
+  }
+
   const token = await generateUniqueJobToken();
   const reprinted = await Order.create({
     tenantId: req.tenantId,
     shopSlug: sourceOrder.shopSlug || req.tenant?.shopSlug,
     token,
+    pickupCode: sourceOrder.pickupCode || null,
+    pickupCodeActive: false,
+    pickupCodeReservedUntil: sourceOrder.pickupCode ? nextReservedUntil : null,
     originalName: sourceOrder.originalName,
     gridFsFileId: sourceOrder.gridFsFileId,
     fileSha256: sourceOrder.fileSha256,
@@ -1031,6 +1147,11 @@ async function reprintOrder(req, res) {
     pageCount: sourceOrder.pageCount,
     printablePageCount: sourceOrder.printablePageCount,
     targetPrinterName: req.tenant?.selectedPrinterName || sourceOrder.targetPrinterName,
+    totalPrice: sourceOrder.totalPrice ?? 0,
+    amountPaise: sourceOrder.amountPaise ?? 0,
+    currency: sourceOrder.currency || "INR",
+    pricingSnapshot: sourceOrder.pricingSnapshot || undefined,
+    printConfigSnapshot: sourceOrder.printConfigSnapshot || undefined,
     status: "QUEUED"
   });
 
