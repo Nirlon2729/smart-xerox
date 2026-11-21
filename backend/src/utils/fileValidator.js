@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const zlib = require("zlib");
 
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
@@ -137,7 +138,35 @@ function inspectPdfBuffer(buffer) {
     }
   }
 
-  const pageCount = leafCount > 0 ? Math.max(leafCount, maxTreeCount) : maxTreeCount;
+  // Fallback for PDFs with FlateDecode-compressed object streams (/ObjStm)
+  let inflatedLeafCount = 0;
+  let inflatedMaxTreeCount = 0;
+  if (leafCount === 0 && maxTreeCount === 0) {
+    const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    let streamMatch;
+    while ((streamMatch = streamRegex.exec(rawContent)) !== null) {
+      try {
+        const compressed = Buffer.from(streamMatch[1], "latin1");
+        const inflated = zlib.inflateSync(compressed).toString("latin1");
+        const leaves = inflated.match(/\/Type\s*\/Page\b(?!s)/g);
+        if (leaves) inflatedLeafCount += leaves.length;
+        const counts = [...inflated.matchAll(/\/Type\s*\/Pages[\s\S]*?\/Count\s+(\d+)/g)].map((m) =>
+          parseInt(m[1], 10)
+        );
+        for (const c of counts) {
+          if (Number.isInteger(c) && c > inflatedMaxTreeCount) {
+            inflatedMaxTreeCount = c;
+          }
+        }
+      } catch (_inflateErr) {
+        // Non-FlateDecode stream (e.g. image stream); skip safely
+      }
+    }
+  }
+
+  const totalLeaf = Math.max(leafCount, inflatedLeafCount);
+  const totalTree = Math.max(maxTreeCount, inflatedMaxTreeCount);
+  const pageCount = totalLeaf > 0 ? Math.max(totalLeaf, totalTree) : totalTree;
   if (!pageCount || pageCount < 1) {
     throw Object.assign(
       new Error("Could not determine page count from this PDF. Verify the PDF contains at least 1 page."),
@@ -160,15 +189,19 @@ function inspectPdfBuffer(buffer) {
  * Validates actual binary file contents (not just extension/MIME) for PDF, JPG, JPEG, and PNG.
  * Returns normalized metadata and SHA-256 content hash.
  */
-function inspectUploadedBuffer(buffer, originalName = "") {
+function inspectUploadedBuffer(buffer, originalName = "", options = {}) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw Object.assign(new Error("Uploaded file is empty."), { statusCode: 400 });
   }
 
-  const maxUploadMb = Number(process.env.MAX_UPLOAD_MB) || 20;
+  const configuredMaxMb = Number(options.maxUploadMb);
+  const maxUploadMb =
+    Number.isFinite(configuredMaxMb) && configuredMaxMb > 0
+      ? Math.min(100, configuredMaxMb)
+      : Number(process.env.MAX_UPLOAD_MB) || 20;
   if (buffer.length > maxUploadMb * 1024 * 1024) {
     throw Object.assign(
-      new Error(`File exceeds maximum allowed size of ${maxUploadMb} MB.`),
+      new Error(`File exceeds this shop's maximum allowed upload size of ${maxUploadMb} MB.`),
       { statusCode: 413 }
     );
   }

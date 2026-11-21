@@ -1029,6 +1029,10 @@ async function listOrders(req, res) {
  * Streams the uploaded document from MongoDB GridFS strictly verifying req.tenantId ownership.
  */
 async function downloadAdminOrderFile(req, res) {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    return res.status(400).json({ success: false, message: "Invalid print job ID." });
+  }
+
   const order = await Order.findOne({
     _id: req.params.id,
     tenantId: req.tenantId
@@ -1047,20 +1051,45 @@ async function downloadAdminOrderFile(req, res) {
     return res.status(404).json({ success: false, message: "Print job not found" });
   }
 
-  if (!order.gridFsFileId || order.fileDeleted) {
+  if (order.documentStatus === "EXPIRED" || order.documentStatus === "DELETED" || !order.gridFsFileId || order.fileDeleted) {
+    const isExpired = order.documentStatus === "EXPIRED" || order.documentStatus === "DELETED";
     return res.status(410).json({
       success: false,
-      message: "Document file was already cleaned up from GridFS after printing."
+      code: isExpired ? "DOCUMENT_EXPIRED" : "FILE_DELETED",
+      message: isExpired
+        ? "This uploaded document has expired and was automatically deleted after 48 hours."
+        : "Document file was already cleaned up from GridFS."
     });
   }
 
-  const { fileDoc, stream } = await openGridFSDownloadStream(order.gridFsFileId, req.tenantId);
+  let fileDoc;
+  let stream;
+  try {
+    ({ fileDoc, stream } = await openGridFSDownloadStream(order.gridFsFileId, req.tenantId));
+  } catch (err) {
+    if (err.statusCode === 404) {
+      return res.status(410).json({
+        success: false,
+        code: "DOCUMENT_EXPIRED",
+        message: "This uploaded document has expired and was automatically deleted after 48 hours."
+      });
+    }
+    throw err;
+  }
+
   res.setHeader("Content-Type", order.mimeType || fileDoc.contentType || "application/octet-stream");
   res.setHeader("Content-Length", String(fileDoc.length));
   res.setHeader(
     "Content-Disposition",
     `inline; filename="${encodeURIComponent(order.originalName || fileDoc.filename)}"`
   );
+  stream.on("error", (err) => {
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: "GridFS stream error." });
+    } else {
+      res.destroy(err);
+    }
+  });
   stream.pipe(res);
 }
 
@@ -1272,6 +1301,10 @@ async function createVendor(req, res) {
  * Activates or suspends a vendor tenant.
  */
 async function updateVendorStatus(req, res) {
+  if (!mongoose.Types.ObjectId.isValid(req.params.tenantId)) {
+    return res.status(400).json({ success: false, message: "Invalid vendor tenant ID." });
+  }
+
   const { status } = req.body;
   if (!["ACTIVE", "SUSPENDED"].includes(status)) {
     return res.status(400).json({
@@ -1318,6 +1351,10 @@ async function updateVendorStatus(req, res) {
  * Resets a vendor's password.
  */
 async function resetVendorPassword(req, res) {
+  if (!mongoose.Types.ObjectId.isValid(req.params.tenantId)) {
+    return res.status(400).json({ success: false, message: "Invalid vendor tenant ID." });
+  }
+
   const newPassword = String(req.body.newPassword || req.body.password || "");
   if (!newPassword || newPassword.length < 6) {
     return res.status(400).json({
@@ -1332,10 +1369,25 @@ async function resetVendorPassword(req, res) {
   }
 
   const passwordHash = await bcrypt.hash(newPassword, 12);
+  const now = new Date();
+  // Never modify SUPER_ADMIN accounts; always set passwordChangedAt to invalidate old vendor JWTs
   const updated = await Admin.updateMany(
-    { tenantId: tenant._id },
-    { $set: { passwordHash, active: tenant.status === "ACTIVE" } }
+    { tenantId: tenant._id, role: { $ne: "SUPER_ADMIN" } },
+    {
+      $set: {
+        passwordHash,
+        passwordChangedAt: now,
+        active: tenant.status === "ACTIVE"
+      }
+    }
   );
+
+  if (!updated.matchedCount) {
+    return res.status(404).json({
+      success: false,
+      message: "No vendor account found for this tenant (SUPER_ADMIN accounts are protected)."
+    });
+  }
 
   await recordAuditLog({
     tenantId: tenant._id,

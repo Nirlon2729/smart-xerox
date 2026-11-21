@@ -99,3 +99,40 @@ export function validateCustomPageRangeInput(input, totalPages) {
   const sorted = [...pages].sort((a, b) => a - b);
   return { valid: true, pages: sorted, error: null };
 }
+
+const ALLOWED_UPLOAD_EXTENSIONS = /\.(pdf|jpg|jpeg|png)$/i;
+const ALLOWED_UPLOAD_MIMES = new Set([
+  "application/pdf",
+  "application/x-pdf",
+  "image/jpeg",
+  "image/jpg",
+  "image/png"
+]);
+
+/**
+ * Shared client-side file upload validator used across Home and PrintSettings.
+ */
+export function validateUploadFile(file, maxUploadMb = 20) {
+  if (!file) return { valid: false, error: "No file selected." };
+  const name = String(file.name || "");
+  const mime = String(file.type || "").toLowerCase();
+  const isAllowed = ALLOWED_UPLOAD_EXTENSIONS.test(name) || ALLOWED_UPLOAD_MIMES.has(mime);
+  if (!isAllowed) {
+    return {
+      valid: false,
+      error: `Unsupported file "${name}". Only PDF, JPG, JPEG, and PNG files are allowed.`
+    };
+  }
+  if (!file.size || file.size <= 0) {
+    return { valid: false, error: `File "${name}" is empty.` };
+  }
+  const limitMb = Math.max(1, Number(maxUploadMb) || 20);
+  const maxBytes = limitMb * 1024 * 1024;
+  if (file.size > maxBytes) {
+    return {
+      valid: false,
+      error: `"${name}" exceeds this shop's maximum upload size of ${limitMb} MB.`
+    };
+  }
+  return { valid: true, error: null };
+}

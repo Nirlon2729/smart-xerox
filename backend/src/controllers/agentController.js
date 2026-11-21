@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const mongoose = require("mongoose");
 const Order = require("../models/Order");
 const Agent = require("../models/Agent");
 const Tenant = require("../models/Tenant");
@@ -9,6 +10,10 @@ const {
   deleteGridFSFile,
   cleanupExpiredGridFSFiles
 } = require("../services/gridfsService");
+const {
+  EXPIRED_DOCUMENT_MESSAGE,
+  runDocumentCleanupSweep
+} = require("../services/fileCleanupService");
 
 const LEASE_DURATION_MS = 3 * 60 * 1000; // 3 minutes per active download/processing lease
 const VALID_PAPER_SIZES = ["A4", "A3", "Legal", "Letter", "A5", "B5", "Executive"];
@@ -400,6 +405,10 @@ async function nextJob(req, res) {
  * enforcing exact tenantId ownership on both the Order and GridFS file document.
  */
 async function downloadJobFile(req, res) {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    return res.status(400).json({ success: false, message: "Invalid print job ID." });
+  }
+
   const job = await Order.findOne({
     _id: req.params.id,
     tenantId: req.tenantId
@@ -433,10 +442,16 @@ async function downloadJobFile(req, res) {
     });
   }
 
-  if (!job.gridFsFileId || job.fileDeleted) {
+  if (
+    job.documentStatus === "EXPIRED" ||
+    job.documentStatus === "DELETED" ||
+    !job.gridFsFileId ||
+    job.fileDeleted
+  ) {
     return res.status(410).json({
       success: false,
-      message: "Document file is no longer available in GridFS"
+      code: "DOCUMENT_EXPIRED",
+      message: EXPIRED_DOCUMENT_MESSAGE
     });
   }
 
@@ -483,10 +498,54 @@ async function downloadJobFile(req, res) {
  * strictly enforcing tenantId and agentJobId ownership.
  */
 async function updateJobStatus(req, res) {
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+    return res.status(400).json({ success: false, message: "Invalid print job ID." });
+  }
+
   const { status, failureReason, agentJobId, spoolerJobId } = req.body;
-  const allowed = ["DOWNLOADING", "PROCESSING", "PRINTING", "COMPLETED", "FAILED"];
+  const allowed = ["DOWNLOADING", "PROCESSING", "PRINTING", "COMPLETED", "FAILED", "CANCELLED"];
   if (!allowed.includes(status)) {
     return res.status(400).json({ success: false, message: `Invalid status: ${status}` });
+  }
+
+  const existing = await Order.findOne({
+    _id: req.params.id,
+    tenantId: req.tenantId
+  });
+
+  if (!existing) {
+    return res
+      .status(404)
+      .json({ success: false, message: "Job not found for this shop." });
+  }
+
+  // Strictly enforce that only the agent that claimed the job can update its status
+  if (existing.claimedByAgentId && existing.claimedByAgentId !== req.agent.agentId) {
+    await recordAuditLog({
+      tenantId: req.tenantId,
+      actorType: "AGENT",
+      actorId: req.agent.agentId,
+      action: "AGENT_JOB_OWNERSHIP_VIOLATION",
+      targetType: "Order",
+      targetId: existing._id,
+      details: {
+        claimedByAgentId: existing.claimedByAgentId,
+        attemptedStatus: status
+      },
+      req
+    });
+    return res.status(403).json({
+      success: false,
+      message: "This print job is leased to another agent."
+    });
+  }
+
+  const providedAgentJobId = agentJobId || req.headers["x-agent-job-id"];
+  if (existing.agentJobId && providedAgentJobId && existing.agentJobId !== providedAgentJobId) {
+    return res.status(409).json({
+      success: false,
+      message: "Agent job lease mismatch."
+    });
   }
 
   const update = {
@@ -504,40 +563,40 @@ async function updateJobStatus(req, res) {
   if (status === "COMPLETED") {
     update.completedAt = new Date();
     update.pickupCodeReservedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000);
-  } else if (status === "FAILED") {
+  } else if (status === "FAILED" || status === "CANCELLED") {
     update.pickupCodeReservedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000);
   }
 
-  const query = {
-    _id: req.params.id,
+  const atomicFilter = {
+    _id: existing._id,
     tenantId: req.tenantId
   };
-  if (agentJobId) {
-    query.agentJobId = agentJobId;
+  if (existing.claimedByAgentId) {
+    atomicFilter.claimedByAgentId = req.agent.agentId;
+  }
+  if (existing.agentJobId && providedAgentJobId) {
+    atomicFilter.agentJobId = providedAgentJobId;
   }
 
   const job = await Order.findOneAndUpdate(
-    query,
+    atomicFilter,
     { $set: update },
     { new: true }
   );
 
   if (!job) {
     return res
-      .status(404)
-      .json({ success: false, message: "Job not found or agent job lease mismatch" });
+      .status(409)
+      .json({ success: false, message: "Job lease changed concurrently." });
   }
 
-  if (status === "COMPLETED" && job.gridFsFileId) {
-    const retentionMinutes =
-      process.env.FILE_RETENTION_MINUTES !== undefined
-        ? Number(process.env.FILE_RETENTION_MINUTES)
-        : 60;
-    if (retentionMinutes <= 0) {
-      await deleteGridFSFile(job.gridFsFileId, req.tenantId);
-      job.fileDeleted = true;
-      await job.save();
-    }
+  // If this document reached 48h while actively downloading/printing, trigger deferred cleanup safely now
+  if (
+    job.cleanupEligible &&
+    ["COMPLETED", "FAILED", "CANCELLED"].includes(status) &&
+    !job.fileDeleted
+  ) {
+    runDocumentCleanupSweep({ tenantId: req.tenantId }).catch(() => {});
   }
 
   res.json({

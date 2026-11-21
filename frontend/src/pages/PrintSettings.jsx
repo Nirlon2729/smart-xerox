@@ -26,6 +26,7 @@ import {
 } from "../services/api";
 import {
   validateCustomPageRangeInput,
+  validateUploadFile,
   summarizeSelectedPages,
   formatFileSize
 } from "../utils/formatters";
@@ -137,8 +138,15 @@ export default function PrintSettings() {
 
   if (!documentMeta) return null;
 
+  const maxUploadMb = shopConfig?.maxUploadMb || Number(import.meta.env.VITE_MAX_UPLOAD_MB) || 20;
+
   const handleReplaceFile = async (newFile) => {
     if (replacing || submitting || !activeSlug) return;
+    const check = validateUploadFile(newFile, maxUploadMb);
+    if (!check.valid) {
+      toast.error(check.error);
+      return;
+    }
     try {
       setReplacing(true);
       const res = await inspectAndStagePdf(activeSlug, newFile);
@@ -157,6 +165,14 @@ export default function PrintSettings() {
     const files = Array.from(e.target.files || []).filter(Boolean);
     e.target.value = "";
     if (files.length === 0 || replacing || submitting || !activeSlug) return;
+
+    for (const f of files) {
+      const check = validateUploadFile(f, maxUploadMb);
+      if (!check.valid) {
+        toast.error(check.error);
+        return;
+      }
+    }
 
     try {
       setReplacing(true);
@@ -230,7 +246,8 @@ export default function PrintSettings() {
     return validation.valid ? validation.pages : s.selectedPages || [1];
   };
 
-  const isShopAvailable = Boolean(printerState?.shopAvailable || printerState?.online);
+  // A manually paused shop (shopAvailable === false) must remain unavailable even if agent/printer are online
+  const isShopAvailable = Boolean(printerState?.shopAvailable);
 
   const handleCheckAvailability = async () => {
     if (checkingAvailability) return;
@@ -252,12 +269,6 @@ export default function PrintSettings() {
       handleCheckAvailability();
       return;
     }
-    if (customRangeError) {
-      toast.error(customRangeError);
-      return;
-    }
-
-    submittingRef.current = true;
 
     const docsToSubmit =
       uploadedDocuments.length > 0
@@ -269,6 +280,32 @@ export default function PrintSettings() {
               settings
             }
           ];
+
+    // Validate custom page range for EVERY staged document independently (not just the active tab)
+    for (let i = 0; i < docsToSubmit.length; i++) {
+      const docItem = docsToSubmit[i];
+      const docIsImg = docItem.meta?.documentType === "image";
+      const docTotal = docItem.meta?.pageCount || 1;
+      const s = docItem.settings || settings;
+
+      if (!docIsImg && s.pageSelectionMode === "custom") {
+        const validation = validateCustomPageRangeInput(s.customPageRange, docTotal);
+        if (!validation.valid) {
+          setActiveDocIndex(i);
+          setCustomRangeError(validation.error);
+          const docLabel = docItem.meta?.originalName || `Document ${i + 1}`;
+          toast.error(`${docLabel}: ${validation.error}`);
+          return;
+        }
+      }
+    }
+
+    if (customRangeError) {
+      toast.error(customRangeError);
+      return;
+    }
+
+    submittingRef.current = true;
 
     try {
       setSubmitting(true);

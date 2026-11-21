@@ -1,0 +1,115 @@
+name: Smart Xerox CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: Backend Isolated Tests
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    env:
+      NODE_ENV: test
+      TEST_MONGODB_URI: mongodb://127.0.0.1:27017/smart_xerox_ci_test
+      TEST_JWT_SECRET: ci-isolated-jwt-secret-not-for-production
+      TEST_ADMIN_EMAIL: ci-superadmin@smartxerox.local
+      TEST_ADMIN_PASSWORD: CiSuperAdminPassword123!
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run isolated backend test suites
+        working-directory: backend
+        run: npm test
+
+  frontend-build:
+    name: Frontend Production Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend bundle
+        working-directory: frontend
+        run: npm run build
+
+  desktop-app-validation:
+    name: Electron Renderer Build & IPC Validation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: desktop-app/package-lock.json
+
+      - name: Install desktop app dependencies
+        working-directory: desktop-app
+        run: npm ci
+
+      - name: Build Electron renderer bundle
+        working-directory: desktop-app
+        run: npm run build:renderer
+
+      - name: Validate Electron IPC & security module syntax
+        working-directory: desktop-app
+        run: |
+          node -c electron/main.cjs
+          node -c electron/preload.cjs
+          node -c electron/ipcValidators.cjs
+
+  print-agent-tests:
+    name: Print Agent Unit Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install print-agent dependencies
+        working-directory: print-agent
+        run: pip install -r requirements.txt
+
+      - name: Run universal print-agent unittest suite
+        working-directory: print-agent
+        run: python -m unittest test_universal_printers.py -v

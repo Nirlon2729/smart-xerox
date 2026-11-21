@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
+const mongoose = require("mongoose");
 const rateLimit = require("express-rate-limit");
 
 const shopRoutes = require("./routes/shopRoutes");
@@ -114,11 +115,27 @@ if (process.env.NODE_ENV !== "test") {
 }
 
 app.get("/api/health", (_req, res) => {
-  res.json({
+  res.setHeader("Cache-Control", "no-store");
+  const isDbConnected = mongoose.connection.readyState === 1;
+
+  if (!isDbConnected) {
+    return res.status(503).json({
+      success: false,
+      status: "unhealthy",
+      service: "smart-xerox-multi-vendor-print-api",
+      database: "disconnected",
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  return res.status(200).json({
     success: true,
+    status: "ok",
     service: "smart-xerox-multi-vendor-print-api",
     architecture: "multi-tenant",
     storage: "mongodb-gridfs",
+    database: "connected",
+    uptimeSeconds: Math.floor(process.uptime()),
     timestamp: new Date().toISOString()
   });
 });
@@ -153,8 +170,28 @@ app.use("/api/admin", apiLimiter, adminRoutes);
 // 3. Super Admin Platform Routes (/api/super-admin/*)
 app.use("/api/super-admin", apiLimiter, superAdminRoutes);
 
+const agentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.AGENT_RATE_LIMIT_MAX) || 180,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    recordAuditLog({
+      actorType: "AGENT",
+      actorId: req.headers["x-agent-id"] || req.ip,
+      action: "AGENT_RATE_LIMIT_EXCEEDED",
+      details: { path: req.originalUrl },
+      req
+    }).catch(() => {});
+    res.status(429).json({
+      success: false,
+      message: "Agent request rate limit exceeded. Please back off and retry."
+    });
+  }
+});
+
 // 4. Print Agent Routes (/api/agent/*)
-app.use("/api/agent", agentRoutes);
+app.use("/api/agent", agentLimiter, agentRoutes);
 
 // 5. Legacy unscoped /api/orders & /api/jobs guard
 app.use("/api/orders", orderRoutes);

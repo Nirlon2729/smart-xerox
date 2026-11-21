@@ -5,6 +5,7 @@ const os = require("os");
 const app = require("./app");
 const connectDB = require("./config/db");
 const { bootstrapOwner } = require("./controllers/adminController");
+const { startDocumentCleanupScheduler } = require("./services/fileCleanupService");
 
 const PORT = Number(process.env.PORT) || 5000;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -25,6 +26,9 @@ function getLanAddresses() {
 async function start() {
   await connectDB();
   await bootstrapOwner();
+  if (process.env.NODE_ENV !== "test") {
+    startDocumentCleanupScheduler();
+  }
   app.listen(PORT, HOST, () => {
     console.log(`Smart Xerox API listening on http://localhost:${PORT}`);
     const lanAddrs = getLanAddresses();

@@ -496,15 +496,23 @@ class UniversalPrinterTests(unittest.TestCase):
             mock_dc.GetHandleOutput.return_value = 12345
 
             with self._patch_win32print(db), patch.object(
+                agent.win32gui, "CreateDC", return_value=777
+            ) as mock_gui_dc, patch.object(
+                agent.win32ui, "CreateDCFromHandle", return_value=mock_dc
+            ) as mock_from_handle, patch.object(
                 agent.win32ui, "CreateDC", return_value=mock_dc
             ), patch.object(agent.ImageWin, "Dib") as mock_dib:
                 doc_title = agent.print_via_windows_gdi(
                     "Brother HL-L2321D series", pdf_job, rendered_pdf
                 )
                 self.assertEqual(doc_title, "SmartXerox-XR-TEST-PDF")
-                mock_dc.CreatePrinterDC.assert_called_once_with("Brother HL-L2321D series")
+                mock_gui_dc.assert_called_once()
+                self.assertEqual(mock_gui_dc.call_args[0][0], "WINSPOOL")
+                self.assertEqual(mock_gui_dc.call_args[0][1], "Brother HL-L2321D series")
+                self.assertIsNotNone(mock_gui_dc.call_args[0][2])
+                mock_from_handle.assert_called_once_with(777)
                 mock_dc.StartDoc.assert_called_once_with("SmartXerox-XR-TEST-PDF")
-                # 2 pages * 2 copies = 4 StartPage/EndPage calls
+                # 2 even pages * 2 copies = 4 StartPage/EndPage calls (no blank pad needed)
                 self.assertEqual(mock_dc.StartPage.call_count, 4)
                 self.assertEqual(mock_dc.EndPage.call_count, 4)
                 self.assertEqual(mock_dib.return_value.draw.call_count, 4)
@@ -535,6 +543,252 @@ class UniversalPrinterTests(unittest.TestCase):
             src_img, paper_size="Legal", requested_orientation="portrait", dpi=150
         )
         self.assertGreater(legal_portrait.height, a4_portrait.height)
+
+    def test_16_devmode_applied_for_paper_orientation_color_and_duplex(self):
+        db = {
+            "Canon imageRUNNER C3520i": {
+                "port": "IP_192.168.1.50",
+                "driver": "Canon Generic Plus PCL6",
+                "caps": {"papers": (9, 5, 1), "color": 1, "duplex": 1},
+            }
+        }
+        pages = [
+            Image.new("RGB", (900, 600), (255, 255, 255)),
+            Image.new("RGB", (900, 600), (255, 255, 255)),
+        ]
+        job = {
+            "orderId": "ord_devmode_1",
+            "token": "XR-DM-1",
+            "paperSize": "Legal",
+            "orientation": "landscape",
+            "colorMode": "color",
+            "sides": "duplex",
+            "copies": 2,
+        }
+        mock_dc = MagicMock()
+        mock_dc.GetDeviceCaps.side_effect = lambda idx: 3508 if idx == agent.win32con.HORZRES else 2480
+        mock_dc.GetHandleOutput.return_value = 999
+
+        with self._patch_win32print(db), patch.object(
+            agent.win32gui, "CreateDC", return_value=888
+        ) as mock_gui_dc, patch.object(
+            agent.win32ui, "CreateDCFromHandle", return_value=mock_dc
+        ), patch.object(agent.ImageWin, "Dib"):
+            agent.print_via_windows_gdi(
+                "Canon imageRUNNER C3520i",
+                job,
+                pages,
+                capabilities={
+                    "supportsColor": True,
+                    "colorSupportKnown": True,
+                    "supportsDuplex": True,
+                    "duplexSupportKnown": True,
+                    "supportedPaperSizes": ["A4", "Legal", "Letter"],
+                    "paperSizesKnown": True,
+                },
+            )
+            passed_dm = mock_gui_dc.call_args[0][2]
+            self.assertEqual(passed_dm.PaperSize, agent.PAPER_SIZE_MAP["Legal"])
+            self.assertEqual(passed_dm.Orientation, agent.win32con.DMORIENT_LANDSCAPE)
+            self.assertEqual(passed_dm.Color, agent.win32con.DMCOLOR_COLOR)
+            self.assertEqual(passed_dm.Duplex, agent.win32con.DMDUP_VERTICAL)
+            self.assertEqual(passed_dm.Copies, 1)
+
+        # Unsupported color & duplex capabilities must be safely downgraded
+        with self._patch_win32print(db), patch.object(
+            agent.win32gui, "CreateDC", return_value=889
+        ) as mock_gui_dc2, patch.object(
+            agent.win32ui, "CreateDCFromHandle", return_value=mock_dc
+        ), patch.object(agent.ImageWin, "Dib"):
+            agent.print_via_windows_gdi(
+                "Canon imageRUNNER C3520i",
+                job,
+                pages,
+                capabilities={
+                    "supportsColor": False,
+                    "colorSupportKnown": True,
+                    "supportsDuplex": False,
+                    "duplexSupportKnown": True,
+                    "supportedPaperSizes": ["A4"],
+                    "paperSizesKnown": True,
+                },
+            )
+            passed_dm2 = mock_gui_dc2.call_args[0][2]
+            self.assertEqual(passed_dm2.Color, agent.win32con.DMCOLOR_MONOCHROME)
+            self.assertEqual(passed_dm2.Duplex, agent.win32con.DMDUP_SIMPLEX)
+
+    def test_17_multi_copy_duplex_odd_and_even_page_counts(self):
+        db = {
+            "Brother HL-L2321D": {
+                "port": "USB001",
+                "driver": "Brother",
+                "caps": {"papers": (9,), "color": 0, "duplex": 1},
+            }
+        }
+        odd_pages = [Image.new("RGB", (600, 800), (255, 255, 255)) for _ in range(3)]
+        even_pages = [Image.new("RGB", (600, 800), (255, 255, 255)) for _ in range(2)]
+
+        # 3 odd pages * 3 copies duplex => (3+1) + (3+1) + 3 = 11 StartPage calls
+        mock_dc_odd = MagicMock()
+        mock_dc_odd.GetDeviceCaps.side_effect = lambda idx: 2480 if idx == agent.win32con.HORZRES else 3508
+        mock_dc_odd.GetHandleOutput.return_value = 111
+        with self._patch_win32print(db), patch.object(
+            agent.win32gui, "CreateDC", return_value=501
+        ), patch.object(
+            agent.win32ui, "CreateDCFromHandle", return_value=mock_dc_odd
+        ), patch.object(agent.ImageWin, "Dib"):
+            agent.print_via_windows_gdi(
+                "Brother HL-L2321D",
+                {"orderId": "o1", "token": "T1", "sides": "duplex", "copies": 3, "paperSize": "A4", "colorMode": "bw"},
+                odd_pages,
+                capabilities={"supportsDuplex": True, "duplexSupportKnown": True},
+            )
+            self.assertEqual(mock_dc_odd.StartPage.call_count, 11)
+            self.assertEqual(mock_dc_odd.EndPage.call_count, 11)
+
+        # 2 even pages * 3 copies duplex => 6 StartPage calls (no pad needed)
+        mock_dc_even = MagicMock()
+        mock_dc_even.GetDeviceCaps.side_effect = lambda idx: 2480 if idx == agent.win32con.HORZRES else 3508
+        mock_dc_even.GetHandleOutput.return_value = 112
+        with self._patch_win32print(db), patch.object(
+            agent.win32gui, "CreateDC", return_value=502
+        ), patch.object(
+            agent.win32ui, "CreateDCFromHandle", return_value=mock_dc_even
+        ), patch.object(agent.ImageWin, "Dib"):
+            agent.print_via_windows_gdi(
+                "Brother HL-L2321D",
+                {"orderId": "o2", "token": "T2", "sides": "duplex", "copies": 3, "paperSize": "A4", "colorMode": "bw"},
+                even_pages,
+                capabilities={"supportsDuplex": True, "duplexSupportKnown": True},
+            )
+            self.assertEqual(mock_dc_even.StartPage.call_count, 6)
+
+        # 3 odd pages * 3 copies single-sided => 9 StartPage calls (no pad)
+        mock_dc_single = MagicMock()
+        mock_dc_single.GetDeviceCaps.side_effect = lambda idx: 2480 if idx == agent.win32con.HORZRES else 3508
+        mock_dc_single.GetHandleOutput.return_value = 113
+        with self._patch_win32print(db), patch.object(
+            agent.win32gui, "CreateDC", return_value=503
+        ), patch.object(
+            agent.win32ui, "CreateDCFromHandle", return_value=mock_dc_single
+        ), patch.object(agent.ImageWin, "Dib"):
+            agent.print_via_windows_gdi(
+                "Brother HL-L2321D",
+                {"orderId": "o3", "token": "T3", "sides": "single", "copies": 3, "paperSize": "A4", "colorMode": "bw"},
+                odd_pages,
+                capabilities={"supportsDuplex": True, "duplexSupportKnown": True},
+            )
+            self.assertEqual(mock_dc_single.StartPage.call_count, 9)
+
+    def test_18_spooler_cancellation_and_failure_detection(self):
+        with patch.object(agent.win32print, "OpenPrinter", return_value="H"), patch.object(
+            agent.win32print, "ClosePrinter"
+        ):
+            # JOB_STATUS_DELETED must raise SpoolerJobCancelledError
+            with patch.object(
+                agent.win32print,
+                "EnumJobs",
+                return_value=[{"pDocument": "SmartXerox-T1", "JobId": 42, "Status": agent.JOB_STATUS_DELETED}],
+            ):
+                with self.assertRaises(agent.SpoolerJobCancelledError):
+                    agent.wait_for_spooler_completion("HP LaserJet", "SmartXerox-T1", timeout_seconds=5, poll_interval=0.01)
+
+            # JOB_STATUS_DELETED combined with PRINTED must still be treated as cancelled
+            with patch.object(
+                agent.win32print,
+                "EnumJobs",
+                return_value=[{
+                    "pDocument": "SmartXerox-T2",
+                    "JobId": 43,
+                    "Status": agent.JOB_STATUS_DELETED | agent.JOB_STATUS_PRINTED,
+                }],
+            ):
+                with self.assertRaises(agent.SpoolerJobCancelledError):
+                    agent.wait_for_spooler_completion("HP LaserJet", "SmartXerox-T2", timeout_seconds=5, poll_interval=0.01)
+
+            # JOB_STATUS_PAPEROUT must raise SpoolerJobFailedError
+            with patch.object(
+                agent.win32print,
+                "EnumJobs",
+                return_value=[{"pDocument": "SmartXerox-T3", "JobId": 44, "Status": agent.JOB_STATUS_PAPEROUT}],
+            ):
+                with self.assertRaises(agent.SpoolerJobFailedError):
+                    agent.wait_for_spooler_completion("HP LaserJet", "SmartXerox-T3", timeout_seconds=5, poll_interval=0.01)
+
+            # JOB_STATUS_PRINTED | JOB_STATUS_COMPLETE returns JobId
+            with patch.object(
+                agent.win32print,
+                "EnumJobs",
+                return_value=[{"pDocument": "SmartXerox-T4", "JobId": 45, "Status": agent.JOB_STATUS_COMPLETE}],
+            ):
+                self.assertEqual(
+                    agent.wait_for_spooler_completion("HP LaserJet", "SmartXerox-T4", timeout_seconds=5, poll_interval=0.01),
+                    45,
+                )
+
+    def test_19_heartbeat_keeper_during_long_print_job(self):
+        hb_calls = []
+
+        def fake_hb(**kwargs):
+            hb_calls.append(kwargs)
+            return True, {"success": True}
+
+        fake_printer_info = {
+            "printerName": "HP LaserJet",
+            "portName": "USB001",
+            "driverName": "HP",
+            "printerAvailable": True,
+            "status": "READY",
+            "statusMessage": "Ready",
+            "spoolerJobCount": 1,
+            "capabilities": {},
+        }
+
+        with patch.object(
+            agent, "inspect_printer_state_and_capabilities", return_value=fake_printer_info
+        ), patch.object(agent, "send_heartbeat", side_effect=fake_hb):
+            keeper = agent.HeartbeatKeeper(
+                backend_url="https://example.test/api",
+                agent_id="agt_test",
+                agent_secret="sxk_test",
+                device_id="win-test",
+                printer_name="HP LaserJet",
+                interval_seconds=0.05,
+            )
+            with keeper:
+                agent.time.sleep(0.22)
+            self.assertGreaterEqual(keeper.heartbeats_sent, 2)
+            self.assertEqual(hb_calls[0]["primary_printer"]["status"], "PRINTING")
+
+    def test_20_completed_ledger_chronological_order_and_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "completed_jobs.json"
+            for i in range(510):
+                agent.record_completed_job(f"ord-{i}", ledger)
+            loaded = agent.load_completed_ledger(ledger)
+            self.assertEqual(len(loaded), 500)
+            self.assertEqual(loaded[0], "ord-10")
+            self.assertEqual(loaded[-1], "ord-509")
+            self.assertNotIn("ord-0", loaded)
+            self.assertIn("ord-509", loaded)
+
+    def test_21_in_memory_secret_preserved_on_config_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_file = Path(tmp) / "agent-runtime-config.json"
+            cfg_file.write_text(
+                agent.json.dumps({
+                    "backendApiUrl": "https://smart-xerox-api.onrender.com/api",
+                    "agentId": "agt_123",
+                    "selectedPrinterName": "HP LaserJet",
+                }),
+                encoding="utf-8",
+            )
+            loaded = agent.load_runtime_config(
+                str(cfg_file), inherited_secret="sxk_in_memory_only"
+            )
+            self.assertEqual(loaded["agentId"], "agt_123")
+            self.assertEqual(loaded["agentSecret"], "sxk_in_memory_only")
+            self.assertEqual(loaded["selectedPrinterName"], "HP LaserJet")
 
 
 if __name__ == "__main__":

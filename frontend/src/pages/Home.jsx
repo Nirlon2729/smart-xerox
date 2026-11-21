@@ -248,7 +248,8 @@ export default function Home() {
   };
 
   const connBadge = getConnectionBadgeStyle(printerState?.connectionState, printerState);
-  const isShopAvailable = Boolean(printerState?.shopAvailable || printerState?.online);
+  // A manually paused shop (shopAvailable === false) must remain unavailable even if agent/printer are online
+  const isShopAvailable = Boolean(printerState?.shopAvailable);
 
   return (
     <div className={documentMeta ? "pb-24 space-y-5" : "pb-12 space-y-5"}>

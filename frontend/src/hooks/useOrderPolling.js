@@ -14,6 +14,14 @@ export function useOrderPolling(shopSlug, token, intervalMs = 3000) {
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
   const timerRef = useRef(null);
+  const statusRef = useRef(null);
+
+  const stopTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
 
   const loadOrder = useCallback(
     async (isManual = false) => {
@@ -28,9 +36,13 @@ export function useOrderPolling(shopSlug, token, intervalMs = 3000) {
       try {
         const res = await fetchOrderByToken(cleanSlug, cleanToken);
         if (res?.success && res.order) {
+          statusRef.current = res.order.status;
           setOrder(res.order);
           setError(null);
           setLastUpdated(new Date());
+          if (TERMINAL_STATUSES.includes(res.order.status)) {
+            stopTimer();
+          }
           return res.order;
         }
       } catch (err) {
@@ -41,36 +53,37 @@ export function useOrderPolling(shopSlug, token, intervalMs = 3000) {
       }
       return null;
     },
-    [shopSlug, token]
+    [shopSlug, token, stopTimer]
   );
 
   useEffect(() => {
     const cleanSlug = String(shopSlug || "").trim();
     const cleanToken = String(token || "").trim();
     if (!cleanSlug || !cleanToken) {
+      statusRef.current = null;
       setOrder(null);
       setLoading(false);
       setError(null);
+      stopTimer();
       return;
     }
 
+    statusRef.current = null;
     setLoading(true);
     loadOrder(false);
 
     timerRef.current = setInterval(() => {
-      setOrder((currentOrder) => {
-        if (currentOrder && TERMINAL_STATUSES.includes(currentOrder.status)) {
-          return currentOrder;
-        }
-        loadOrder(false);
-        return currentOrder;
-      });
+      if (statusRef.current && TERMINAL_STATUSES.includes(statusRef.current)) {
+        stopTimer();
+        return;
+      }
+      loadOrder(false);
     }, intervalMs);
 
     return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
+      stopTimer();
     };
-  }, [shopSlug, token, intervalMs, loadOrder]);
+  }, [shopSlug, token, intervalMs, loadOrder, stopTimer]);
 
   return {
     order,

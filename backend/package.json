@@ -7,7 +7,10 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "test": "node tests/multiVendorIsolation.test.js"
+    "test": "node tests/multiVendorIsolation.test.js && node tests/securityHardening.test.js && node tests/stabilizationAndCleanup.test.js",
+    "test:isolation": "node tests/multiVendorIsolation.test.js",
+    "test:security": "node tests/securityHardening.test.js",
+    "test:stabilization": "node tests/stabilizationAndCleanup.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -23,6 +26,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "mongodb-memory-server": "^11.3.0",
     "nodemon": "^3.1.9"
   }
 }

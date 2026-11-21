@@ -28,6 +28,7 @@ function uploadBufferToGridFS({ buffer, filename, contentType, tenantId, metadat
       chunkSizeBytes: 255 * 1024,
       contentType,
       metadata: {
+        category: "customer-print-document",
         ...metadata,
         tenantId: String(resolvedTenantId),
         uploadedAt: new Date()
@@ -112,9 +113,11 @@ async function markGridFSFileBoundToJob(fileId, jobId, expectedTenantId = null) 
 
 /**
  * Deletes a file and all of its chunks from MongoDB Atlas GridFS, enforcing tenant ownership if specified.
- * Safe and idempotent if the file was already deleted.
+ * When `throwOnError` is true, real database/storage errors are propagated so cleanup workers can retry safely.
+ * Safe and idempotent if the file was already deleted (FileNotFound).
  */
-async function deleteGridFSFile(fileId, expectedTenantId = null) {
+async function deleteGridFSFile(fileId, expectedTenantId = null, options = {}) {
+  const { throwOnError = false } = options;
   if (!fileId || !mongoose.Types.ObjectId.isValid(fileId)) return false;
   try {
     if (expectedTenantId) {
@@ -129,58 +132,38 @@ async function deleteGridFSFile(fileId, expectedTenantId = null) {
     if (err && /FileNotFound/i.test(String(err.message))) {
       return false;
     }
+    if (throwOnError) {
+      throw err;
+    }
     return false;
   }
 }
 
 /**
- * Cleans up:
- * 1) Abandoned staged GridFS files that were uploaded for preview/inspection but never submitted as a job.
- * 2) Completed / Cancelled / Failed job files whose configurable retention period has elapsed.
+ * Legacy helper retained for backwards compatibility with heartbeat maintenance:
+ * cleans up abandoned staged preview uploads (never bound to a print job) after STAGED_UPLOAD_TTL_MINUTES.
+ * Bound customer order documents are strictly governed by the 48-hour retention policy in fileCleanupService.js.
  */
-async function cleanupExpiredGridFSFiles(OrderModel) {
+async function cleanupExpiredGridFSFiles(_OrderModel) {
   if (mongoose.connection.readyState !== 1 || !mongoose.connection.db) return;
 
   const stagedTtlMinutes = Number(process.env.STAGED_UPLOAD_TTL_MINUTES) || 30;
-  const retentionMinutes =
-    process.env.FILE_RETENTION_MINUTES !== undefined
-      ? Number(process.env.FILE_RETENTION_MINUTES)
-      : 60;
-
   const stagedCutoff = new Date(Date.now() - stagedTtlMinutes * 60 * 1000);
   const filesColl = mongoose.connection.db.collection("printDocuments.files");
 
-  // 1. Delete orphaned staged files older than stagedTtlMinutes
+  // Delete only abandoned staged files (never submitted as an order) older than stagedTtlMinutes
   const orphanedStaged = await filesColl
     .find({
       "metadata.staged": true,
+      "metadata.category": { $ne: "vendor" },
       uploadDate: { $lt: stagedCutoff }
     })
-    .project({ _id: 1 })
+    .project({ _id: 1, "metadata.tenantId": 1 })
     .limit(50)
     .toArray();
 
   for (const doc of orphanedStaged) {
-    await deleteGridFSFile(doc._id);
-  }
-
-  // 2. Delete GridFS files for completed/cancelled jobs past retention period
-  if (OrderModel && Number.isFinite(retentionMinutes) && retentionMinutes >= 0) {
-    const retentionCutoff = new Date(Date.now() - retentionMinutes * 60 * 1000);
-    const expiredOrders = await OrderModel.find({
-      status: { $in: ["COMPLETED", "CANCELLED"] },
-      fileDeleted: { $ne: true },
-      gridFsFileId: { $ne: null },
-      updatedAt: { $lte: retentionCutoff }
-    })
-      .select("_id gridFsFileId tenantId")
-      .limit(50);
-
-    for (const order of expiredOrders) {
-      await deleteGridFSFile(order.gridFsFileId, order.tenantId);
-      order.fileDeleted = true;
-      await order.save();
-    }
+    await deleteGridFSFile(doc._id, doc.metadata?.tenantId || null);
   }
 }
 

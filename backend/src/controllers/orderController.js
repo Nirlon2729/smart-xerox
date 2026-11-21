@@ -22,8 +22,10 @@ const {
   markGridFSFileBoundToJob,
   deleteGridFSFile
 } = require("../services/gridfsService");
+const { EXPIRED_DOCUMENT_MESSAGE } = require("../services/fileCleanupService");
 
 const defaultMaxUploadMb = Number(process.env.MAX_UPLOAD_MB) || 20;
+const HARD_MULTER_CEILING_MB = 100; // Matches Tenant.config.maxUploadMb schema max; per-tenant cap enforced in controllers
 const defaultMaxCopiesAllowed = Number(process.env.MAX_COPIES) || 100;
 
 const ALLOWED_EXTENSIONS = new Set([".pdf", ".jpg", ".jpeg", ".png"]);
@@ -38,7 +40,7 @@ const ALLOWED_MIMES = new Set([
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: defaultMaxUploadMb * 1024 * 1024 },
+  limits: { fileSize: HARD_MULTER_CEILING_MB * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const originalName = String(file.originalname || "").trim().toLowerCase();
     const ext = path.extname(originalName);
@@ -365,6 +367,9 @@ async function getActivePrinterState(tenantId) {
  */
 function formatPublicPrinterState(printer) {
   if (!printer) return null;
+  const publicStatusMessage = printer.shopAvailable
+    ? "Shop is open and ready to print."
+    : printer.unavailableReason || "Shop is temporarily unavailable.";
   return {
     online: Boolean(printer.online),
     shopAvailable: Boolean(printer.shopAvailable),
@@ -379,7 +384,7 @@ function formatPublicPrinterState(printer) {
     selectedPrinterDisconnected: Boolean(printer.selectedPrinterDisconnected),
     printerName: printer.printerName || "Shop Printer",
     status: printer.status,
-    statusMessage: printer.statusMessage,
+    statusMessage: publicStatusMessage,
     heartbeatTimeoutSeconds: printer.heartbeatTimeoutSeconds,
     capabilities: {
       supportedPaperSizes: printer.capabilities?.supportedPaperSizes || ["A4"],
@@ -461,7 +466,9 @@ async function inspectDocument(req, res) {
     });
   }
 
-  const inspection = inspectUploadedBuffer(req.file.buffer, req.file.originalname);
+  const inspection = inspectUploadedBuffer(req.file.buffer, req.file.originalname, {
+    maxUploadMb: maxMb
+  });
 
   const gridFsResult = await uploadBufferToGridFS({
     buffer: req.file.buffer,
@@ -558,7 +565,6 @@ function formatJobResponse(order) {
     token: order.token,
     pickupCode: order.pickupCode || null,
     originalName: order.originalName,
-    documentId: order.gridFsFileId,
     documentType: order.documentType || "pdf",
     mimeType: order.mimeType || "application/pdf",
     fileSize: order.fileSize,
@@ -577,10 +583,18 @@ function formatJobResponse(order) {
     amountPaise: order.amountPaise ?? order.pricingSnapshot?.amountPaise ?? 0,
     currency: order.currency || "INR",
     pricingSnapshot: order.pricingSnapshot || null,
-    printConfigSnapshot: order.printConfigSnapshot || null,
+    printConfigSnapshot: order.printConfigSnapshot
+      ? {
+          ...order.printConfigSnapshot,
+          documentId: null
+        }
+      : null,
     status: order.status,
     spoolerJobId: order.spoolerJobId || null,
     fileDeleted: Boolean(order.fileDeleted),
+    documentStatus:
+      order.documentStatus || (order.fileDeleted ? "DELETED" : "AVAILABLE"),
+    documentDeletedAt: order.documentDeletedAt || null,
     failureReason: order.failureReason || null,
     createdAt: order.createdAt,
     updatedAt: order.updatedAt,
@@ -727,7 +741,16 @@ async function createOrder(req, res) {
     let fileMeta = null;
 
     if (req.file && req.file.buffer) {
-      const inspection = inspectUploadedBuffer(req.file.buffer, req.file.originalname);
+      const tenantMaxMb = req.tenant?.config?.maxUploadMb || defaultMaxUploadMb;
+      if (req.file.buffer.length > tenantMaxMb * 1024 * 1024) {
+        return res.status(413).json({
+          success: false,
+          message: `File exceeds this shop's maximum allowed upload size of ${tenantMaxMb} MB.`
+        });
+      }
+      const inspection = inspectUploadedBuffer(req.file.buffer, req.file.originalname, {
+        maxUploadMb: tenantMaxMb
+      });
       const gridFsResult = await uploadBufferToGridFS({
         buffer: req.file.buffer,
         filename: req.file.originalname || `upload.${inspection.extension}`,
@@ -757,7 +780,8 @@ async function createOrder(req, res) {
         pageCount: inspection.pageCount,
         width: inspection.width,
         height: inspection.height,
-        sha256: inspection.sha256
+        sha256: inspection.sha256,
+        uploadedAt: new Date()
       };
 
       if (data.uploadId && mongoose.Types.ObjectId.isValid(data.uploadId)) {
@@ -782,7 +806,8 @@ async function createOrder(req, res) {
         pageCount: Number(meta.pageCount) || 1,
         width: meta.width || null,
         height: meta.height || null,
-        sha256: meta.sha256 || gridFsDoc._id.toString()
+        sha256: meta.sha256 || gridFsDoc._id.toString(),
+        uploadedAt: gridFsDoc.uploadDate || meta.uploadedAt || new Date()
       };
     } else {
       return res.status(400).json({
@@ -916,7 +941,9 @@ async function createOrder(req, res) {
         pageSelectionMode: data.pageSelectionMode,
         customPageRange: data.customPageRange || null
       },
-      status: "QUEUED"
+      status: "QUEUED",
+      documentStatus: "AVAILABLE",
+      documentUploadedAt: fileMeta.uploadedAt || new Date()
     };
 
     let order = null;
@@ -1037,7 +1064,7 @@ async function getOrderByToken(req, res) {
   res.json({
     success: true,
     order: formatJobResponse(order),
-    printer
+    printer: formatPublicPrinterState(printer)
   });
 }
 
@@ -1073,6 +1100,13 @@ async function cancelOrder(req, res) {
   if (order.gridFsFileId && !order.fileDeleted) {
     await deleteGridFSFile(order.gridFsFileId, req.tenantId);
     order.fileDeleted = true;
+    order.documentStatus = "DELETED";
+    order.documentDeletedAt = new Date();
+    order.gridFsFileId = null;
+    order.storedFileName = null;
+    if (order.printConfigSnapshot) {
+      order.printConfigSnapshot.documentId = null;
+    }
   }
   await order.save();
 
@@ -1111,12 +1145,25 @@ async function reprintOrder(req, res) {
     });
   }
 
-  const gridFsDoc = await findGridFSFileById(sourceOrder.gridFsFileId, req.tenantId);
-  if (!gridFsDoc || sourceOrder.fileDeleted) {
+  if (
+    sourceOrder.documentStatus === "EXPIRED" ||
+    sourceOrder.documentStatus === "DELETED" ||
+    !sourceOrder.gridFsFileId ||
+    sourceOrder.fileDeleted
+  ) {
     return res.status(410).json({
       success: false,
-      message:
-        "Document file was already cleaned up after printing. Please upload the file again to print."
+      code: "DOCUMENT_EXPIRED",
+      message: EXPIRED_DOCUMENT_MESSAGE
+    });
+  }
+
+  const gridFsDoc = await findGridFSFileById(sourceOrder.gridFsFileId, req.tenantId);
+  if (!gridFsDoc) {
+    return res.status(410).json({
+      success: false,
+      code: "DOCUMENT_EXPIRED",
+      message: EXPIRED_DOCUMENT_MESSAGE
     });
   }
 
@@ -1186,6 +1233,9 @@ async function reprintOrder(req, res) {
     currency: sourceOrder.currency || "INR",
     pricingSnapshot: sourceOrder.pricingSnapshot || undefined,
     printConfigSnapshot: sourceOrder.printConfigSnapshot || undefined,
+    documentStatus: "AVAILABLE",
+    documentUploadedAt:
+      sourceOrder.documentUploadedAt || gridFsDoc.uploadDate || sourceOrder.createdAt,
     status: "QUEUED"
   });
 

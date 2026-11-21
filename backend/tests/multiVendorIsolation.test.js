@@ -1,5 +1,8 @@
 const path = require("path");
-require("dotenv").config({ path: path.join(__dirname, "../.env") });
+const {
+  startIsolatedTestDatabase,
+  stopIsolatedTestDatabase
+} = require("./testDbGuard");
 
 const assert = require("assert");
 const http = require("http");
@@ -77,6 +80,7 @@ async function runTests() {
   console.log("SMART XEROX — STAGE 2 MULTI-VENDOR SECURITY & ISOLATION TEST SUITE");
   console.log("====================================================================");
 
+  const dbHandle = await startIsolatedTestDatabase();
   await connectDB();
   await bootstrapOwner();
 
@@ -1074,7 +1078,7 @@ async function runTests() {
       await Tenant.deleteMany({ _id: { $in: createdTenantIds } }).catch(() => {});
     }
     server.close();
-    await mongoose.disconnect();
+    await stopIsolatedTestDatabase(dbHandle);
   }
 }
 

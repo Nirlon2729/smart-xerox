@@ -14,10 +14,14 @@ const fs = require("fs");
 const path = require("path");
 const assert = require("assert");
 const http = require("http");
-require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
+const {
+  startIsolatedTestDatabase,
+  stopIsolatedTestDatabase
+} = require("./testDbGuard");
 
 const mongoose = require("mongoose");
 const { connectDB } = require("../src/config/db");
+const { bootstrapOwner } = require("../src/controllers/adminController");
 const app = require("../src/app");
 const Tenant = require("../src/models/Tenant");
 const Admin = require("../src/models/Admin");
@@ -46,7 +50,9 @@ async function runSecurityTests() {
   console.log("SMART XEROX — SECURITY HARDENING & MULTI-TENANT AUDIT TEST SUITE");
   console.log("====================================================================");
 
+  const dbHandle = await startIsolatedTestDatabase();
   await connectDB();
+  await bootstrapOwner();
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -274,7 +280,7 @@ async function runSecurityTests() {
       await Tenant.deleteMany({ _id: { $in: createdTenantIds } }).catch(() => {});
     }
     server.close();
-    await mongoose.disconnect();
+    await stopIsolatedTestDatabase(dbHandle);
   }
 }
 

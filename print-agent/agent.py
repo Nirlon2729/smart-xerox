@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import logging
 import tempfile
+import threading
 from ctypes import wintypes
 from pathlib import Path
 from dotenv import load_dotenv
@@ -43,6 +44,7 @@ from PIL import Image, ImageOps, ImageWin
 
 import win32print
 import win32ui
+import win32gui
 import win32con
 
 AGENT_VERSION = "3.1.0"
@@ -208,12 +210,26 @@ DC_COPIES = 18
 DC_COLORDEVICE = 32
 
 # Windows Job Status Bitmasks
+JOB_STATUS_PAUSED = 0x00000001
 JOB_STATUS_ERROR = 0x00000002
+JOB_STATUS_DELETING = 0x00000004
+JOB_STATUS_SPOOLING = 0x00000008
+JOB_STATUS_PRINTING = 0x00000010
 JOB_STATUS_OFFLINE = 0x00000020
 JOB_STATUS_PAPEROUT = 0x00000040
 JOB_STATUS_PRINTED = 0x00000080
 JOB_STATUS_DELETED = 0x00000100
+JOB_STATUS_BLOCKED_DEVQ = 0x00000200
+JOB_STATUS_USER_INTERVENTION = 0x00000400
 JOB_STATUS_COMPLETE = 0x00001000
+
+
+class SpoolerJobCancelledError(RuntimeError):
+    """Raised when a print job is cancelled/deleted in the Windows Print Spooler."""
+
+
+class SpoolerJobFailedError(RuntimeError):
+    """Raised when the Windows Print Spooler reports a hardware or driver failure."""
 
 
 def setup_logger(log_path: Path, quiet_stdout: bool = False) -> logging.Logger:
@@ -1125,20 +1141,37 @@ def validate_job_against_printer_capabilities(job: dict, printer_info: dict) -> 
         )
 
 
-def load_completed_ledger(ledger_path: Path = LEDGER_FILE) -> set:
+def load_completed_ledger(ledger_path: Path = LEDGER_FILE) -> list:
+    """
+    Loads completed order IDs in chronological insertion order (oldest -> newest).
+    """
     if not ledger_path.exists():
-        return set()
+        return []
     try:
         data = json.loads(ledger_path.read_text(encoding="utf-8"))
-        return set(data.get("completedOrderIds", []))
+        raw = data.get("completedOrderIds", [])
+        if not isinstance(raw, list):
+            return []
+        seen = set()
+        ordered = []
+        for item in raw:
+            val = str(item)
+            if val and val not in seen:
+                seen.add(val)
+                ordered.append(val)
+        return ordered
     except Exception:
-        return set()
+        return []
 
 
 def record_completed_job(order_id: str, ledger_path: Path = LEDGER_FILE) -> None:
-    completed = load_completed_ledger(ledger_path)
-    completed.add(str(order_id))
-    recent = list(completed)[-500:]
+    """
+    Appends `order_id` to the chronological ledger and retains the 500 most recent IDs.
+    """
+    key = str(order_id)
+    ordered = [item for item in load_completed_ledger(ledger_path) if item != key]
+    ordered.append(key)
+    recent = ordered[-500:]
     try:
         ledger_path.write_text(
             json.dumps({"completedOrderIds": recent}, indent=2),
@@ -1415,14 +1448,25 @@ def render_pages_to_pil_images(job: dict, file_path: Path, dpi: int = 300) -> li
 
 
 def wait_for_spooler_completion(
-    printer_name: str, doc_title: str, timeout_seconds: int = 180
+    printer_name: str,
+    doc_title: str,
+    timeout_seconds: int = 180,
+    poll_interval: float = 1.2,
 ) -> int:
     """
     Monitors the Windows Print Spooler queue for `doc_title` on `printer_name`
     until the printer finishes spooling/printing the job.
+
+    Distinguishes:
+    - Completed: JOB_STATUS_PRINTED / JOB_STATUS_COMPLETE (without DELETED/DELETING),
+      or job disappears cleanly after spooling/printing.
+    - Cancelled: JOB_STATUS_DELETED / JOB_STATUS_DELETING -> raises SpoolerJobCancelledError.
+    - Failed: JOB_STATUS_PAPEROUT / JOB_STATUS_OFFLINE / JOB_STATUS_ERROR /
+      JOB_STATUS_BLOCKED_DEVQ / JOB_STATUS_USER_INTERVENTION -> raises SpoolerJobFailedError.
     """
     deadline = time.time() + timeout_seconds
     seen_job_id = 0
+    saw_deleting_or_deleted = False
 
     while time.time() < deadline:
         handle = win32print.OpenPrinter(printer_name)
@@ -1436,76 +1480,192 @@ def wait_for_spooler_completion(
                     break
 
             if matching_job is None:
+                if saw_deleting_or_deleted:
+                    raise SpoolerJobCancelledError(
+                        f"Print job {doc_title} was cancelled in the Windows Print Spooler on {printer_name}."
+                    )
                 return seen_job_id
 
             status_bits = int(matching_job.get("Status", 0))
+
+            # Cancellation takes precedence over printed/complete bits
+            if status_bits & (JOB_STATUS_DELETED | JOB_STATUS_DELETING):
+                saw_deleting_or_deleted = True
+                raise SpoolerJobCancelledError(
+                    f"Print job {doc_title} was cancelled/deleted from the Windows Print Spooler on {printer_name}."
+                )
+
             if status_bits & JOB_STATUS_PAPEROUT:
-                raise RuntimeError(f"{printer_name} ran out of paper while printing.")
+                raise SpoolerJobFailedError(f"{printer_name} ran out of paper while printing.")
             if status_bits & JOB_STATUS_OFFLINE:
-                raise RuntimeError(f"{printer_name} went offline during printing.")
+                raise SpoolerJobFailedError(f"{printer_name} went offline during printing.")
             if status_bits & JOB_STATUS_ERROR:
-                raise RuntimeError(f"Windows Print Spooler reported a print error on {printer_name}.")
-            if status_bits & (JOB_STATUS_PRINTED | JOB_STATUS_COMPLETE | JOB_STATUS_DELETED):
+                raise SpoolerJobFailedError(
+                    f"Windows Print Spooler reported a print error on {printer_name}."
+                )
+            if status_bits & JOB_STATUS_BLOCKED_DEVQ:
+                raise SpoolerJobFailedError(
+                    f"Windows Print Spooler queue is blocked on {printer_name}."
+                )
+            if status_bits & JOB_STATUS_USER_INTERVENTION:
+                raise SpoolerJobFailedError(
+                    f"{printer_name} requires user intervention (check paper/toner/door)."
+                )
+            if status_bits & (JOB_STATUS_PRINTED | JOB_STATUS_COMPLETE):
                 return seen_job_id
         finally:
             win32print.ClosePrinter(handle)
 
-        time.sleep(1.2)
+        time.sleep(poll_interval)
 
     raise TimeoutError(f"Timed out waiting for {printer_name} to finish printing {doc_title}.")
 
 
-def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
+def _configure_devmode_for_job(
+    printer_name: str,
+    job: dict,
+    pil_pages: list,
+    capabilities: dict = None,
+) -> tuple:
     """
-    Sends rendered pages directly to the selected Windows printer using Windows GDI (win32ui / win32print).
-    Works universally across HP, Canon, Epson, Brother, Samsung, Xerox, Ricoh, Kyocera, Pantum, Lexmark, etc.
+    Opens the Windows printer, applies supported paper size, colour, duplex, orientation,
+    and copies=1 to a validated DEVMODE, and returns (devmode, effective_duplex).
     """
-    if is_forbidden_printer(printer_name):
-        raise RuntimeError(f"Refusing to print to virtual printer '{printer_name}'.")
-
     paper_size_name = job.get("paperSize", "A4")
     sides = job.get("sides", "single")
     color_mode = job.get("colorMode", "bw")
-    copies = max(1, min(1000, int(job.get("copies", 1))))
     orientation = job.get("orientation", "auto")
-    doc_title = f"SmartXerox-{job.get('token', job.get('orderId'))}"
+    caps = capabilities or {}
 
+    color_supported = not (caps.get("colorSupportKnown") and not caps.get("supportsColor"))
+    duplex_supported = not (caps.get("duplexSupportKnown") and not caps.get("supportsDuplex"))
+    supported_sizes = caps.get("supportedPaperSizes") or []
+    paper_supported = not (
+        caps.get("paperSizesKnown")
+        and supported_sizes
+        and paper_size_name not in supported_sizes
+    )
+
+    effective_duplex = bool(sides == "duplex" and len(pil_pages) > 1 and duplex_supported)
+    effective_color = (
+        win32con.DMCOLOR_COLOR
+        if (color_mode == "color" and color_supported)
+        else win32con.DMCOLOR_MONOCHROME
+    )
+
+    first_img = pil_pages[0]
+    use_landscape = orientation == "landscape" or (
+        orientation == "auto" and first_img.width > first_img.height
+    )
+
+    devmode = None
     handle = win32print.OpenPrinter(printer_name)
     try:
         info2 = win32print.GetPrinter(handle, 2)
         devmode = info2.get("pDevMode")
-        if devmode:
-            devmode.PaperSize = PAPER_SIZE_MAP.get(paper_size_name, win32con.DMPAPER_A4)
-            devmode.Color = (
-                win32con.DMCOLOR_COLOR
-                if color_mode == "color"
-                else win32con.DMCOLOR_MONOCHROME
-            )
+        if devmode is not None:
+            fields = 0
+            if paper_supported:
+                devmode.PaperSize = PAPER_SIZE_MAP.get(paper_size_name, win32con.DMPAPER_A4)
+                fields |= DM_PAPERSIZE
+
+            devmode.Color = effective_color
+            fields |= DM_COLOR
+
             devmode.Duplex = (
-                win32con.DMDUP_VERTICAL
-                if sides == "duplex" and len(pil_pages) > 1
-                else win32con.DMDUP_SIMPLEX
+                win32con.DMDUP_VERTICAL if effective_duplex else win32con.DMDUP_SIMPLEX
             )
-            first_img = pil_pages[0]
-            use_landscape = orientation == "landscape" or (
-                orientation == "auto" and first_img.width > first_img.height
-            )
+            fields |= DM_DUPLEX
+
             devmode.Orientation = (
                 win32con.DMORIENT_LANDSCAPE
                 if use_landscape
                 else win32con.DMORIENT_PORTRAIT
             )
+            fields |= DM_ORIENTATION
+
+            # We collate copies explicitly (with blank-page padding on odd-page duplex)
+            # so force driver-side Copies = 1 to avoid N*N multiplication.
             try:
-                devmode.Fields |= (
-                    DM_PAPERSIZE | DM_COLOR | DM_DUPLEX | DM_ORIENTATION
-                )
+                devmode.Copies = 1
+                fields |= DM_COPIES
             except Exception:
                 pass
+
+            try:
+                devmode.Fields = int(getattr(devmode, "Fields", 0) or 0) | fields
+            except Exception:
+                pass
+
+            # Ask the driver to validate/normalize our DEVMODE buffer when supported
+            try:
+                dm_in_out = getattr(win32con, "DM_IN_BUFFER", 8) | getattr(
+                    win32con, "DM_OUT_BUFFER", 2
+                )
+                win32print.DocumentProperties(
+                    0, handle, printer_name, devmode, devmode, dm_in_out
+                )
+            except Exception as dp_err:
+                logger.debug(
+                    "DocumentProperties validation skipped for '%s': %s",
+                    printer_name,
+                    dp_err,
+                )
     finally:
         win32print.ClosePrinter(handle)
 
+    return devmode, effective_duplex
+
+
+def _create_printer_dc(printer_name: str, devmode):
+    """
+    Creates a Windows GDI printer DC with the modified DEVMODE actually applied via
+    win32gui.CreateDC('WINSPOOL', printer_name, devmode) + win32ui.CreateDCFromHandle.
+    Falls back safely to win32ui.CreateDC().CreatePrinterDC(printer_name) if devmode
+    is unavailable or rejected by the driver.
+    """
+    if devmode is not None:
+        try:
+            raw_hdc = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
+            if raw_hdc:
+                return win32ui.CreateDCFromHandle(raw_hdc)
+        except Exception as dc_err:
+            logger.warning(
+                "win32gui.CreateDC with custom DEVMODE failed for '%s' (%s); "
+                "falling back to default printer DC.",
+                printer_name,
+                dc_err,
+            )
+
     hdc = win32ui.CreateDC()
     hdc.CreatePrinterDC(printer_name)
+    return hdc
+
+
+def print_via_windows_gdi(
+    printer_name: str,
+    job: dict,
+    pil_pages: list,
+    capabilities: dict = None,
+) -> str:
+    """
+    Sends rendered pages directly to the selected Windows printer using Windows GDI
+    (win32gui / win32ui / win32print) with the modified DEVMODE applied to the DC.
+    Handles multi-copy duplex collation by inserting a blank back-side sheet page
+    between copies when an odd-page document is printed double-sided with copies > 1.
+    """
+    if is_forbidden_printer(printer_name):
+        raise RuntimeError(f"Refusing to print to virtual printer '{printer_name}'.")
+    if not pil_pages:
+        raise ValueError("No pages provided for printing.")
+
+    copies = max(1, min(1000, int(job.get("copies", 1))))
+    doc_title = f"SmartXerox-{job.get('token', job.get('orderId'))}"
+
+    devmode, effective_duplex = _configure_devmode_for_job(
+        printer_name, job, pil_pages, capabilities=capabilities
+    )
+    hdc = _create_printer_dc(printer_name, devmode)
 
     try:
         printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
@@ -1514,8 +1674,20 @@ def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
         hdc.StartDoc(doc_title)
         try:
             dc_is_landscape = printable_width > printable_height
-            for _copy_idx in range(copies):
-                for page_img in pil_pages:
+            needs_duplex_pad = effective_duplex and (len(pil_pages) % 2 == 1) and (copies > 1)
+            blank_pad_img = (
+                Image.new("RGB", pil_pages[-1].size, (255, 255, 255))
+                if needs_duplex_pad
+                else None
+            )
+
+            for copy_idx in range(copies):
+                pages_for_copy = list(pil_pages)
+                # Prevent Copy N+1 Page 1 from printing on the back of Copy N's last odd page
+                if needs_duplex_pad and copy_idx < (copies - 1):
+                    pages_for_copy.append(blank_pad_img)
+
+                for page_img in pages_for_copy:
                     hdc.StartPage()
 
                     draw_img = page_img
@@ -1550,6 +1722,77 @@ def print_via_windows_gdi(printer_name: str, job: dict, pil_pages: list) -> str:
     return doc_title
 
 
+class HeartbeatKeeper:
+    """
+    Daemon background heartbeat thread that keeps reporting agent + printer status
+    to the backend during long downloads, 300 DPI rendering, and Windows Spooler waits,
+    preventing backend heartbeat-timeout (30s) starvation.
+    """
+
+    def __init__(
+        self,
+        backend_url: str,
+        agent_id: str,
+        agent_secret: str,
+        device_id: str,
+        printer_name: str,
+        interval_seconds: float = 5.0,
+        all_printers: list = None,
+    ):
+        self.backend_url = backend_url
+        self.agent_id = agent_id
+        self.agent_secret = agent_secret
+        self.device_id = device_id
+        self.printer_name = printer_name
+        self.interval_seconds = max(0.05, float(interval_seconds))
+        self.all_printers = all_printers or []
+        self._stop_event = threading.Event()
+        self._thread = None
+        self.heartbeats_sent = 0
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_seconds):
+            try:
+                p_info = inspect_printer_state_and_capabilities(self.printer_name)
+                if p_info.get("printerAvailable") and p_info.get("status") in ("READY", "ONLINE"):
+                    p_info = dict(p_info)
+                    p_info["status"] = "PRINTING"
+                ok, _ = send_heartbeat(
+                    backend_url=self.backend_url,
+                    agent_id=self.agent_id,
+                    agent_secret=self.agent_secret,
+                    device_id=self.device_id,
+                    primary_printer=p_info,
+                    all_printers=self.all_printers,
+                )
+                if ok:
+                    self.heartbeats_sent += 1
+            except Exception as hb_err:
+                logger.debug("Background job heartbeat warning: %s", hb_err)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="SmartXeroxHeartbeatKeeper", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
+
+
 def process_and_print_job(
     backend_url: str,
     agent_id: str,
@@ -1557,6 +1800,9 @@ def process_and_print_job(
     job: dict,
     printer_name: str,
     ledger_path: Path = LEDGER_FILE,
+    device_id: str = None,
+    all_printers: list = None,
+    heartbeat_interval: float = 5.0,
 ) -> None:
     order_id = str(job["orderId"])
     agent_job_id = str(job["agentJobId"])
@@ -1601,70 +1847,126 @@ def process_and_print_job(
         )
         return
 
-    with tempfile.TemporaryDirectory(prefix="smart_xerox_") as tmp_dir:
-        ext = "pdf" if job.get("documentType") == "pdf" else "img"
-        local_file = Path(tmp_dir) / f"job_{order_id}.{ext}"
+    keeper = HeartbeatKeeper(
+        backend_url=backend_url,
+        agent_id=agent_id,
+        agent_secret=agent_secret,
+        device_id=device_id or f"win-{socket.gethostname()}",
+        printer_name=printer_name,
+        interval_seconds=heartbeat_interval,
+        all_printers=all_printers,
+    )
 
-        logger.info("[Job %s] Step 1/4: Downloading GridFS document...", token)
-        update_backend_job_status(
-            backend_url, agent_id, agent_secret, order_id, agent_job_id, "DOWNLOADING"
-        )
-        bytes_downloaded = download_job_document(
-            backend_url=backend_url,
-            agent_id=agent_id,
-            agent_secret=agent_secret,
-            order_id=order_id,
-            agent_job_id=agent_job_id,
-            expected_sha256=job.get("fileSha256"),
-            dest_path=local_file,
-        )
-        logger.info("[Job %s] Downloaded %d bytes from GridFS.", token, bytes_downloaded)
+    with keeper:
+        with tempfile.TemporaryDirectory(prefix="smart_xerox_") as tmp_dir:
+            ext = "pdf" if job.get("documentType") == "pdf" else "img"
+            local_file = Path(tmp_dir) / f"job_{order_id}.{ext}"
 
-        logger.info("[Job %s] Step 2/4: Rendering pages at 300 DPI...", token)
-        update_backend_job_status(
-            backend_url, agent_id, agent_secret, order_id, agent_job_id, "PROCESSING"
-        )
-        pil_pages = render_pages_to_pil_images(job, local_file, dpi=300)
+            logger.info("[Job %s] Step 1/4: Downloading GridFS document...", token)
+            update_backend_job_status(
+                backend_url, agent_id, agent_secret, order_id, agent_job_id, "DOWNLOADING"
+            )
+            bytes_downloaded = download_job_document(
+                backend_url=backend_url,
+                agent_id=agent_id,
+                agent_secret=agent_secret,
+                order_id=order_id,
+                agent_job_id=agent_job_id,
+                expected_sha256=job.get("fileSha256"),
+                dest_path=local_file,
+            )
+            logger.info("[Job %s] Downloaded %d bytes from GridFS.", token, bytes_downloaded)
 
-        logger.info(
-            "[Job %s] Step 3/4: Sending %d page(s) x %d copies to '%s' (%s)...",
-            token,
-            len(pil_pages),
-            job.get("copies", 1),
-            printer_name,
-            printer_info.get("portName"),
-        )
-        update_backend_job_status(
-            backend_url, agent_id, agent_secret, order_id, agent_job_id, "PRINTING"
-        )
-        doc_title = print_via_windows_gdi(printer_name, job, pil_pages)
+            logger.info("[Job %s] Step 2/4: Rendering pages at 300 DPI...", token)
+            update_backend_job_status(
+                backend_url, agent_id, agent_secret, order_id, agent_job_id, "PROCESSING"
+            )
+            pil_pages = render_pages_to_pil_images(job, local_file, dpi=300)
 
-        logger.info("[Job %s] Step 4/4: Waiting for Windows Spooler confirmation...", token)
-        spooler_id = wait_for_spooler_completion(printer_name, doc_title)
+            logger.info(
+                "[Job %s] Step 3/4: Sending %d page(s) x %d copies to '%s' (%s)...",
+                token,
+                len(pil_pages),
+                job.get("copies", 1),
+                printer_name,
+                printer_info.get("portName"),
+            )
+            update_backend_job_status(
+                backend_url, agent_id, agent_secret, order_id, agent_job_id, "PRINTING"
+            )
+            doc_title = print_via_windows_gdi(
+                printer_name,
+                job,
+                pil_pages,
+                capabilities=printer_info.get("capabilities"),
+            )
 
-        record_completed_job(order_id, ledger_path)
-        update_backend_job_status(
-            backend_url,
-            agent_id,
-            agent_secret,
-            order_id,
-            agent_job_id,
-            "COMPLETED",
-            spooler_job_id=spooler_id,
-        )
-        logger.info("[Job %s] Physical print on '%s' confirmed COMPLETED.", token, printer_name)
+            logger.info("[Job %s] Step 4/4: Waiting for Windows Spooler confirmation...", token)
+            try:
+                spooler_id = wait_for_spooler_completion(printer_name, doc_title)
+            except SpoolerJobCancelledError as cancel_err:
+                logger.warning("[Job %s] Print job cancelled in Windows Spooler: %s", token, cancel_err)
+                update_backend_job_status(
+                    backend_url,
+                    agent_id,
+                    agent_secret,
+                    order_id,
+                    agent_job_id,
+                    "CANCELLED",
+                    failure_reason=str(cancel_err),
+                )
+                return
+
+            record_completed_job(order_id, ledger_path)
+            update_backend_job_status(
+                backend_url,
+                agent_id,
+                agent_secret,
+                order_id,
+                agent_job_id,
+                "COMPLETED",
+                spooler_job_id=spooler_id,
+            )
+            logger.info("[Job %s] Physical print on '%s' confirmed COMPLETED.", token, printer_name)
 
 
-def load_runtime_config(config_path: str = None) -> dict:
+def read_stdin_secret_payload() -> dict:
+    """
+    Reads an optional JSON secret bootstrap payload from stdin when launched by
+    the Electron Desktop App with --secret-stdin so agentSecret is never written
+    to plaintext disk files or CLI arguments.
+    """
+    try:
+        raw = sys.stdin.read()
+        if not raw or not raw.strip():
+            return {}
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            "agentId": str(parsed.get("agentId") or "").strip(),
+            "agentSecret": str(parsed.get("agentSecret") or "").strip(),
+        }
+    except Exception:
+        return {}
+
+
+def load_runtime_config(config_path: str = None, inherited_secret: str = "") -> dict:
     load_dotenv(BASE_DIR / ".env")
     load_dotenv(BASE_DIR.parent / "backend" / ".env")
+
+    env_secret = (
+        os.getenv("SMART_XEROX_AGENT_SECRET") or os.getenv("AGENT_SECRET") or ""
+    ).strip()
 
     cfg = {
         "backendApiUrl": (
             os.getenv("BACKEND_API_URL") or "https://smart-xerox-api.onrender.com/api"
         ).rstrip("/"),
-        "agentId": os.getenv("AGENT_ID", "").strip(),
-        "agentSecret": os.getenv("AGENT_SECRET", "").strip(),
+        "agentId": (
+            os.getenv("SMART_XEROX_AGENT_ID") or os.getenv("AGENT_ID") or ""
+        ).strip(),
+        "agentSecret": inherited_secret or env_secret,
         "deviceId": os.getenv("AGENT_DEVICE_ID", f"win-{socket.gethostname()}").strip(),
         "selectedPrinterName": os.getenv("PRINTER_NAME", "").strip(),
         "pollIntervalSeconds": max(2, int(os.getenv("POLL_INTERVAL_SECONDS", "3"))),
@@ -1679,6 +1981,9 @@ def load_runtime_config(config_path: str = None) -> dict:
         try:
             file_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
             for k, v in file_cfg.items():
+                # Never overwrite an in-memory secret with an empty value from disk
+                if k == "agentSecret" and not v:
+                    continue
                 if v is not None and v != "":
                     cfg[k] = v
             cfg["backendApiUrl"] = str(cfg["backendApiUrl"]).rstrip("/")
@@ -1753,13 +2058,17 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
     logger.info("Backend API URL : %s", cfg["backendApiUrl"])
 
     preferred_printer = cfg.get("selectedPrinterName") or ""
+    in_memory_secret = cfg.get("agentSecret", "").strip()
+    job_lock = threading.Lock()
 
     while True:
         try:
             # Reload runtime config on each tick if managed by Electron Desktop App
             if config_path and Path(config_path).exists():
-                latest = load_runtime_config(config_path)
+                latest = load_runtime_config(config_path, inherited_secret=in_memory_secret)
                 cfg.update(latest)
+                if cfg.get("agentSecret"):
+                    in_memory_secret = cfg["agentSecret"].strip()
                 if latest.get("selectedPrinterName") is not None:
                     preferred_printer = latest.get("selectedPrinterName") or preferred_printer
 
@@ -1834,26 +2143,34 @@ def run_agent_loop(cfg: dict, config_path: str = None) -> None:
                             job.get("originalName"),
                             resolved_job_printer,
                         )
-                        try:
-                            process_and_print_job(
-                                backend_url=backend_url,
-                                agent_id=agent_id,
-                                agent_secret=agent_secret,
-                                job=job,
-                                printer_name=resolved_job_printer,
-                                ledger_path=ledger_path,
-                            )
-                        except Exception as job_err:
-                            logger.exception("Error processing print job %s", job.get("token"))
-                            update_backend_job_status(
-                                backend_url=backend_url,
-                                agent_id=agent_id,
-                                agent_secret=agent_secret,
-                                order_id=str(job["orderId"]),
-                                agent_job_id=str(job["agentJobId"]),
-                                status="FAILED",
-                                failure_reason=str(job_err),
-                            )
+                        if job_lock.acquire(blocking=False):
+                            try:
+                                process_and_print_job(
+                                    backend_url=backend_url,
+                                    agent_id=agent_id,
+                                    agent_secret=agent_secret,
+                                    job=job,
+                                    printer_name=resolved_job_printer,
+                                    ledger_path=ledger_path,
+                                    device_id=device_id,
+                                    all_printers=discovered_list,
+                                    heartbeat_interval=max(
+                                        2.0, min(8.0, float(cfg.get("pollIntervalSeconds", 5)))
+                                    ),
+                                )
+                            except Exception as job_err:
+                                logger.exception("Error processing print job %s", job.get("token"))
+                                update_backend_job_status(
+                                    backend_url=backend_url,
+                                    agent_id=agent_id,
+                                    agent_secret=agent_secret,
+                                    order_id=str(job["orderId"]),
+                                    agent_job_id=str(job["agentJobId"]),
+                                    status="FAILED",
+                                    failure_reason=str(job_err),
+                                )
+                            finally:
+                                job_lock.release()
         except KeyboardInterrupt:
             logger.info("Print agent stopped by user.")
             send_offline_notification(
@@ -1892,13 +2209,23 @@ if __name__ == "__main__":
         default=None,
         help="Path to JSON runtime config managed by the Smart Xerox Electron Desktop App.",
     )
+    parser.add_argument(
+        "--secret-stdin",
+        action="store_true",
+        help="Read protected agent credentials JSON from stdin (never persisted to plaintext config).",
+    )
     args = parser.parse_args()
 
     if args.list_printers_json:
         print(json.dumps(discover_all_windows_printers(include_virtual=args.include_virtual)))
         sys.exit(0)
 
-    runtime_cfg = load_runtime_config(args.config)
+    stdin_creds = read_stdin_secret_payload() if args.secret_stdin else {}
+    runtime_cfg = load_runtime_config(
+        args.config, inherited_secret=stdin_creds.get("agentSecret", "")
+    )
+    if stdin_creds.get("agentId"):
+        runtime_cfg["agentId"] = stdin_creds["agentId"]
     if args.diagnose:
         sys.exit(run_diagnostics(runtime_cfg))
     else:

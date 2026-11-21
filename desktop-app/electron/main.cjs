@@ -3,6 +3,7 @@ const {
   BrowserWindow,
   ipcMain,
   safeStorage,
+  session,
   Tray,
   Menu,
   nativeImage,
@@ -252,15 +253,23 @@ function resolvePythonAndAgentPaths() {
   };
 }
 
+function redactSecrets(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/sxk_[a-fA-F0-9]{16,}/g, "sxk_[REDACTED]")
+    .replace(/(x-agent-secret["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, "$1[REDACTED]")
+    .replace(/(Bearer\s+)[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/gi, "$1[REDACTED]");
+}
+
 function syncAgentRuntimeConfigFile() {
-  const session = getDecryptedSession();
+  const currentSession = getDecryptedSession();
   const cfgPath = getAgentRuntimeConfigPath();
+  // SECURITY: Never write agentSecret to plaintext disk config; it is delivered via stdin pipe.
   const payload = {
-    backendApiUrl: session.apiBaseUrl,
-    agentId: session.agentId || "",
-    agentSecret: session.agentSecret || "",
-    deviceId: session.deviceId,
-    selectedPrinterName: session.tenant?.selectedPrinterName || "",
+    backendApiUrl: currentSession.apiBaseUrl,
+    agentId: currentSession.agentId || "",
+    deviceId: currentSession.deviceId,
+    selectedPrinterName: currentSession.tenant?.selectedPrinterName || "",
     pollIntervalSeconds: 3,
     logFile: getAgentLogPath(),
     ledgerFile: getAgentLedgerPath()
@@ -346,8 +355,8 @@ function stopBackgroundAgent({ notifyOffline = false, reason = "Print agent stop
 function startBackgroundAgent() {
   stopBackgroundAgent();
 
-  const session = getDecryptedSession();
-  if (!session.agentId || !session.agentSecret) {
+  const currentSession = getDecryptedSession();
+  if (!currentSession.agentId || !currentSession.agentSecret) {
     agentState.running = false;
     agentState.lastError = "Waiting for vendor sign-in and agent pairing.";
     return agentState;
@@ -366,11 +375,24 @@ function startBackgroundAgent() {
   }
 
   try {
-    const child = spawn(python, [script, "--config", cfgPath], {
+    const child = spawn(python, [script, "--config", cfgPath, "--secret-stdin"], {
       cwd,
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"]
     });
+
+    // Deliver DPAPI-decrypted agentSecret exclusively over protected process stdin pipe
+    try {
+      child.stdin.write(
+        JSON.stringify({
+          agentId: currentSession.agentId,
+          agentSecret: currentSession.agentSecret
+        })
+      );
+      child.stdin.end();
+    } catch (_stdinErr) {
+      // Child exited early
+    }
 
     agentProcess = child;
     agentState.running = true;
@@ -379,7 +401,7 @@ function startBackgroundAgent() {
     agentState.lastError = null;
 
     child.stderr.on("data", (chunk) => {
-      const msg = String(chunk || "").trim();
+      const msg = redactSecrets(String(chunk || "").trim());
       if (msg) {
         agentState.lastError = msg.slice(-300);
       }
@@ -391,8 +413,8 @@ function startBackgroundAgent() {
       agentState.lastExitCode = code;
 
       if (!isQuitting) {
-        const currentSession = getDecryptedSession();
-        if (currentSession.agentId && currentSession.agentSecret) {
+        const latestSession = getDecryptedSession();
+        if (latestSession.agentId && latestSession.agentSecret) {
           agentRestartTimer = setTimeout(() => {
             startBackgroundAgent();
           }, 4000);
@@ -401,13 +423,13 @@ function startBackgroundAgent() {
     });
   } catch (err) {
     agentState.running = false;
-    agentState.lastError = err.message;
+    agentState.lastError = redactSecrets(err.message);
   }
 
   return agentState;
 }
 
-function runAgentCliJson(args = ["--list-printers-json"], timeoutMs = 12000) {
+function runAgentCliJson(args = ["--list-printers-json"], timeoutMs = 12000, stdinPayload = null) {
   return new Promise((resolve) => {
     const { python, script, cwd } = resolvePythonAndAgentPaths();
     if (!fs.existsSync(script)) {
@@ -418,6 +440,81 @@ function runAgentCliJson(args = ["--list-printers-json"], timeoutMs = 12000) {
       });
     }
 
+    if (stdinPayload) {
+      const child = spawn(python, [script, ...args], {
+        cwd,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          try {
+            child.kill();
+          } catch (_e) {
+            // ignore
+          }
+          resolve({
+            success: false,
+            error: "Print agent command timed out.",
+            output: redactSecrets(stdout || stderr),
+            printers: []
+          });
+        }
+      }, timeoutMs);
+
+      child.stdout.on("data", (d) => {
+        stdout += String(d || "");
+      });
+      child.stderr.on("data", (d) => {
+        stderr += String(d || "");
+      });
+      child.on("error", (err) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve({
+            success: false,
+            error: redactSecrets(err.message),
+            output: redactSecrets(stdout || stderr || err.message),
+            printers: []
+          });
+        }
+      });
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const safeOut = redactSecrets(stdout.trim());
+        const safeErr = redactSecrets(stderr.trim());
+        if (code !== 0) {
+          return resolve({
+            success: false,
+            error: safeErr || `Exited with code ${code}`,
+            output: safeOut || safeErr,
+            printers: []
+          });
+        }
+        try {
+          resolve(JSON.parse(safeOut));
+        } catch (_e) {
+          resolve({ success: true, output: safeOut });
+        }
+      });
+
+      try {
+        child.stdin.write(JSON.stringify(stdinPayload));
+        child.stdin.end();
+      } catch (_e) {
+        // ignore
+      }
+      return;
+    }
+
     execFile(
       python,
       [script, ...args],
@@ -426,12 +523,12 @@ function runAgentCliJson(args = ["--list-printers-json"], timeoutMs = 12000) {
         if (error) {
           return resolve({
             success: false,
-            error: stderr || error.message,
-            output: stdout || stderr || error.message,
+            error: redactSecrets(stderr || error.message),
+            output: redactSecrets(stdout || stderr || error.message),
             printers: []
           });
         }
-        const trimmed = String(stdout || "").trim();
+        const trimmed = redactSecrets(String(stdout || "").trim());
         try {
           resolve(JSON.parse(trimmed));
         } catch (_e) {
@@ -453,7 +550,7 @@ function readAgentLogTail(maxLines = 80) {
   try {
     const raw = fs.readFileSync(logPath, "utf-8");
     const lines = raw.split(/\r?\n/).filter(Boolean);
-    return lines.slice(-maxLines).join("\n");
+    return redactSecrets(lines.slice(-maxLines).join("\n"));
   } catch (err) {
     return `Could not read agent log: ${err.message}`;
   }
@@ -529,8 +626,44 @@ function createTray() {
   }
 }
 
+function configureContentSecurityPolicy() {
+  const cspDirectives = isDev
+    ? [
+        "default-src 'self'",
+        "script-src 'self' 'unsafe-inline'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob: https:",
+        "font-src 'self' data:",
+        `connect-src 'self' ${DEFAULT_PRODUCTION_API_URL.replace(/\/api$/, "")} http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*`,
+        "object-src 'none'",
+        "base-uri 'self'",
+        "frame-ancestors 'none'"
+      ].join("; ")
+    : [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob: https:",
+        "font-src 'self' data:",
+        `connect-src 'self' ${DEFAULT_PRODUCTION_API_URL.replace(/\/api$/, "")}`,
+        "object-src 'none'",
+        "base-uri 'self'",
+        "frame-ancestors 'none'"
+      ].join("; ");
+
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        "Content-Security-Policy": [cspDirectives]
+      }
+    });
+  });
+}
+
 function createMainWindow() {
   const startMinimized = process.argv.includes("--autostart");
+  configureContentSecurityPolicy();
 
   mainWindow = new BrowserWindow({
     width: 1260,
@@ -849,7 +982,18 @@ ipcMain.handle("agent:stop", async (event) => {
 ipcMain.handle("agent:diagnose", async (event) => {
   assertTrustedIpcSender(event);
   const cfgPath = syncAgentRuntimeConfigFile();
-  return runAgentCliJson(["--diagnose", "--config", cfgPath], 20000);
+  const currentSession = getDecryptedSession();
+  const stdinPayload =
+    currentSession.agentId && currentSession.agentSecret
+      ? {
+          agentId: currentSession.agentId,
+          agentSecret: currentSession.agentSecret
+        }
+      : null;
+  const diagArgs = stdinPayload
+    ? ["--diagnose", "--config", cfgPath, "--secret-stdin"]
+    : ["--diagnose", "--config", cfgPath];
+  return runAgentCliJson(diagArgs, 20000, stdinPayload);
 });
 
 ipcMain.handle("settings:update", async (event, partial) => {

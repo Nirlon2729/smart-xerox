@@ -705,15 +705,31 @@ export default function App() {
     toast.success("Downloaded Shop QR Code PNG");
   };
 
+  const escapeHtml = (value) =>
+    String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
   const handlePrintQrPoster = () => {
     if (!qrDataUrl || !session.tenant) return;
+    if (!String(qrDataUrl).startsWith("data:image/png;base64,")) {
+      toast.error("Invalid QR image data.");
+      return;
+    }
     const win = window.open("", "_blank", "width=720,height=900");
     if (!win) return;
+    const safeShopName = escapeHtml(session.tenant.shopName);
+    const safeShopUrl = escapeHtml(resolvedShopUrl);
+    const safeQrDataUrl = escapeHtml(qrDataUrl);
     win.document.write(`
       <!doctype html>
       <html>
         <head>
-          <title>${session.tenant.shopName} — Smart Xerox QR Code</title>
+          <meta charset="UTF-8" />
+          <title>${safeShopName} — Smart Xerox QR Code</title>
           <style>
             body { font-family: Segoe UI, Arial, sans-serif; text-align: center; padding: 48px; color: #18181B; }
             .card { border: 3px solid #8D0100; border-radius: 24px; padding: 40px; max-width: 480px; margin: 0 auto; }
@@ -727,16 +743,23 @@ export default function App() {
         <body>
           <div class="card">
             <div class="brand">SMART XEROX INSTANT PRINT</div>
-            <h1>${session.tenant.shopName}</h1>
-            <p>Scan this QR code with your phone camera to upload & print PDF or Image documents</p>
-            <img src="${qrDataUrl}" alt="Shop QR Code" />
-            <div class="url">${resolvedShopUrl}</div>
+            <h1>${safeShopName}</h1>
+            <p>Scan this QR code with your phone camera to upload &amp; print PDF or Image documents</p>
+            <img src="${safeQrDataUrl}" alt="Shop QR Code" />
+            <div class="url">${safeShopUrl}</div>
           </div>
-          <script>window.onload = () => { window.print(); };</script>
         </body>
       </html>
     `);
     win.document.close();
+    win.focus();
+    setTimeout(() => {
+      try {
+        win.print();
+      } catch (_e) {
+        // Ignore if popup was closed before print triggered
+      }
+    }, 250);
   };
 
   const handleSaveShopProfile = async (e) => {
@@ -1068,7 +1091,21 @@ export default function App() {
       setInspectingOrderId(order._id);
       const blob = await downloadVendorOrderBlob(order._id);
       const url = URL.createObjectURL(blob);
-      window.open(url, "_blank", "noopener,noreferrer");
+      const popup = window.open(url, "_blank", "noopener,noreferrer");
+      // Release blob URL memory once opened or after 60s
+      const revokeTimer = setTimeout(() => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch (_e) {
+          // ignore
+        }
+      }, 60_000);
+      if (popup) {
+        popup.addEventListener?.("beforeunload", () => {
+          clearTimeout(revokeTimer);
+          URL.revokeObjectURL(url);
+        });
+      }
     } catch (err) {
       toast.error(err.message || "Could not open document file");
     } finally {

@@ -45,7 +45,8 @@ const orderSchema = new mongoose.Schema(
     },
     gridFsFileId: {
       type: mongoose.Schema.Types.ObjectId,
-      required: true,
+      required: false,
+      default: null,
       index: true
     },
     fileSha256: {
@@ -208,6 +209,34 @@ const orderSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
+    documentStatus: {
+      type: String,
+      enum: ["AVAILABLE", "EXPIRED", "DELETED"],
+      default: "AVAILABLE",
+      index: true
+    },
+    documentUploadedAt: {
+      type: Date,
+      default: null,
+      index: true
+    },
+    documentDeletedAt: {
+      type: Date,
+      default: null
+    },
+    cleanupEligible: {
+      type: Boolean,
+      default: false,
+      index: true
+    },
+    cleanupClaimedAt: {
+      type: Date,
+      default: null
+    },
+    cleanupClaimedBy: {
+      type: String,
+      default: null
+    },
     failureReason: {
       type: String,
       default: null
@@ -222,6 +251,8 @@ const orderSchema = new mongoose.Schema(
 
 orderSchema.index({ tenantId: 1, status: 1, createdAt: 1 });
 orderSchema.index({ tenantId: 1, createdAt: -1 });
+orderSchema.index({ tenantId: 1, fileDeleted: 1, documentUploadedAt: 1 });
+orderSchema.index({ cleanupEligible: 1, fileDeleted: 1 });
 orderSchema.index(
   { tenantId: 1, pickupCode: 1 },
   {
